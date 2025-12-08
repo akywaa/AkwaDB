@@ -1,0 +1,9 @@
+listen_addr: ":6380"
+data_dir: "./akwadata"
+password: ""
+
+memtable_mb: 4
+compaction_threshold: 4
+block_cache_size: 1000
+max_disk_bytes: 10737418240  # 10 GB
+repl_backlog_size: 10000
