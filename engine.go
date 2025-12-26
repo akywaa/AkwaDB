@@ -6,6 +6,7 @@ import (
 	"github.com/akywaa/akwadb/memtable"
 	"github.com/akywaa/akwadb/server"
 	"github.com/akywaa/akwadb/sstable"
+	"github.com/akywaa/akwadb/vlog"
 	"github.com/akywaa/akwadb/wal"
 	"bytes"
 	"context"
@@ -42,6 +43,10 @@ type ValuePointer struct {
 	Fid    uint32
 	Offset uint64
 	Size   uint32
+}
+
+func vpFromVlog(vvp vlog.ValuePointer) ValuePointer {
+	return ValuePointer{Fid: vvp.Fid, Offset: vvp.Offset, Size: vvp.Size}
 }
 
 func encodeInlineValue(val []byte) []byte {
@@ -93,22 +98,11 @@ func (e *Engine) resolveValue(raw []byte) ([]byte, error) {
 	}
 
 	e.vlogMu.RLock()
-	vlogRef, exists := e.oldVLogs[vp.Fid]
-	if exists {
-		vlogRef.IncrRef()
-	}
-	e.vlogMu.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("vlog %d not found", vp.Fid)
-	}
-	defer vlogRef.DecrRef()
-
-	buf := make([]byte, vp.Size)
-	if _, err := vlogRef.ReadAt(buf, int64(vp.Offset)); err != nil {
-		return nil, err
-	}
-	return buf, nil
+	return e.vl.ReadValue(vlog.ValuePointer{
+		Fid:    vp.Fid,
+		Offset: vp.Offset,
+		Size:   vp.Size,
+	})
 }
 
 func (e *Engine) addDiscard(valBytes []byte) {
@@ -198,10 +192,11 @@ func DefaultOptions(dataDir string) Options {
 }
 
 type flushTask struct {
-	seq        uint64
-	memTable   *memtable.SkipList
-	oldWal     *wal.WAL
-	oldWalPath string
+	seq          uint64
+	memTable     *memtable.SkipList
+	oldWal       *wal.WAL
+	oldWalPath   string
+	oldVlogFid   uint32 // fid of VLog segment that was active before flush
 }
 
 const opIncr byte = 128
@@ -224,26 +219,6 @@ type incrResult struct {
 	err error
 }
 
-// vlogRef wraps an old vlog file with reference counting for safe concurrent access.
-type vlogRef struct {
-	file *os.File
-	refs int32
-}
-
-func newVlogRef(f *os.File) *vlogRef {
-	return &vlogRef{file: f, refs: 1}
-}
-
-func (v *vlogRef) IncrRef() { atomic.AddInt32(&v.refs, 1) }
-func (v *vlogRef) DecrRef() {
-	if atomic.AddInt32(&v.refs, -1) == 0 {
-		v.file.Close()
-	}
-}
-func (v *vlogRef) ReadAt(buf []byte, offset int64) (int, error) {
-	return v.file.ReadAt(buf, offset)
-}
-
 type Engine struct {
 	levelMu  [MaxLevels]sync.RWMutex
 	metrics  metricsCollector
@@ -255,7 +230,7 @@ type Engine struct {
 
 	wal           *wal.WAL
 	currentWalFid uint32
-	oldVLogs      map[uint32]*vlogRef
+	vl          *vlog.ValueLog
 	vlogMu        sync.RWMutex
 	dataDir       string
 	nextSeq       uint64
@@ -272,6 +247,7 @@ type Engine struct {
 
 	discardMu    sync.Mutex
 	discardStats map[uint32]int64 // fid -> stale bytes from discarded pointers
+	vlogDiscards *vlog.DiscardStats
 
 	gcDiscardTs uint64 // max version at start of GC; tombstones above this are preserved
 
@@ -299,19 +275,27 @@ func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList, fid uint32) inc
 	}
 	newVal := cur + r.delta
 	newBytes := []byte(strconv.FormatInt(newVal, 10))
-	offset, werr := e.wal.WriteVersion(wal.OpPut, r.key, newBytes, 0, r.seq)
-	if werr != nil {
-		return incrResult{err: werr}
-	}
 	threshold := e.opts.ValueThreshold
 	if threshold <= 0 {
 		threshold = defaultValueThreshold
 	}
 	if len(newBytes) < threshold {
+		_, werr := e.wal.WriteVersion(wal.OpPut, r.key, newBytes, 0, r.seq)
+		if werr != nil {
+			return incrResult{err: werr}
+		}
 		mt.PutVersion(r.key, encodeInlineValue(newBytes), 0, r.seq)
 	} else {
-		vp := ValuePointer{Fid: fid, Offset: uint64(offset), Size: uint32(len(newBytes))}
-		mt.PutVersion(r.key, encodeValuePointer(vp), 0, r.seq)
+		vvp, verr := e.vl.Write(&vlog.ValueEntry{
+			Op:    vlog.OpPut,
+			Key:   r.key,
+			Value: newBytes,
+		})
+		if verr != nil {
+			return incrResult{err: verr}
+		}
+		_, _ = e.wal.WriteVersion(wal.OpPut, r.key, nil, 0, r.seq)
+		mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), 0, r.seq)
 	}
 	return incrResult{val: newVal}
 }
@@ -420,11 +404,17 @@ func (e *Engine) writer() {
 					curVal, err := e.getWithoutLock(r.key)
 					if err == nil && isValuePointer(curVal) {
 						curVp := decodeValuePointer(curVal)
-						if curVp.Fid == r.expectedVp.Fid && curVp.Offset == r.expectedVp.Offset {
-							offset, werr := e.wal.WriteVersion(wal.OpPut, r.key, r.val, r.expiresAt, r.seq)
-							if werr == nil {
-								newVp := ValuePointer{Fid: fid, Offset: uint64(offset), Size: uint32(len(r.val))}
-								mt.PutVersion(r.key, encodeValuePointer(newVp), r.expiresAt, r.seq)
+						if curVp.Fid == r.expectedVp.Fid {
+							// rewrite live value into new VLog segment
+							vvp, verr := e.vl.Write(&vlog.ValueEntry{
+								Op:        vlog.OpPut,
+								Key:       r.key,
+								Value:     r.val,
+								ExpiresAt: r.expiresAt,
+							})
+							if verr == nil {
+								_, _ = e.wal.WriteVersion(wal.OpPut, r.key, nil, r.expiresAt, r.seq)
+								mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
 							}
 						}
 					}
@@ -433,14 +423,15 @@ func (e *Engine) writer() {
 				}
 
 				if len(r.batch) > 0 {
-					type walResult struct {
+					type batchResult struct {
 						kBytes  []byte
 						vBytes  []byte
-						offset  int64
+						vp      ValuePointer
+						isPtr   bool
 						deleted bool
 						expAt   int64
 					}
-					var results []walResult
+					var results []batchResult
 					var batchErr error
 					for _, entry := range r.batch {
 						kBytes := []byte(entry.Key)
@@ -450,56 +441,80 @@ func (e *Engine) writer() {
 								batchErr = werr
 								break
 							}
-							results = append(results, walResult{kBytes: kBytes, deleted: true})
+							results = append(results, batchResult{kBytes: kBytes, deleted: true})
 						} else {
 							vBytes := []byte(entry.Value)
-							offset, werr := e.wal.WriteVersion(wal.OpPut, kBytes, vBytes, entry.ExpiresAt, r.seq)
-							if werr != nil {
-								batchErr = werr
-								break
+							if len(vBytes) < threshold {
+								// small value: write to WAL
+								_, werr := e.wal.WriteVersion(wal.OpPut, kBytes, vBytes, entry.ExpiresAt, r.seq)
+								if werr != nil {
+									batchErr = werr
+									break
+								}
+								results = append(results, batchResult{kBytes: kBytes, vBytes: vBytes, expAt: entry.ExpiresAt})
+							} else {
+								// large value: write to VLog
+								vvp, verr := e.vl.Write(&vlog.ValueEntry{
+									Op:        vlog.OpPut,
+									Key:       kBytes,
+									Value:     vBytes,
+									ExpiresAt: entry.ExpiresAt,
+								})
+								if verr != nil {
+									batchErr = verr
+									break
+								}
+								_, _ = e.wal.WriteVersion(wal.OpPut, kBytes, nil, entry.ExpiresAt, r.seq)
+								results = append(results, batchResult{kBytes: kBytes, vp: vpFromVlog(vvp), isPtr: true, expAt: entry.ExpiresAt})
 							}
-							results = append(results, walResult{kBytes: kBytes, vBytes: vBytes, offset: offset, expAt: entry.ExpiresAt})
 						}
 					}
 					if batchErr == nil {
 						for _, res := range results {
 							if res.deleted {
 								mt.Delete(res.kBytes)
+							} else if res.isPtr {
+								mt.PutVersion(res.kBytes, encodeValuePointer(res.vp), res.expAt, r.seq)
 							} else {
-								if len(res.vBytes) < threshold {
-									mt.PutVersion(res.kBytes, encodeInlineValue(res.vBytes), res.expAt, r.seq)
-								} else {
-									vp := ValuePointer{Fid: fid, Offset: uint64(res.offset), Size: uint32(len(res.vBytes))}
-									mt.PutVersion(res.kBytes, encodeValuePointer(vp), res.expAt, r.seq)
-								}
+								mt.PutVersion(res.kBytes, encodeInlineValue(res.vBytes), res.expAt, r.seq)
 							}
-					}
+						}
 					}
 					r.errCh <- incrResult{err: batchErr}
 					continue
 				}
 
-				var err error
-				var offset int64
-				switch r.op {
-				case wal.OpPut:
-					offset, err = e.wal.WriteVersion(wal.OpPut, r.key, r.val, r.expiresAt, r.seq)
-				case wal.OpDelete:
-					offset, err = e.wal.WriteVersion(wal.OpDelete, r.key, nil, 0, r.seq)
-				}
-				if err != nil {
-					r.errCh <- incrResult{err: err}
-					continue
-				}
 				if r.op == wal.OpPut {
 					if len(r.val) < threshold {
+						// small value: store inline in memtable, write full record to WAL
+						_, werr := e.wal.WriteVersion(wal.OpPut, r.key, r.val, r.expiresAt, r.seq)
+						if werr != nil {
+							r.errCh <- incrResult{err: werr}
+							continue
+						}
 						mt.PutVersion(r.key, encodeInlineValue(r.val), r.expiresAt, r.seq)
 					} else {
-						vp := ValuePointer{Fid: fid, Offset: uint64(offset), Size: uint32(len(r.val))}
-						mt.PutVersion(r.key, encodeValuePointer(vp), r.expiresAt, r.seq)
+						// large value: write to VLog, store pointer in memtable
+						vvp, verr := e.vl.Write(&vlog.ValueEntry{
+							Op:        vlog.OpPut,
+							Key:       r.key,
+							Value:     r.val,
+							ExpiresAt: r.expiresAt,
+						})
+						if verr != nil {
+							r.errCh <- incrResult{err: verr}
+							continue
+						}
+						// WAL record: op + key only (value is in VLog)
+						_, _ = e.wal.WriteVersion(wal.OpPut, r.key, nil, r.expiresAt, r.seq)
+						mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
 					}
-				} else {
-					mt.Delete(r.key)
+				} else {						_, werr := e.wal.WriteVersion(wal.OpDelete, r.key, nil, 0, r.seq)
+						if werr != nil {
+							r.errCh <- incrResult{err: werr}
+							continue
+						}
+						mt.Delete(r.key)
 				}
 				r.errCh <- incrResult{}
 			}
@@ -580,7 +595,6 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	e := &Engine{
 		memTable:    atomic.Pointer[memtable.SkipList]{},
 		wal:         w,
-		oldVLogs:    make(map[uint32]*vlogRef),
 		dataDir:     opts.DataDir,
 		blockCache:  blockCache,
 		flushChan:   make(chan flushTask, 16),
@@ -596,6 +610,17 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	e.lock = lock
 	e.memTable.Store(memtable.NewSkipList())
 	e.loadDiscardStats()
+
+	// open or create vlog
+	vlogDir := filepath.Join(opts.DataDir, "vlog")
+	e.vl, err = vlog.Open(vlogDir)
+	if err != nil {
+		w.Close()
+		cancel()
+		return nil, fmt.Errorf("open vlog: %w", err)
+	}
+	e.vlogDiscards = vlog.NewDiscardStats()
+	e.vlogDiscards.Load(vlogDir)
 
 	// open or create manifest
 	manifestPath := filepath.Join(opts.DataDir, "MANIFEST")
@@ -677,48 +702,12 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 				if len(rec.Value) < recThreshold {
 					e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
 				} else {
+					// large value: replay pointer into memtable (resolved from VLog on read)
 					vp := ValuePointer{Fid: atomic.LoadUint32(&e.currentWalFid), Offset: uint64(rec.ValueOffset), Size: uint32(len(rec.Value))}
 					e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vp), rec.ExpiresAt, rec.Version)
 				}
 			} else if rec.Op == wal.OpDelete {
 				e.activeMemTable().Delete(rec.Key)
-			}
-		}
-	}
-
-	for _, f := range files {
-		name := f.Name()
-		if strings.HasPrefix(name, "wal_flush_") && strings.HasSuffix(name, ".log") {
-			flushPath := filepath.Join(opts.DataDir, name)
-			base := strings.TrimSuffix(strings.TrimPrefix(name, "wal_flush_"), ".log")
-			flushSeq, _ := strconv.ParseUint(base, 10, 64)
-			fw, err := wal.Open(flushPath)
-			if err == nil {
-				flushRecs, rerr := fw.Recover()
-				if rerr == nil {
-					for _, rec := range flushRecs {
-						if rec.ExpiresAt == 0 || now < rec.ExpiresAt {
-							if rec.Op == wal.OpPut {
-								if len(rec.Value) < recThreshold {
-									e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
-								} else {
-									vp := ValuePointer{Fid: uint32(flushSeq), Offset: uint64(rec.ValueOffset), Size: uint32(len(rec.Value))}
-									e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vp), rec.ExpiresAt, rec.Version)
-								}
-							} else if rec.Op == wal.OpDelete {
-								e.activeMemTable().Delete(rec.Key)
-							}
-						}
-					}
-				}
-				fw.Close()
-
-				roFile, oerr := os.OpenFile(flushPath, os.O_RDONLY, 0644)
-				if oerr == nil {
-					e.vlogMu.Lock()
-					e.oldVLogs[uint32(flushSeq)] = newVlogRef(roFile)
-					e.vlogMu.Unlock()
-				}
 			}
 		}
 	}
@@ -793,14 +782,17 @@ func (e *Engine) executeFlush(task flushTask) {
 
 	if task.oldWal != nil {
 		task.oldWal.Close()
-		roFile, err := os.OpenFile(task.oldWalPath, os.O_RDONLY, 0644)
-		if err == nil {
-			e.vlogMu.Lock()
-			e.oldVLogs[uint32(task.seq)] = newVlogRef(roFile)
-			e.vlogMu.Unlock()
-		} else {
-			slog.Error("failed to open vlog for reading", "path", task.oldWalPath, "err", err)
-		}
+	}
+
+	// Track old VLog segment for GC. After the SSTable is written,
+	// values pointed to by this segment are now in the SSTable,
+	// so the segment can be reclaimed during GC.
+	if task.oldVlogFid > 0 {
+		// Mark the segment as fully discardable. The actual stale bytes
+		// will be computed during GC when it reads live values.
+		e.vlogMu.Lock()
+		e.discardStats[task.oldVlogFid] = 1 // trigger GC for this segment
+		e.vlogMu.Unlock()
 	}
 
 	e.metrics.incFlush()
@@ -834,11 +826,18 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 	e.wal = newWal
 	atomic.StoreUint32(&e.currentWalFid, uint32(seq+1))
 
+	// Rotate VLog segment to create a clean GC boundary.
+	oldVlogFid := e.vl.ActiveFid()
+	if err := e.vl.Rotate(); err != nil {
+		slog.Warn("vlog rotate failed", "err", err)
+	}
+
 	task := &flushTask{
 		seq:        seq,
 		memTable:   old,
 		oldWal:     reopenedOldWal,
 		oldWalPath: oldWalPath,
+		oldVlogFid: oldVlogFid,
 	}
 	return task, nil
 }
@@ -2237,34 +2236,31 @@ func (e *Engine) compactManifest() error {
 }
 
 func (e *Engine) RunValueLogGC(targetFid uint32) error {
-	vlogPath := filepath.Join(e.dataDir, fmt.Sprintf("wal_flush_%06d.log", targetFid))
-	tempWal, err := wal.OpenWithOptions(vlogPath, false)
-	if err != nil {
-		return err
-	}
-	defer tempWal.Close()
+	e.gcDiscardTs = atomic.LoadUint64(&e.oracle.nextTs)
 
-	records, err := tempWal.Recover()
+	// Replay live entries from the target VLog segment into the current WAL/VLog.
+	var entriesToRewrite []vlog.ValueEntry
+	err := e.vl.Recover(targetFid, func(entry vlog.ValueEntry, valueOffset int64) error {
+		if entry.Op == vlog.OpDelete || len(entry.Value) == 0 {
+			return nil
+		}
+		entriesToRewrite = append(entriesToRewrite, entry)
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("failed to read vlog %d: %w", targetFid, err)
 	}
 
-	e.gcDiscardTs = atomic.LoadUint64(&e.oracle.nextTs)
-
-	for _, rec := range records {
-		if rec.Op == wal.OpDelete || len(rec.Value) == 0 {
-			continue
-		}
-
+	for _, entry := range entriesToRewrite {
 		req := &writeReq{
 			op:   opGCRewrite,
-			key:  rec.Key,
-			val:  rec.Value,
-			expiresAt: rec.ExpiresAt,
+			key:  entry.Key,
+			val:  entry.Value,
+			expiresAt: entry.ExpiresAt,
 			expectedVp: ValuePointer{
 				Fid:    targetFid,
-				Offset: uint64(rec.ValueOffset),
-				Size:   uint32(len(rec.Value)),
+				Offset: 0, // offset check is skipped for VLog GC
+				Size:   uint32(len(entry.Value)),
 			},
 			errCh: make(chan incrResult, 1),
 		}
@@ -2274,30 +2270,18 @@ func (e *Engine) RunValueLogGC(targetFid uint32) error {
 
 	atomic.StoreUint64(&e.gcDiscardTs, 0)
 
-	e.discardMu.Lock()
-	delete(e.discardStats, targetFid)
-	e.discardMu.Unlock()
-
 	// Wait until no active MVCC readers can still reference this vlog.
 	for e.oracle.MinReadTs() < atomic.LoadUint64(&e.gcDiscardTs) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// Remove the segment from VLog and discard stats.
 	e.vlogMu.Lock()
-	if vref, ok := e.oldVLogs[targetFid]; ok {
-		delete(e.oldVLogs, targetFid)
-		// Wait for all readers to finish before closing.
-		vref.DecrRef() // remove our reference
-		for atomic.LoadInt32(&vref.refs) > 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+	delete(e.discardStats, targetFid)
 	e.vlogMu.Unlock()
+	e.vlogDiscards.Delete(targetFid)
 
-	// Actually remove the vlog file from disk.
-	_ = os.Remove(vlogPath)
-
-	return nil
+	return e.vl.DeleteSegment(targetFid)
 }
 
 // ==========================================
@@ -2744,13 +2728,13 @@ func (e *Engine) Close() error {
 	if e.manifest != nil {
 		_ = e.manifest.Close()
 	}
-	e.vlogMu.Lock()
-	for fid, vref := range e.oldVLogs {
-		delete(e.oldVLogs, fid)
-		vref.DecrRef()
+	if e.vl != nil {
+		_ = e.vl.Close()
 	}
-	e.vlogMu.Unlock()
 	e.saveDiscardStats()
+	if e.vlogDiscards != nil {
+		_ = e.vlogDiscards.Save(filepath.Join(e.dataDir, "vlog"))
+	}
 	if e.lock != nil {
 		_ = e.lock.release()
 	}
