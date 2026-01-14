@@ -261,7 +261,7 @@ type Engine struct {
 	OnWrite func(op byte, key, val []byte, expiresAt int64)
 }
 
-func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList, fid uint32) incrResult {
+func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList) incrResult {
 	current, err := e.getWithoutLock(r.key)
 	if err != nil && err != ErrKeyNotFound {
 		return incrResult{err: err}
@@ -380,11 +380,6 @@ func (e *Engine) writer() {
 			}
 
 			mt := e.activeMemTable()
-			fid := atomic.LoadUint32(&e.currentWalFid)
-			threshold := e.opts.ValueThreshold
-			if threshold <= 0 {
-				threshold = defaultValueThreshold
-			}
 			for _, r := range batch {
 				if r.seq == 0 {
 					r.seq = atomic.AddUint64(&e.nextSeq, 1)
@@ -396,7 +391,7 @@ func (e *Engine) writer() {
 			}
 
 			if r.op == opIncr {
-					r.errCh <- e.processIncr(r, mt, fid)
+					r.errCh <- e.processIncr(r, mt)
 					continue
 			}
 
@@ -423,6 +418,10 @@ func (e *Engine) writer() {
 				}
 
 				if len(r.batch) > 0 {
+					threshold := e.opts.ValueThreshold
+					if threshold <= 0 {
+						threshold = defaultValueThreshold
+					}
 					type batchResult struct {
 						kBytes  []byte
 						vBytes  []byte
@@ -484,38 +483,7 @@ func (e *Engine) writer() {
 					continue
 				}
 
-				if r.op == wal.OpPut {
-					if len(r.val) < threshold {
-						// small value: store inline in memtable, write full record to WAL
-						_, werr := e.wal.WriteVersion(wal.OpPut, r.key, r.val, r.expiresAt, r.seq)
-						if werr != nil {
-							r.errCh <- incrResult{err: werr}
-							continue
-						}
-						mt.PutVersion(r.key, encodeInlineValue(r.val), r.expiresAt, r.seq)
-					} else {
-						// large value: write to VLog, store pointer in memtable
-						vvp, verr := e.vl.Write(&vlog.ValueEntry{
-							Op:        vlog.OpPut,
-							Key:       r.key,
-							Value:     r.val,
-							ExpiresAt: r.expiresAt,
-						})
-						if verr != nil {
-							r.errCh <- incrResult{err: verr}
-							continue
-						}
-						// WAL record: op + key only (value is in VLog)
-						_, _ = e.wal.WriteVersion(wal.OpPut, r.key, nil, r.expiresAt, r.seq)
-						mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
-					}
-				} else {						_, werr := e.wal.WriteVersion(wal.OpDelete, r.key, nil, 0, r.seq)
-						if werr != nil {
-							r.errCh <- incrResult{err: werr}
-							continue
-						}
-						mt.Delete(r.key)
-				}
+				// unreachable: all op types handled above
 				r.errCh <- incrResult{}
 			}
 
@@ -573,7 +541,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	}
 
 	walPath := filepath.Join(opts.DataDir, "wal.log")
-	w, err := wal.Open(walPath)
+	w, err := wal.OpenWithOptions(walPath, true)
 	if err != nil {
 		return nil, fmt.Errorf("open active wal: %w", err)
 	}
@@ -854,26 +822,16 @@ func (e *Engine) PutEx(key, val string, ttlSeconds int64) error {
 
 	kBytes := []byte(key)
 	vBytes := []byte(val)
+	seq := atomic.AddUint64(&e.nextSeq, 1)
 
-	req := &writeReq{
-		op:        wal.OpPut,
-		key:       kBytes,
-		val:       vBytes,
-		expiresAt: expiresAt,
-		errCh:     make(chan incrResult, 1),
+	if err := e.applyEntry(wal.OpPut, kBytes, vBytes, expiresAt, seq); err != nil {
+		return fmt.Errorf("wal write: %w", err)
 	}
-	e.writeReq <- req
-	res := <-req.errCh
-	if res.err != nil {
-		return fmt.Errorf("wal write: %w", res.err)
-	}
-
+	e.tryFlush()
 	e.metrics.incPut()
-
 	if e.OnWrite != nil {
 		e.OnWrite(wal.OpPut, kBytes, vBytes, expiresAt)
 	}
-
 	return nil
 }
 
@@ -1070,24 +1028,16 @@ func (e *Engine) NewVersionIteratorAt(maxVersion uint64) iterator.VersionIterato
 
 func (e *Engine) Delete(key string) (bool, error) {
 	kBytes := []byte(key)
+	seq := atomic.AddUint64(&e.nextSeq, 1)
 
-	req := &writeReq{
-		op:    wal.OpDelete,
-		key:   kBytes,
-		errCh: make(chan incrResult, 1),
+	if err := e.applyEntry(wal.OpDelete, kBytes, nil, 0, seq); err != nil {
+		return false, err
 	}
-	e.writeReq <- req
-	res := <-req.errCh
-	if res.err != nil {
-		return false, res.err
-	}
-
+	e.tryFlush()
 	e.metrics.incDel()
-
 	if e.OnWrite != nil {
 		e.OnWrite(wal.OpDelete, kBytes, nil, 0)
 	}
-
 	return true, nil
 }
 
@@ -1130,8 +1080,61 @@ func (e *Engine) getByKey(kBytes []byte) ([]byte, error) {
 	return e.getWithoutLock(kBytes)
 }
 
-// submitBatch sends a group of write operations through the writer goroutine
-// and blocks until they all complete.
+// applyEntry writes a single entry to WAL/VLog + memtable.
+// Safe for concurrent use: WAL has group commit, memtable is lock-free.
+func (e *Engine) applyEntry(op byte, key, val []byte, expiresAt int64, seq uint64) error {
+	mt := e.activeMemTable()
+	threshold := e.opts.ValueThreshold
+	if threshold <= 0 {
+		threshold = defaultValueThreshold
+	}
+	if op == wal.OpDelete {
+		_, werr := e.wal.WriteVersion(wal.OpDelete, key, nil, 0, seq)
+		if werr != nil {
+			return werr
+		}
+		mt.Delete(key)
+		return nil
+	}
+	if len(val) < threshold {
+		_, werr := e.wal.WriteVersion(wal.OpPut, key, val, expiresAt, seq)
+		if werr != nil {
+			return werr
+		}
+		mt.PutVersion(key, encodeInlineValue(val), expiresAt, seq)
+	} else {
+		vvp, verr := e.vl.Write(&vlog.ValueEntry{
+			Op: vlog.OpPut, Key: key, Value: val, ExpiresAt: expiresAt,
+		})
+		if verr != nil {
+			return verr
+		}
+		_, _ = e.wal.WriteVersion(wal.OpPut, key, nil, expiresAt, seq)
+		mt.PutVersion(key, encodeValuePointer(vpFromVlog(vvp)), expiresAt, seq)
+	}
+	return nil
+}
+
+// tryFlush triggers a memtable flush if the active memtable is full.
+// Called by writers after each batch. Safe to call concurrently.
+func (e *Engine) tryFlush() {
+	e.memTableMu.Lock()
+	defer e.memTableMu.Unlock()
+	if e.activeMemTable().SizeInBytes() >= e.opts.MemTableSize {
+		if e.immutableMemTable() != nil {
+			for e.immutableMemTable() != nil && e.ctx.Err() == nil {
+				e.l0Cond.Wait()
+			}
+		} else if task, err := e.triggerFlushLocked(); err == nil {
+			select {
+			case e.flushChan <- *task:
+			default:
+			}
+		}
+	}
+}
+
+// submitBatch writes a batch of entries atomically through the writer goroutine.
 func (e *Engine) submitBatch(entries []server.BatchWriteEntry) error {
 	req := &writeReq{
 		batch: entries,
