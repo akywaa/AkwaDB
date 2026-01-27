@@ -34,6 +34,7 @@ type SkipList struct {
 	sizeBytes      atomic.Int64
 	randSeed      uint64 // per-skiplist xorshift64 seed (atomic for lock-free access)
 	versionCounter uint64 // atomic: monotonic version counter for MVCC
+	writeMu       sync.Mutex // serializes writers so duplicate keys stay version-ordered
 
 	bytes *byteSlab
 }
@@ -101,6 +102,8 @@ func loadForward(n *Node, idx int) *Node {
 // findSpliceForLevel walks level i starting from curr and returns the node
 // whose fwd[i] should point to a node with key >= target (or nil at the end).
 // It also fills update[0..i] with the predecessors at each level below i.
+// Equal keys stop the walk (<=): duplicates of the same key are ordered by
+// insertion at level 0, which keeps version order deterministic for MVCC.
 func (s *SkipList) findSpliceForLevel(curr *Node, key []byte, level int, update []*Node) *Node {
 	for i := level; i >= 0; i-- {
 		next := loadForward(curr, i)
@@ -131,6 +134,9 @@ func (s *SkipList) PutVersion(key, val []byte, expiresAt int64, version uint64) 
 		}
 	}
 
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	pUpd := updatePool.Get().(*[]*Node)
 	update := *pUpd
 	defer returnUpdatePool(pUpd)
@@ -150,6 +156,19 @@ insert:
 				next = loadForward(curr, i)
 			}
 			update[i] = curr
+		}
+		// insert after any existing versions of the same key so that level 0
+		// order for duplicates is deterministic (newer version follows older)
+		for i := curLevel - 1; i >= 0; i-- {
+			tail := update[i]
+			next := loadForward(tail, i)
+			for next != nil && bytes.Equal(next.key, key) {
+				tail = next
+				next = loadForward(tail, i)
+			}
+			if tail != update[i] {
+				update[i] = tail
+			}
 		}
 
 		lvl := s.randomLevel()
@@ -169,20 +188,20 @@ insert:
 			version:   version,
 		}
 
-	for i := 0; i < lvl; i++ {
-		for {
-			next := atomic.LoadPointer(&update[i].fwd[i])
-			atomic.StorePointer(&newNode.fwd[i], next)
-			if atomic.CompareAndSwapPointer(&update[i].fwd[i], next, unsafe.Pointer(newNode)) {
-				break
+		for i := 0; i < lvl; i++ {
+			for {
+				next := atomic.LoadPointer(&update[i].fwd[i])
+				atomic.StorePointer(&newNode.fwd[i], next)
+				if atomic.CompareAndSwapPointer(&update[i].fwd[i], next, unsafe.Pointer(newNode)) {
+					break
+				}
+				s.findSpliceForLevel(update[i], key, i, update)
 			}
-			s.findSpliceForLevel(update[i], key, i, update)
 		}
-	}
 
-	nodeOverhead := int64(unsafe.Sizeof(Node{}))
-	s.sizeBytes.Add(int64(len(key)) + int64(len(val)) + nodeOverhead)
-	return
+		nodeOverhead := int64(unsafe.Sizeof(Node{}))
+		s.sizeBytes.Add(int64(len(key)) + int64(len(val)) + nodeOverhead)
+		return
 	}
 }
 
@@ -193,6 +212,9 @@ func (s *SkipList) Put(key, val []byte, expiresAt int64) {
 
 func (s *SkipList) Delete(key []byte) {
 	version := atomic.AddUint64(&s.versionCounter, 1)
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	pUpd := updatePool.Get().(*[]*Node)
 	update := *pUpd
@@ -213,6 +235,19 @@ insert:
 				next = loadForward(curr, i)
 			}
 			update[i] = curr
+		}
+		// insert the tombstone after existing versions of the same key so the
+		// newest version (the delete) sorts last at level 0
+		for i := curLevel - 1; i >= 0; i-- {
+			tail := update[i]
+			next := loadForward(tail, i)
+			for next != nil && bytes.Equal(next.key, key) {
+				tail = next
+				next = loadForward(tail, i)
+			}
+			if tail != update[i] {
+				update[i] = tail
+			}
 		}
 
 		lvl := s.randomLevel()

@@ -537,7 +537,8 @@ func (n *Node) startElection() {
 	slog.Info("starting election", "term", term)
 
 	votes := int32(1)
-	needed := int32(len(n.config.Peers)/2 + 1)
+	// full cluster size N = peers + self; majority = N/2 + 1
+	needed := int32((len(n.config.Peers) + 1) / 2 + 1)
 	var mu sync.Mutex
 
 	for _, peerAddr := range n.config.Peers {

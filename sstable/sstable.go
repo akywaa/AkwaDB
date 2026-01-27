@@ -256,6 +256,7 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 
 	file.Write(filterHeader)
 	file.Write(filter.Bytes())
+	currentOffset += int64(len(filterHeader)) + int64(len(filter.Bytes()))
 
 	var minKey, maxKey []byte
 	if len(entries) > 0 {
@@ -268,6 +269,7 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 	binary.BigEndian.PutUint32(mkHdr[:], uint32(len(minKey)))
 	file.Write(mkHdr[:])
 	file.Write(minKey)
+	currentOffset += int64(len(mkHdr)) + int64(len(minKey))
 	binary.BigEndian.PutUint32(mkHdr[:], uint32(len(maxKey)))
 	file.Write(mkHdr[:])
 	file.Write(maxKey)

@@ -65,6 +65,28 @@ func encodeValuePointer(vp ValuePointer) []byte {
 	return buf
 }
 
+var walValuePtrMagic = [4]byte{'V', 'L', 'P', 'T'}
+
+func encodeWalValuePointer(vp ValuePointer) []byte {
+	buf := make([]byte, 4+valPtrSize)
+	copy(buf, walValuePtrMagic[:])
+	binary.BigEndian.PutUint32(buf[4:8], vp.Fid)
+	binary.BigEndian.PutUint64(buf[8:16], vp.Offset)
+	binary.BigEndian.PutUint32(buf[16:20], vp.Size)
+	return buf
+}
+
+func decodeWalValuePointer(b []byte) (ValuePointer, bool) {
+	if len(b) != 4+valPtrSize || b[0] != walValuePtrMagic[0] || b[1] != walValuePtrMagic[1] || b[2] != walValuePtrMagic[2] || b[3] != walValuePtrMagic[3] {
+		return ValuePointer{}, false
+	}
+	return ValuePointer{
+		Fid:    binary.BigEndian.Uint32(b[4:8]),
+		Offset: binary.BigEndian.Uint64(b[8:16]),
+		Size:   binary.BigEndian.Uint32(b[16:20]),
+	}, true
+}
+
 func isValuePointer(b []byte) bool {
 	return len(b) == 1+valPtrSize && b[0] == valFlagPointer
 }
@@ -94,7 +116,12 @@ func (e *Engine) resolveValue(raw []byte) ([]byte, error) {
 	}
 
 	if vp.Fid == atomic.LoadUint32(&e.currentWalFid) {
-		return e.wal.ReadValue(vp.Offset, vp.Size)
+		e.walMu.RLock()
+		w := e.wal
+		e.walMu.RUnlock()
+		if w != nil {
+			return w.ReadValue(vp.Offset, vp.Size)
+		}
 	}
 
 	e.vlogMu.RLock()
@@ -229,6 +256,7 @@ type Engine struct {
 	levels [MaxLevels][]*sstable.SSTable
 
 	wal           *wal.WAL
+	walMu         sync.RWMutex // guards wal pointer during rotation
 	currentWalFid uint32
 	vl          *vlog.ValueLog
 	vlogMu        sync.RWMutex
@@ -294,7 +322,7 @@ func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList) incrResult {
 		if verr != nil {
 			return incrResult{err: verr}
 		}
-		_, _ = e.wal.WriteVersion(wal.OpPut, r.key, nil, 0, r.seq)
+		_, _ = e.wal.WriteVersion(wal.OpPut, r.key, encodeWalValuePointer(vpFromVlog(vvp)), 0, r.seq)
 		mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), 0, r.seq)
 	}
 	return incrResult{val: newVal}
@@ -408,7 +436,7 @@ func (e *Engine) writer() {
 								ExpiresAt: r.expiresAt,
 							})
 							if verr == nil {
-								_, _ = e.wal.WriteVersion(wal.OpPut, r.key, nil, r.expiresAt, r.seq)
+								_, _ = e.wal.WriteVersion(wal.OpPut, r.key, encodeWalValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
 								mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
 							}
 						}
@@ -463,7 +491,7 @@ func (e *Engine) writer() {
 									batchErr = verr
 									break
 								}
-								_, _ = e.wal.WriteVersion(wal.OpPut, kBytes, nil, entry.ExpiresAt, r.seq)
+								_, _ = e.wal.WriteVersion(wal.OpPut, kBytes, encodeWalValuePointer(vpFromVlog(vvp)), entry.ExpiresAt, r.seq)
 								results = append(results, batchResult{kBytes: kBytes, vp: vpFromVlog(vvp), isPtr: true, expAt: entry.ExpiresAt})
 							}
 						}
@@ -483,6 +511,11 @@ func (e *Engine) writer() {
 					continue
 				}
 
+				if r.op == wal.OpPut || r.op == wal.OpDelete {
+					r.errCh <- incrResult{err: e.applyEntry(r.op, r.key, r.val, r.expiresAt, r.seq)}
+					continue
+				}
+
 				// unreachable: all op types handled above
 				r.errCh <- incrResult{}
 			}
@@ -495,12 +528,12 @@ func (e *Engine) writer() {
 					for e.immutableMemTable() != nil && e.ctx.Err() == nil {
 						e.l0Cond.Wait()
 					}
-				} else if task, err := e.triggerFlushLocked(); err == nil {
-					select {
-					case e.flushChan <- *task:
-					default:
-					}
+			} else if task, err := e.triggerFlushLocked(); err == nil {
+				select {
+				case e.flushChan <- *task:
+				case <-e.ctx.Done():
 				}
+			}
 			}
 			e.memTableMu.Unlock()
 
@@ -667,7 +700,9 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	for _, rec := range records {
 		if rec.ExpiresAt == 0 || now < rec.ExpiresAt {
 			if rec.Op == wal.OpPut {
-				if len(rec.Value) < recThreshold {
+				if vp, ok := decodeWalValuePointer(rec.Value); ok {
+					e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vp), rec.ExpiresAt, rec.Version)
+				} else if len(rec.Value) < recThreshold {
 					e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
 				} else {
 					// large value: replay pointer into memtable (resolved from VLog on read)
@@ -720,6 +755,9 @@ func (e *Engine) executeFlush(task flushTask) {
 			_ = os.Remove(task.oldWalPath)
 		}
 		e.immMemTable.Store(nil)
+		e.memTableMu.Lock()
+		e.l0Cond.Broadcast()
+		e.memTableMu.Unlock()
 		return
 	}
 
@@ -744,6 +782,9 @@ func (e *Engine) executeFlush(task flushTask) {
 	e.levels[0] = append(e.levels[0], sst)
 	e.levelMu[0].Unlock()
 	e.immMemTable.Store(nil)
+	e.memTableMu.Lock()
+	e.l0Cond.Broadcast()
+	e.memTableMu.Unlock()
 
 	// record in manifest
 	e.appendManifest('A', 0, task.seq, sst.MinKey(), sst.MaxKey())
@@ -777,21 +818,26 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 	e.memTable.Store(memtable.NewSkipList())
 
 	seq := atomic.AddUint64(&e.nextSeq, 1)
-	oldWal := e.wal
 	oldWalPath := filepath.Join(e.dataDir, fmt.Sprintf("wal_flush_%06d.log", seq))
 	activeWalPath := filepath.Join(e.dataDir, "wal.log")
 
+	e.walMu.Lock()
+	oldWal := e.wal
+
 	_ = oldWal.Close()
 	if err := os.Rename(activeWalPath, oldWalPath); err != nil {
+		e.walMu.Unlock()
 		return nil, fmt.Errorf("rotate active wal: %w", err)
 	}
 
 	reopenedOldWal, _ := wal.Open(oldWalPath)
 	newWal, err := wal.Open(activeWalPath)
 	if err != nil {
+		e.walMu.Unlock()
 		return nil, fmt.Errorf("create new wal: %w", err)
 	}
 	e.wal = newWal
+	e.walMu.Unlock()
 	atomic.StoreUint32(&e.currentWalFid, uint32(seq+1))
 
 	// Rotate VLog segment to create a clean GC boundary.
@@ -822,16 +868,20 @@ func (e *Engine) PutEx(key, val string, ttlSeconds int64) error {
 
 	kBytes := []byte(key)
 	vBytes := []byte(val)
-	seq := atomic.AddUint64(&e.nextSeq, 1)
 
-	if err := e.applyEntry(wal.OpPut, kBytes, vBytes, expiresAt, seq); err != nil {
-		return fmt.Errorf("wal write: %w", err)
+	req := &writeReq{
+		op:        wal.OpPut,
+		key:       kBytes,
+		val:       vBytes,
+		expiresAt: expiresAt,
+		errCh:     make(chan incrResult, 1),
 	}
-	e.tryFlush()
+	e.writeReq <- req
+	res := <-req.errCh
+	if res.err != nil {
+		return fmt.Errorf("wal write: %w", res.err)
+	}
 	e.metrics.incPut()
-	if e.OnWrite != nil {
-		e.OnWrite(wal.OpPut, kBytes, vBytes, expiresAt)
-	}
 	return nil
 }
 
@@ -1028,16 +1078,18 @@ func (e *Engine) NewVersionIteratorAt(maxVersion uint64) iterator.VersionIterato
 
 func (e *Engine) Delete(key string) (bool, error) {
 	kBytes := []byte(key)
-	seq := atomic.AddUint64(&e.nextSeq, 1)
 
-	if err := e.applyEntry(wal.OpDelete, kBytes, nil, 0, seq); err != nil {
-		return false, err
+	req := &writeReq{
+		op:    wal.OpDelete,
+		key:   kBytes,
+		errCh: make(chan incrResult, 1),
 	}
-	e.tryFlush()
+	e.writeReq <- req
+	res := <-req.errCh
+	if res.err != nil {
+		return false, res.err
+	}
 	e.metrics.incDel()
-	if e.OnWrite != nil {
-		e.OnWrite(wal.OpDelete, kBytes, nil, 0)
-	}
 	return true, nil
 }
 
@@ -1109,29 +1161,10 @@ func (e *Engine) applyEntry(op byte, key, val []byte, expiresAt int64, seq uint6
 		if verr != nil {
 			return verr
 		}
-		_, _ = e.wal.WriteVersion(wal.OpPut, key, nil, expiresAt, seq)
+		_, _ = e.wal.WriteVersion(wal.OpPut, key, encodeWalValuePointer(vpFromVlog(vvp)), expiresAt, seq)
 		mt.PutVersion(key, encodeValuePointer(vpFromVlog(vvp)), expiresAt, seq)
 	}
 	return nil
-}
-
-// tryFlush triggers a memtable flush if the active memtable is full.
-// Called by writers after each batch. Safe to call concurrently.
-func (e *Engine) tryFlush() {
-	e.memTableMu.Lock()
-	defer e.memTableMu.Unlock()
-	if e.activeMemTable().SizeInBytes() >= e.opts.MemTableSize {
-		if e.immutableMemTable() != nil {
-			for e.immutableMemTable() != nil && e.ctx.Err() == nil {
-				e.l0Cond.Wait()
-			}
-		} else if task, err := e.triggerFlushLocked(); err == nil {
-			select {
-			case e.flushChan <- *task:
-			default:
-			}
-		}
-	}
 }
 
 // submitBatch writes a batch of entries atomically through the writer goroutine.
@@ -1440,20 +1473,10 @@ func (e *Engine) compactLevel0() error {
 	merged := iterator.NewMergedIterator(iters, priorities)
 	consolidated := e.drainMergedIterator(merged, iters, baseLevel)
 
-	if len(consolidated) == 0 {	for _, s := range all {
-		e.discardSSTablePointers(s)
-		s.MarkRemove()
-	}
-
-	return nil
-}
-
 	newTables := e.writeSSTablesAtLevel(consolidated, baseLevel)
 
 	// Now that compaction is done, remove old tables and add new ones atomically.
-	e.levelMu[0].Lock()
-	e.levels[0] = nil
-	e.levelMu[0].Unlock()
+	e.removeFromLevel(0, toCompactL0)
 
 	e.levelMu[baseLevel].Lock()
 	e.levels[baseLevel] = append(e.levels[baseLevel], newTables...)
@@ -1524,55 +1547,58 @@ func (e *Engine) compactLevel(fromLevel int) error {
 	}
 	merged := iterator.NewMergedIterator(iters, priorities)
 	consolidated := e.drainMergedIterator(merged, iters, toLevel)
-	if len(consolidated) == 0 {	for _, s := range all {
-		e.discardSSTablePointers(s)
-		s.MarkRemove()
-	}
-
-	return nil
-}
 
 	// split consolidated entries into subcompactionSplits chunks and write in parallel
 	eng := e
 	n := len(consolidated)
-	numSplits := subcompactionSplits
-	if numSplits > n {
-		numSplits = n
-	}
-	chunkSize := (n + numSplits - 1) / numSplits
-
-	type splitResult struct {
-		tables []*sstable.SSTable
-	}
-	results := make([]splitResult, numSplits)
-	syncCh := make(chan int, numSplits)
-
-	spawned := 0
-	for i := 0; i < numSplits; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > n {
-			end = n
-		}
-		if start >= n {
-			break
-		}
-		go func(idx, s, ed int) {
-			results[idx].tables = eng.writeSSTablesAtLevel(consolidated[s:ed], toLevel)
-			syncCh <- idx
-		}(i, start, end)
-		spawned++
-	}
-
-	for i := 0; i < spawned; i++ {
-		<-syncCh
-	}
-
-	// merge all results and insert into target level
 	var newTables []*sstable.SSTable
-	for _, r := range results {
-		newTables = append(newTables, r.tables...)
+	if n > 0 {
+		numSplits := subcompactionSplits
+		if numSplits > n {
+			numSplits = n
+		}
+		chunkSize := (n + numSplits - 1) / numSplits
+
+		var bounds []int
+		start := 0
+		for start < n {
+			end := start + chunkSize
+			if end > n {
+				end = n
+			}
+			for end < n && bytes.Equal(consolidated[end-1].Key, consolidated[end].Key) {
+				end++
+			}
+			bounds = append(bounds, start, end)
+			start = end
+		}
+
+		type splitResult struct {
+			tables []*sstable.SSTable
+		}
+		numChunks := len(bounds) / 2
+		results := make([]splitResult, numChunks)
+		syncCh := make(chan int, numChunks)
+
+		for i := 0; i < numChunks; i++ {
+			s, ed := bounds[i*2], bounds[i*2+1]
+			go func(idx, s, ed int) {
+				results[idx].tables = eng.writeSSTablesAtLevel(consolidated[s:ed], toLevel)
+				syncCh <- idx
+			}(i, s, ed)
+		}
+
+		for i := 0; i < numChunks; i++ {
+			<-syncCh
+		}
+
+		// merge all results and insert into target level
+		for _, r := range results {
+			newTables = append(newTables, r.tables...)
+		}
 	}
+
+	e.removeFromLevel(fromLevel, []*sstable.SSTable{pick})
 
 	e.levelMu[toLevel].Lock()
 	e.levels[toLevel] = append(newTables, e.levels[toLevel]...)
@@ -1581,13 +1607,17 @@ func (e *Engine) compactLevel(fromLevel int) error {
 	})
 	e.levelMu[toLevel].Unlock()
 
+	for _, s := range overlaps {
+		e.appendManifest('D', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
+	}
+	e.appendManifest('D', fromLevel, sstSeqNum(pick), pick.MinKey(), pick.MaxKey())
+	for _, s := range newTables {
+		e.appendManifest('A', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
+	}
+
 	for _, s := range all {
 		e.discardSSTablePointers(s)
 		s.MarkRemove()
-		e.appendManifest('D', s.Level(), sstSeqNum(s), s.MinKey(), s.MaxKey())
-	}
-	for _, s := range newTables {
-		e.appendManifest('A', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
 	}
 
 	return nil
@@ -1615,7 +1645,7 @@ func (e *Engine) drainMergedIterator(merged *iterator.MergedIterator, iters []it
 	for merged.Valid() {
 
 		if merged.Deleted() || (merged.ExpiresAt() > 0 && now >= merged.ExpiresAt()) {
-			canPurge := isBottomLevel && !hasActiveTxns && gcTs == 0
+			canPurge := isBottomLevel && !hasActiveTxns && gcTs == 0 && !e.keyMayExistBelow(targetLevel, merged.Key())
 			if canPurge {
 				e.addDiscard(merged.Value())
 			} else {
@@ -1677,6 +1707,9 @@ func (e *Engine) writeSSTablesAtLevel(entries []memtable.Entry, level int) []*ss
 		if end == 0 {
 			end = 1
 		}
+		for end < len(entries) && bytes.Equal(entries[end-1].Key, entries[end].Key) {
+			end++
+		}
 
 		batch := entries[:end]
 		entries = entries[end:]
@@ -1693,6 +1726,40 @@ func (e *Engine) writeSSTablesAtLevel(entries []memtable.Entry, level int) []*ss
 	}
 
 	return tables
+}
+
+func (e *Engine) removeFromLevel(lvl int, remove []*sstable.SSTable) {
+	e.levelMu[lvl].Lock()
+	remaining := e.levels[lvl][:0]
+	for _, t := range e.levels[lvl] {
+		keep := true
+		for _, rm := range remove {
+			if t == rm {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			remaining = append(remaining, t)
+		}
+	}
+	e.levels[lvl] = remaining
+	e.levelMu[lvl].Unlock()
+}
+
+func (e *Engine) keyMayExistBelow(targetLevel int, key []byte) bool {
+	for lvl := targetLevel + 1; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for _, t := range snapshot {
+			if bytes.Compare(t.MinKey(), key) <= 0 && bytes.Compare(key, t.MaxKey()) <= 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func rangesOverlap(a, b *sstable.SSTable) bool {
@@ -2121,7 +2188,9 @@ func (e *Engine) Clear() error {
 // clearInternal performs the actual clear. Called by the writer goroutine.
 func (e *Engine) clearInternal() error {
 	e.memTableMu.Lock()
+	e.walMu.Lock()
 	defer e.memTableMu.Unlock()
+	defer e.walMu.Unlock()
 
 	e.memTable.Store(memtable.NewSkipList())
 	e.immMemTable.Store(nil)
@@ -2239,7 +2308,8 @@ func (e *Engine) compactManifest() error {
 }
 
 func (e *Engine) RunValueLogGC(targetFid uint32) error {
-	e.gcDiscardTs = atomic.LoadUint64(&e.oracle.nextTs)
+	gcTs := atomic.LoadUint64(&e.oracle.nextTs)
+	e.gcDiscardTs = gcTs
 
 	// Replay live entries from the target VLog segment into the current WAL/VLog.
 	var entriesToRewrite []vlog.ValueEntry
@@ -2274,7 +2344,7 @@ func (e *Engine) RunValueLogGC(targetFid uint32) error {
 	atomic.StoreUint64(&e.gcDiscardTs, 0)
 
 	// Wait until no active MVCC readers can still reference this vlog.
-	for e.oracle.MinReadTs() < atomic.LoadUint64(&e.gcDiscardTs) {
+	for e.oracle.MinReadTs() < gcTs {
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -2709,14 +2779,21 @@ func (e *Engine) Close() error {
 	e.memTableMu.Lock()
 	e.l0Cond.Broadcast()
 	e.memTableMu.Unlock()
+	e.walMu.Lock()
+	e.walMu.Unlock()
 
 	close(e.writeReq)
 	e.wg.Wait()
 
 	var firstErr error
 	if e.wal != nil {
-		if err := e.wal.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		e.walMu.RLock()
+		w := e.wal
+		e.walMu.RUnlock()
+		if w != nil {
+			if err := w.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	for lvl := 0; lvl < MaxLevels; lvl++ {
