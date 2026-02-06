@@ -1,24 +1,99 @@
-# Akwadb
+# AkwaDB
 
-Akwadb is an embedded and networked key-value storage engine written in Go. It implements an LSM-tree architecture, Serializable Snapshot Isolation (MVCC), and a Redis-compatible server protocol (RESP). 
+AkwaDB is a high-performance, embedded and networked key-value storage engine written in Go. It combines an LSM-tree architecture, WiscKey-style Key-Value separation, Serializable Snapshot Isolation (SSI / MVCC), and full compatibility with the Redis (RESP) network protocol.
 
-I built this project primarily to explore the deep internals of database storage engines, drawing inspiration from systems like LevelDB, RocksDB, and BadgerDB.
+Built for low-latency workloads, AkwaDB minimizes write amplification and GC overhead through memory arenas, zero-allocation flat indices, and optional Linux `io_uring` asynchronous I/O.
+
+---
 
 ## Features
 
-* **Storage Engine:** Leveled LSM-tree with background compaction, Bloom filters, and a block cache (TinyLFU/LRU).
-* **Key-Value Separation:** Values larger than a configurable threshold are kept in a Value Log (reusing old WAL files) to keep the LSM tree small and reduce compaction write amplification.
-* **Concurrency:** Serializable Snapshot Isolation (SSI) using an Oracle for transaction timestamps. Lock-free Skiplist for the active memtable.
-* **Network Protocol:** Native support for the Redis protocol (RESP). You can connect to it using standard `redis-cli`.
-* **Replication:** Basic master-replica sync and an experimental Raft-based cluster mode.
-* **Data Types:** Supports Strings, Counters, Hashes, Lists, Sets, Sorted Sets (ZSet), and Bitmaps mapped over a flat KV store.
+### Storage & Performance
+- **Leveled LSM-Tree Engine**: Multi-level compaction with parallel sub-compaction, block-level compression (Snappy / S2), and two-level restart-point indexation.
+- **Key-Value Separation (WiscKey)**: Small values stay inline within SSTables, while large values are transparently written to dedicated, append-only Value Log segments (`vlog_*.log`) with CRC32 checksums and background Garbage Collection.
+- **Memory & Cache Optimizations**: 
+  - Lock-free MemTable SkipList with an inline pointer tower to eliminate per-node slice allocations.
+  - Custom bump/slab allocator (`byteSlab`) keeping memory contiguous and reducing Go runtime GC pressure.
+  - Multi-backend Block Cache (LRU or frequency-aware TinyLFU via Ristretto).
+  - Kirsch-Mitzenmacher dual-hash Bloom filters for fast negative lookups.
+- **Async I/O (`io_uring`)**: Native Linux `io_uring` support for batched, non-blocking disk reads with automatic fallback to standard POSIX `pread`.
+
+### Concurrency & Transactions
+- **Serializable Snapshot Isolation (SSI)**: Multi-Version Concurrency Control (MVCC) powered by a centralized Oracle and watermark tracking.
+- **Strict Read/Write Conflict Detection**: Full ACID compliance with optimistic conflict detection to guarantee data invariants under heavy chaos loads (verified via the Bank Chaos benchmark).
+- **Interactive Transactions & Group Commit**: Pipeline and `MULTI`/`EXEC` support, with group commit batching to optimize WAL `fsync` frequency.
+
+### Network Protocol & Data Types
+- **Redis Protocol (RESP)**: Drop-in compatibility with standard Redis clients (`redis-cli`, Jedis, go-redis, etc.).
+- **Rich Data Structures**: Flat KV mapping for:
+  - **Strings & Counters**: `SET`, `GET`, `SETEX`, `DEL`, `INCR`, `DECR`, `INCRBY`, `MGET`, `MSET`.
+  - **Hashes**: `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`.
+  - **Lists**: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`.
+  - **Sets**: `SADD`, `SMEMBERS`, `SISMEMBER`, `SREM`, `SCARD`.
+  - **Sorted Sets (ZSet)**: `ZADD`, `ZSCORE`, `ZRANGEBYSCORE`, `ZREM` (lexicographically ordered via IEEE 754 sign-flip encoding).
+  - **Bitmaps**: `SETBIT`, `GETBIT`, `BITCOUNT`.
+  - **Pub/Sub**: Scalable in-memory publish/subscribe broker.
+
+### Replication & Clustering
+- **Master-Replica Sync**: Replication stream with an in-memory ring-buffer backlog (`ReplBacklog`) for quick reconnects and non-blocking snapshot streaming.
+- **Cluster Consensus**: Native, experimental Raft consensus engine for distributed log replication and leader elections.
+
+---
+
+## Architecture Overview
+
+```
+                        +----------------------+
+                        |   Redis Client/CLI   |
+                        +----------+-----------+
+                                   | RESP
+                                   v
++----------------------------------+----------------------------------+
+| AkwaDB Server                                                       |
+|                                                                     |
+|  [ RESP Parser ] ----> [ Transaction Manager / SSI Oracle ]         |
+|                                |                                    |
+|       +------------------------+------------------------+           |
+|       |                                                 |           |
+|       v                                                 v           |
+|  +----+------------------+                    +---------+---------+ |
+|  | MemTable (SkipList)   |                    | Value Log (VLog)  | |
+|  | + Arena Allocator     |                    | + Standalone Segs | |
+|  +----+------------------+                    | + Discard Stats GC| |
+|       |                                       +---------+---------+ |
+|       | Flush                                           ^           |
+|       v                                                 |           |
+|  +----+------------------+                              | (Pointers)|
+|  | L0..Ln SSTables       | -----------------------------+           |
+|  | + Bloom Filter        |                                          |
+|  | + S2 Block Compaction |                                          |
+|  | + io_uring Engine     |                                          |
+|  +-----------------------+                                          |
++---------------------------------------------------------------------+
+```
+
+---
 
 ## Getting Started
 
-You can run the server directly or build the binary:
+### Prerequisites
+- Go 1.22+ (Go 1.24+ recommended)
+- `make` (optional)
+
+### Build and Run
+
+Clone the repository and build the binary:
 
 ```bash
+git clone https://github.com/akywaa/akwadb.git
+cd akwadb
+
 make build
+```
+
+Run the server:
+
+```bash
 ./bin/akwadb -addr :6379 -data-dir ./akwadata -memtable-mb 4
 ```
 
@@ -26,25 +101,127 @@ Connect using `redis-cli`:
 
 ```bash
 $ redis-cli -p 6379
-127.0.0.1:6379> SET user:1 "alice"
+127.0.0.1:6379> SET user:100 "alice"
 OK
-127.0.0.1:6379> GET user:1
+127.0.0.1:6379> GET user:100
 "alice"
-127.0.0.1:6379> MULTI
-OK
-127.0.0.1:6379> INCR counter
-QUEUED
-127.0.0.1:6379> EXEC
-1) (integer) 1
+127.0.0.1:6379> HSET account:100 balance 500 status active
+(integer) 2
+127.0.0.1:6379> HGETALL account:100
+1) "balance"
+2) "500"
+3) "status"
+4) "active"
 ```
 
-## Known Limitations & Future Work
+---
 
-Akwadb is currently a working MVP/educational project. There are several architectural trade-offs that differentiate it from production-grade databases like BadgerDB:
+## Embedded Usage (Go API)
 
-1. **VLog Implementation:** Currently, the Value Log simply reuses old, immutable WAL files (`wal_flush_*.log`). A more mature approach would involve dedicated, structured VLog segments with proper headers to optimize garbage collection.
-2. **Write Bottleneck:** Writes are currently funneled through a single channel (`chan *writeReq`) and processed by a single `writer()` goroutine. Future versions will implement a lock-free or more concurrent batching mechanism to improve write throughput.
-3. **Crash-Safety Edge Cases:** While basic `fsync` is implemented, recovery from extreme scenarios (e.g., power loss exactly during manifest rotation or SSTable compression) lacks the rigorous verification found in enterprise databases.
-4. **Raft Cluster:** The Raft implementation is functional but experimental.
+You can also use AkwaDB as an embedded key-value database in your Go applications:
 
-These are tracked as ongoing challenges and will be addressed in future iterations.
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/akywaa/akwadb"
+)
+
+func main() {
+    opts := akwadb.DefaultOptions("./data")
+    db, err := akwadb.OpenEngineWithOpts(opts)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    // 1. Basic KV operations
+    _ = db.Put("greeting", "hello world")
+    val, _ := db.Get("greeting")
+    fmt.Println("greeting:", val)
+
+    // 2. Read-Write Transaction (SSI)
+    err = db.Update(func(tx *akwadb.Tx) error {
+        v, err := tx.Get([]byte("greeting"))
+        if err != nil && err != akwadb.ErrKeyNotFound {
+            return err
+        }
+        return tx.Set([]byte("greeting"), append(v, []byte("!")...))
+    })
+    if err != nil {
+        log.Printf("Transaction conflict or error: %v", err)
+    }
+
+    // 3. Read-Only Snapshot View
+    _ = db.View(func(tx *akwadb.Tx) error {
+        v, _ := tx.Get([]byte("greeting"))
+        fmt.Println("snapshot:", string(v))
+        return nil
+    })
+}
+```
+
+---
+
+## Configuration
+
+Configuration can be specified via command-line flags or a YAML file (`akwadb.yaml`):
+
+```yaml
+listen_addr: ":6379"
+data_dir: "./akwadata"
+password: ""                  # Optional AUTH password
+
+memtable_mb: 4                # Max size of in-memory SkipList before flush
+compaction_threshold: 4       # Number of L0 tables triggering background compaction
+block_cache_size: 1000        # Cached SSTable data blocks
+max_disk_bytes: 10737418240   # 10 GB limit before auto-eviction
+repl_backlog_size: 10000      # Backlog entries for replication reconnects
+```
+
+Run with custom configuration:
+
+```bash
+./bin/akwadb -config ./akwadb.yaml
+```
+
+---
+
+## Observability & Metrics
+
+AkwaDB exports internal telemetry and runtime profiling out of the box:
+
+- **Prometheus Metrics**: `GET http://localhost:6060/metrics`
+  - `akwadb_puts_total`
+  - `akwadb_gets_total`
+  - `akwadb_deletes_total`
+  - `akwadb_flushes_total`
+  - `akwadb_compactions_total`
+- **Pprof Endpoint**: `http://localhost:6060/debug/pprof/`
+- **Redis INFO**: `redis-cli INFO` provides real-time stats and uptime counters.
+
+---
+
+## Testing & Verification
+
+AkwaDB includes an extensive test suite covering unit components, concurrency, recovery, and strict isolation:
+
+```bash
+# Run unit and race-condition tests
+make test
+
+# Run the Bank Chaos SSI stress test (verifies isolation invariants under extreme concurrent load)
+go test -v -run TestBank_HeavyChaos -duration=2m .
+
+# Run benchmarks
+make bench
+```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

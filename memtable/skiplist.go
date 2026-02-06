@@ -452,9 +452,11 @@ func (s *SkipList) All() []Entry {
 
 // VersionEntry contains all fields needed for multi-version iteration.
 type VersionEntry struct {
-	Key     []byte
-	Value   []byte
-	Version uint64
+	Key       []byte
+	Value     []byte
+	Version   uint64
+	Deleted   bool
+	ExpiresAt int64
 }
 
 type SkipListIterator struct {
@@ -474,9 +476,11 @@ func (s *SkipList) AllVersions() []VersionEntry {
 	for curr != nil {
 		// include all versions (not just the latest)
 		entries = append(entries, VersionEntry{
-			Key:     curr.key,
-			Value:   curr.value,
-			Version: curr.version,
+			Key:       curr.key,
+			Value:     curr.value,
+			Version:   curr.version,
+			Deleted:   curr.deleted.Load(),
+			ExpiresAt: curr.expiresAt,
 		})
 		curr = loadForward(curr, 0)
 	}
@@ -490,9 +494,11 @@ func (s *SkipList) AllVersionsAt(maxVersion uint64) []VersionEntry {
 	for curr != nil {
 		if curr.version <= maxVersion {
 			entries = append(entries, VersionEntry{
-				Key:     curr.key,
-				Value:   curr.value,
-				Version: curr.version,
+				Key:       curr.key,
+				Value:     curr.value,
+				Version:   curr.version,
+				Deleted:   curr.deleted.Load(),
+				ExpiresAt: curr.expiresAt,
 			})
 		}
 		curr = loadForward(curr, 0)
@@ -579,6 +585,13 @@ func (it *SkipListIterator) ExpiresAt() int64 {
 		return 0
 	}
 	return it.entries[it.idx].ExpiresAt
+}
+
+func (it *SkipListIterator) Version() uint64 {
+	if !it.Valid() {
+		return 0
+	}
+	return it.entries[it.idx].Version
 }
 
 func (it *SkipListIterator) Valid() bool {

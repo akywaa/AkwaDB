@@ -179,16 +179,16 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 
 		if firstKeyInBlock == nil {
 			firstKeyInBlock = entry.Key
+			blockEntryOffsets = append(blockEntryOffsets, 0)
+			entryCount = 0
+		} else if entryCount%restartInterval == 0 {
+			blockEntryOffsets = append(blockEntryOffsets, uint32(currentBlock.Len()))
 		}
 
 		vLen := uint32(len(entry.Value))
 		isDel := entry.Deleted
 		if isDel {
 			vLen = 0
-		}
-
-		if entryCount%restartInterval == 0 {
-			blockEntryOffsets = append(blockEntryOffsets, uint32(currentBlock.Len()))
 		}
 
 		hdr := RecordHeader{
@@ -655,7 +655,7 @@ func scanBlockForKeyLinear(blockContent []byte, targetKey []byte) ([]byte, bool,
 func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, bool, int64, error) {
 	n := len(br.offsets)
 	lo, hi := 0, n-1
-	restartIdx := 0
+	restartIdx := -1
 	for lo <= hi {
 		mid := (lo + hi) / 2
 		off := int(br.offsets[mid])
@@ -666,7 +666,7 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) <= 0 {
+		if bytes.Compare(curKey, targetKey) < 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {
@@ -674,11 +674,11 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 		}
 	}
 
-	startOff := int(br.offsets[restartIdx])
-	endOff := len(br.data)
-	if restartIdx+1 < n {
-		endOff = int(br.offsets[restartIdx+1])
+	startOff := 0
+	if restartIdx >= 0 {
+		startOff = int(br.offsets[restartIdx])
 	}
+	endOff := len(br.data)
 
 	off := startOff
 	for off < endOff {
@@ -761,7 +761,7 @@ func scanBlockForKeyVersionLinear(blockContent []byte, targetKey []byte, maxVers
 func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersion uint64) ([]byte, bool, bool, int64, uint64, error) {
 	n := len(br.offsets)
 	lo, hi := 0, n-1
-	restartIdx := 0
+	restartIdx := -1
 	for lo <= hi {
 		mid := (lo + hi) / 2
 		off := int(br.offsets[mid])
@@ -772,7 +772,7 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) <= 0 {
+		if bytes.Compare(curKey, targetKey) < 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {
@@ -780,11 +780,11 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		}
 	}
 
-	startOff := int(br.offsets[restartIdx])
-	endOff := len(br.data)
-	if restartIdx+1 < n {
-		endOff = int(br.offsets[restartIdx+1])
+	startOff := 0
+	if restartIdx >= 0 {
+		startOff = int(br.offsets[restartIdx])
 	}
+	endOff := len(br.data)
 
 	var bestVal []byte
 	var bestDel bool
