@@ -65,7 +65,9 @@ func (w *WaterMark) MinReadTs(defaultTs uint64) uint64 {
 
 type Oracle struct {
 	mu        sync.Mutex
+	commitMu  sync.Mutex
 	nextTs    uint64
+	appliedTs uint64
 	history   []committedTxn
 	watermark *WaterMark
 }
@@ -73,17 +75,38 @@ type Oracle struct {
 func newOracle() *Oracle {
 	return &Oracle{
 		nextTs:    1,
+		appliedTs: 1,
 		watermark: newWaterMark(),
 	}
 }
 
+func (o *Oracle) CommitLock()   { o.commitMu.Lock() }
+func (o *Oracle) CommitUnlock() { o.commitMu.Unlock() }
+
 func (o *Oracle) NewReadTs() uint64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.nextTs++
-	readTs := o.nextTs
+	readTs := o.appliedTs
+	if readTs == 0 {
+		readTs = 1
+	}
 	o.watermark.Begin(readTs)
 	return readTs
+}
+
+func (o *Oracle) NewCommitTs() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.nextTs++
+	return o.nextTs
+}
+
+func (o *Oracle) SetAppliedTs(ts uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if ts > o.appliedTs {
+		o.appliedTs = ts
+	}
 }
 
 func (o *Oracle) Bump(minTs uint64) {
@@ -92,20 +115,23 @@ func (o *Oracle) Bump(minTs uint64) {
 	if minTs > o.nextTs {
 		o.nextTs = minTs
 	}
+	if minTs > o.appliedTs {
+		o.appliedTs = minTs
+	}
 }
 
 func (o *Oracle) Done(readTs uint64) {
 	o.mu.Lock()
-	nextTs := o.nextTs
+	appliedTs := o.appliedTs
 	o.mu.Unlock()
-	o.watermark.Done(readTs, nextTs)
+	o.watermark.Done(readTs, appliedTs)
 }
 
 func (o *Oracle) MinReadTs() uint64 {
 	o.mu.Lock()
-	nextTs := o.nextTs
+	appliedTs := o.appliedTs
 	o.mu.Unlock()
-	return o.watermark.MinReadTs(nextTs)
+	return o.watermark.MinReadTs(appliedTs)
 }
 
 func (o *Oracle) CheckAndCommit(readTs uint64, readSet map[string]struct{}, writes map[string]txEntry) (uint64, error) {
@@ -160,7 +186,7 @@ func (o *Oracle) checkAndCommitInternal(readTs uint64, readFps map[uint64]struct
 		writes:   writeFps,
 	})
 
-	minActiveTs := o.watermark.MinReadTs(o.nextTs)
+	minActiveTs := o.watermark.MinReadTs(o.appliedTs)
 	i := 0
 	for ; i < len(o.history); i++ {
 		if o.history[i].commitTs >= minActiveTs {
