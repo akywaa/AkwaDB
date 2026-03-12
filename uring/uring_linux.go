@@ -65,8 +65,6 @@ type ioSqe struct {
 	op_flags   uint32
 	user_data  uint64
 	splice_off [3]uint64
-	// pad to 64 bytes
-	__pad2     uint64
 }
 
 type ioCqe struct {

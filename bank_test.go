@@ -61,7 +61,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	opts := DefaultOptions(dir)
-	opts.MemTableSize = 8 * 1024 * 1024 // note - it crashed when set to 64 * 1024. find out later why this is happening and fix it.
+	opts.MemTableSize = 256 * 1024 // note - it crashed when set to 64 * 1024. find out later why this is happening and fix it.
 
 	opts.CompactionThreshold = 2
 	opts.BlockCacheSize = 2000
@@ -136,43 +136,45 @@ func TestBank_HeavyChaos(t *testing.T) {
 				fromKey := heavyBankKey(from)
 				toKey := heavyBankKey(to)
 
-				err := eng.Update(func(tx *Tx) error {
-					fromValBytes, err := tx.Get(fromKey)
-					if err != nil {
-						return err
+				const maxRetries = 5
+				for attempt := 0; attempt < maxRetries; attempt++ {
+					err := eng.Update(func(tx *Tx) error {
+						fromValBytes, err := tx.Get(fromKey)
+						if err != nil {
+							return err
+						}
+						fromBal, _ := strconv.ParseInt(string(fromValBytes), 10, 64)
+						if fromBal < amt {
+							return fmt.Errorf("insufficient funds")
+						}
+
+						toValBytes, err := tx.Get(toKey)
+						if err != nil {
+							return err
+						}
+						toBal, _ := strconv.ParseInt(string(toValBytes), 10, 64)
+
+						if err := tx.Set(fromKey, []byte(strconv.FormatInt(fromBal-amt, 10))); err != nil {
+							return err
+						}
+						return tx.Set(toKey, []byte(strconv.FormatInt(toBal+amt, 10)))
+					})
+
+					if err == nil {
+						txCommitted.Add(1)
+						break
+					} else if err == ErrTxnConflict {
+						if attempt == maxRetries-1 {
+							txConflicts.Add(1)
+						} else {
+							time.Sleep(time.Duration(rng.Intn(500)) * time.Microsecond)
+						}
+					} else if err.Error() == "insufficient funds" {
+						break
+					} else {
+						txOtherErrors.Add(1)
+						break
 					}
-					fromBal, _ := strconv.ParseInt(string(fromValBytes), 10, 64)
-
-					if fromBal < amt {
-						return fmt.Errorf("insufficient funds")
-					}
-
-					toValBytes, err := tx.Get(toKey)
-					if err != nil {
-						return err
-					}
-					toBal, _ := strconv.ParseInt(string(toValBytes), 10, 64)
-
-					newFrom := strconv.FormatInt(fromBal-amt, 10)
-					newTo := strconv.FormatInt(toBal+amt, 10)
-
-					if err := tx.Set(fromKey, []byte(newFrom)); err != nil {
-						return err
-					}
-					if err := tx.Set(toKey, []byte(newTo)); err != nil {
-						return err
-					}
-					return nil
-				})
-
-				if err == nil {
-					txCommitted.Add(1)
-				} else if err == ErrTxnConflict {
-					txConflicts.Add(1)
-				} else if err.Error() == "insufficient funds" {
-
-				} else {
-					txOtherErrors.Add(1)
 				}
 			}
 		}(w)
@@ -205,6 +207,8 @@ func TestBank_HeavyChaos(t *testing.T) {
 
 				if err == nil {
 					readChecks.Add(1)
+				} else {
+					fmt.Printf("[READER ERR] reader %d failed: %v\n", readerID, err)
 				}
 				time.Sleep(2 * time.Millisecond)
 			}

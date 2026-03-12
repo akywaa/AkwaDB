@@ -15,6 +15,7 @@ type byteSlab struct {
 	buf       []byte
 	off       int
 	allocated int64
+	pooled    bool
 }
 
 var byteSlabPool = sync.Pool{
@@ -24,7 +25,31 @@ var byteSlabPool = sync.Pool{
 }
 
 func newByteSlab() *byteSlab {
-	return byteSlabPool.Get().(*byteSlab)
+	s := byteSlabPool.Get().(*byteSlab)
+	if cap(s.buf) != byteSlabSize {
+		s.buf = make([]byte, byteSlabSize)
+	}
+	s.buf = s.buf[:byteSlabSize]
+	s.off = 0
+	s.allocated = 0
+	s.pooled = false
+	return s
+}
+
+func (s *byteSlab) release() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.pooled {
+		s.mu.Unlock()
+		return
+	}
+	s.pooled = true
+	s.off = 0
+	s.allocated = 0
+	s.mu.Unlock()
+	byteSlabPool.Put(s)
 }
 
 func (s *byteSlab) alloc(data []byte) []byte {

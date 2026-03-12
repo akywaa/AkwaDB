@@ -688,7 +688,7 @@ func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 	}
 	commitTs, err := srv.db.CommitTx(cl.txReadTs, cl.txReadSet, writeKeys)
 	if err != nil {
-		srv.writeError(cl, fmt.Sprintf("ERR %s", err.Error()))
+		srv.writeNullArray(cl)
 		srv.db.RollbackTx(cl.txReadTs)
 		cl.txWrites = nil
 		cl.txReadSet = nil
@@ -729,7 +729,7 @@ func (s *Server) cmdSet(srv *Server, cl *client, args []string) error {
 	}
 	if cl.txWrites != nil {
 		cl.txWrites[strKey(args[0])] = txWriteEntry{value: args[1]}
-		srv.writeSimpleString(cl, "QUEUED")
+		srv.writeSimpleString(cl, "OK")
 	} else {
 		if err := srv.checkClusterWrite(cl); err != nil {
 			srv.writeError(cl, err.Error())
@@ -758,7 +758,7 @@ func (s *Server) cmdSetEx(srv *Server, cl *client, args []string) error {
 			exp = time.Now().Unix() + sec
 		}
 		cl.txWrites[strKey(args[0])] = txWriteEntry{value: args[2], expiresAt: exp}
-		srv.writeSimpleString(cl, "QUEUED")
+		srv.writeSimpleString(cl, "OK")
 	} else if err := srv.db.PutEx(strKey(args[0]), args[2], sec); err != nil {
 		srv.writeError(cl, err.Error())
 	} else {
@@ -1466,6 +1466,10 @@ func (s *Server) writeBulkString(cl *client, val string) {
 
 func (s *Server) writeNull(cl *client) {
 	cl.writer.WriteString("$-1\r\n")
+}
+
+func (s *Server) writeNullArray(cl *client) {
+	cl.writer.WriteString("*-1\r\n")
 }
 
 func (s *Server) writeArrayHeader(cl *client, length int) {

@@ -83,6 +83,13 @@ func NewSkipList() *SkipList {
 	return sl
 }
 
+func (s *SkipList) ReleaseArena() {
+	if s == nil || s.bytes == nil {
+		return
+	}
+	s.bytes.release()
+}
+
 func (s *SkipList) randomLevel() int {
 	lvl := 1
 	for lvl < maxLevel && (s.fastrand()&0xFFFF) < 0x8000 {

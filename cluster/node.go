@@ -483,8 +483,8 @@ func (n *Node) sendCommittedEntries() {
 		entry := n.log[n.lastApplied-1]
 		select {
 		case n.applyCh <- entry:
-		default:
-			slog.Warn("applyCh full, dropping entry", "index", entry.Index)
+		case <-n.ctx.Done():
+			return
 		}
 	}
 }
