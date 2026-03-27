@@ -2,7 +2,6 @@ package akwadb
 
 import (
 	"errors"
-	"sync/atomic"
 	"time"
 
 	"github.com/akywaa/akwadb/server"
@@ -29,13 +28,8 @@ type txEntry struct {
 	deleted   bool
 }
 
-func (e *Engine) syncOracleTs() {
-	e.oracle.Bump(atomic.LoadUint64(&e.nextSeq))
-}
-
 // View opens a read-only transaction with a snapshot at readTs.
 func (e *Engine) View(fn func(tx *Tx) error) error {
-	e.syncOracleTs()
 	tx := &Tx{
 		db:       e,
 		readOnly: true,
@@ -48,7 +42,6 @@ func (e *Engine) View(fn func(tx *Tx) error) error {
 
 // Update opens a read-write transaction with SSI conflict detection.
 func (e *Engine) Update(fn func(tx *Tx) error) error {
-	e.syncOracleTs()
 	tx := &Tx{
 		db:       e,
 		readOnly: false,
@@ -143,13 +136,13 @@ func (tx *Tx) commit() error {
 	}
 
 	tx.db.oracle.CommitLock()
+
 	commitTs, err := tx.db.oracle.CheckAndCommit(tx.readTs, tx.readSet, tx.writes)
-	tx.db.oracle.CommitUnlock()
 	if err != nil {
+		tx.db.oracle.CommitUnlock()
 		return err
 	}
 
-	// atomic apply with explicit commit version
 	entries := make([]server.BatchWriteEntry, 0, len(tx.writes))
 	for k, entry := range tx.writes {
 		entries = append(entries, server.BatchWriteEntry{
@@ -160,7 +153,10 @@ func (tx *Tx) commit() error {
 		})
 	}
 
-	return tx.db.BatchApplyWithVersion(entries, commitTs)
+	errCh := tx.db.enqueueBatchWithVersion(entries, commitTs)
+	tx.db.oracle.CommitUnlock()
+
+	return (<-errCh).err
 }
 
 func (tx *Tx) rollback() {

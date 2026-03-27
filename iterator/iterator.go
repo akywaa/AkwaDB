@@ -50,8 +50,10 @@ func (h itemHeap) Less(i, j int) bool {
 	if cmp != 0 {
 		return cmp < 0
 	}
-	// HIGHER priority wins if keys are identical
-	return h[i].priority > h[j].priority 
+	if h[i].version != h[j].version {
+		return h[i].version > h[j].version
+	}
+	return h[i].priority > h[j].priority
 }
 
 func (h itemHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
@@ -126,14 +128,21 @@ func (m *MergedIterator) Next() bool {
 		heap.Push(&m.heap, top)
 	}
 
-	// dedup: drain other iterators with the same key, keeping the highest priority one
 	for m.heap.Len() > 0 {
 		peek := m.heap[0]
 		if !bytes.Equal(peek.key, m.currKey) {
 			break
 		}
 		dup := heap.Pop(&m.heap).(*heapItem)
-		if m.onDiscard != nil {
+		if dup.version > m.currVer {
+			if m.onDiscard != nil {
+				m.onDiscard(m.currVal)
+			}
+			m.currVal = dup.value
+			m.currVer = dup.version
+			m.currDel = dup.deleted
+			m.currExp = dup.expAt
+		} else if m.onDiscard != nil {
 			m.onDiscard(dup.value)
 		}
 		if dup.iter.Next() {
@@ -290,6 +299,8 @@ func (m *MergedVersionIterator) Next() bool {
 }
 
 func (m *MergedVersionIterator) Entry() VersionEntry { return m.currEntry }
+func (m *MergedVersionIterator) Deleted() bool       { return m.currDel }
+func (m *MergedVersionIterator) ExpiresAt() int64    { return m.currExp }
 func (m *MergedVersionIterator) Valid() bool         { return m.currValid }
 func (m *MergedVersionIterator) Close() error {
 	for _, it := range m.iters {

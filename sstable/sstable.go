@@ -174,7 +174,12 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 	}
 
 	entryCount := 0
+	var prevKey []byte
 	for _, entry := range entries {
+		if firstKeyInBlock != nil && currentBlock.Len() >= TargetBlockSize && !bytes.Equal(entry.Key, prevKey) {
+			flushCurrentBlock()
+		}
+		prevKey = entry.Key
 		keys = append(keys, entry.Key)
 
 		if firstKeyInBlock == nil {
@@ -208,10 +213,6 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 		}
 
 		entryCount++
-
-		if currentBlock.Len() >= TargetBlockSize {
-			flushCurrentBlock()
-		}
 	}
 	flushCurrentBlock()
 
@@ -615,6 +616,9 @@ func scanBlockForKey(blockContent []byte, targetKey []byte) ([]byte, bool, bool,
 	if br != nil && len(br.offsets) > 1 {
 		return scanBlockForKeyBinary(br, targetKey)
 	}
+	if br != nil {
+		return scanBlockForKeyLinear(br.data, targetKey)
+	}
 	return scanBlockForKeyLinear(blockContent, targetKey)
 }
 
@@ -668,7 +672,7 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) <= 0 {
+		if bytes.Compare(curKey, targetKey) < 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {
@@ -706,6 +710,9 @@ func scanBlockForKeyVersion(blockContent []byte, targetKey []byte, maxVersion ui
 	br := parseBlockRestarts(blockContent)
 	if br != nil && len(br.offsets) > 1 {
 		return scanBlockForKeyVersionBinary(br, targetKey, maxVersion)
+	}
+	if br != nil {
+		return scanBlockForKeyVersionLinear(br.data, targetKey, maxVersion)
 	}
 	return scanBlockForKeyVersionLinear(blockContent, targetKey, maxVersion)
 }
@@ -774,7 +781,7 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) <= 0 {
+		if bytes.Compare(curKey, targetKey) < 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {
@@ -1001,6 +1008,9 @@ func (it *SSTableIterator) loadBlock(idx int) bool {
 
 	it.blockData = blockContent
 	it.blockIdx = idx
+	if br := parseBlockRestarts(blockContent); br != nil {
+		blockContent = br.data
+	}
 	it.reader = bytes.NewReader(blockContent)
 	return true
 }

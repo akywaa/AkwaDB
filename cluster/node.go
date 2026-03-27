@@ -194,10 +194,7 @@ func (n *Node) persistLogEntry(entry LogEntry) error {
 	}
 	_ = os.MkdirAll(n.config.DataDir, 0755)
 
-	data, err := json.Marshal(entry.Command)
-	if err != nil {
-		return err
-	}
+	data := encodeRaftCommand(entry.Command)
 
 	// Format: [term(8)][index(8)][cmdLen(4)][cmdData]
 	var hdr [20]byte
@@ -237,8 +234,8 @@ func (n *Node) loadLogEntries() []LogEntry {
 		if off+cmdLen > len(data) {
 			break
 		}
-		var cmd raftCommand
-		if err := json.Unmarshal(data[off:off+cmdLen], &cmd); err != nil {
+		cmd, err := decodeRaftCommand(data[off : off+cmdLen])
+		if err != nil {
 			off += cmdLen
 			continue
 		}
@@ -732,8 +729,7 @@ func (n *Node) applyLoop() {
 		case <-n.ctx.Done():
 			return
 		case entry := <-n.applyCh:
-			data, _ := json.Marshal(entry.Command)
-			result := n.fsm.Apply(data)
+			result := n.fsm.Apply(encodeRaftCommand(entry.Command))
 			if result != nil {
 				if _, ok := result.(error); ok {
 					slog.Error("FSM apply failed", "result", result)

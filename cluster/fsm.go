@@ -1,7 +1,9 @@
 package cluster
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 
 	"github.com/akywaa/akwadb/server"
@@ -9,8 +11,108 @@ import (
 
 // raftCommand is the serialized form of a write operation replicated via Raft.
 type raftCommand struct {
-	Op      string                   `json:"op"`
-	Entries []server.BatchWriteEntry `json:"entries"`
+	Op      string
+	Entries []server.BatchWriteEntry
+}
+
+const raftCmdDeletedFlag byte = 1 << 0
+
+var errTruncatedRaftCommand = errors.New("cluster: truncated raft command")
+
+func encodeRaftCommand(cmd raftCommand) []byte {
+	buf := make([]byte, 0, 64)
+	var scratch [8]byte
+
+	binary.BigEndian.PutUint32(scratch[:4], uint32(len(cmd.Op)))
+	buf = append(buf, scratch[:4]...)
+	buf = append(buf, cmd.Op...)
+
+	binary.BigEndian.PutUint32(scratch[:4], uint32(len(cmd.Entries)))
+	buf = append(buf, scratch[:4]...)
+
+	for _, e := range cmd.Entries {
+		binary.BigEndian.PutUint32(scratch[:4], uint32(len(e.Key)))
+		buf = append(buf, scratch[:4]...)
+		buf = append(buf, e.Key...)
+
+		binary.BigEndian.PutUint32(scratch[:4], uint32(len(e.Value)))
+		buf = append(buf, scratch[:4]...)
+		buf = append(buf, e.Value...)
+
+		binary.BigEndian.PutUint64(scratch[:8], uint64(e.ExpiresAt))
+		buf = append(buf, scratch[:8]...)
+
+		var flags byte
+		if e.Deleted {
+			flags = raftCmdDeletedFlag
+		}
+		buf = append(buf, flags)
+	}
+
+	return buf
+}
+
+func decodeRaftCommand(data []byte) (raftCommand, error) {
+	var cmd raftCommand
+	off := 0
+
+	readBytes := func() ([]byte, error) {
+		if off+4 > len(data) {
+			return nil, errTruncatedRaftCommand
+		}
+		n := uint64(binary.BigEndian.Uint32(data[off : off+4]))
+		off += 4
+		if uint64(off)+n > uint64(len(data)) {
+			return nil, errTruncatedRaftCommand
+		}
+		b := data[off : off+int(n)]
+		off += int(n)
+		return b, nil
+	}
+
+	op, err := readBytes()
+	if err != nil {
+		return cmd, err
+	}
+	cmd.Op = string(op)
+
+	if off+4 > len(data) {
+		return cmd, errTruncatedRaftCommand
+	}
+	count := binary.BigEndian.Uint32(data[off : off+4])
+	off += 4
+	if uint64(count) > uint64(len(data)) {
+		return cmd, errTruncatedRaftCommand
+	}
+
+	entries := make([]server.BatchWriteEntry, 0, count)
+	for i := uint32(0); i < count; i++ {
+		key, err := readBytes()
+		if err != nil {
+			return cmd, err
+		}
+		value, err := readBytes()
+		if err != nil {
+			return cmd, err
+		}
+		if off+9 > len(data) {
+			return cmd, errTruncatedRaftCommand
+		}
+		expiresAt := int64(binary.BigEndian.Uint64(data[off : off+8]))
+		off += 8
+		flags := data[off]
+		off++
+
+		entries = append(entries, server.BatchWriteEntry{
+			Key:       string(key),
+			Value:     string(value),
+			ExpiresAt: expiresAt,
+			Deleted:   flags&raftCmdDeletedFlag != 0,
+		})
+	}
+
+	cmd.Entries = entries
+	return cmd, nil
 }
 
 // EngineFSM implements the Raft FSM interface, applying committed log entries
@@ -25,8 +127,8 @@ func NewEngineFSM(db server.DB) *EngineFSM {
 
 // Apply is called by Raft when a log entry is committed by a quorum.
 func (f *EngineFSM) Apply(data []byte) interface{} {
-	var cmd raftCommand
-	if err := json.Unmarshal(data, &cmd); err != nil {
+	cmd, err := decodeRaftCommand(data)
+	if err != nil {
 		return err
 	}
 	return f.db.BatchApply(cmd.Entries)

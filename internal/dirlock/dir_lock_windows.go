@@ -1,6 +1,6 @@
 //go:build windows
 
-package akwadb
+package dirlock
 
 import (
 	"errors"
@@ -11,11 +11,11 @@ import (
 
 var ErrDatabaseLocked = errors.New("cannot acquire directory lock: database is already in use by another process")
 
-type dirLock struct {
+type DirLock struct {
 	file *os.File
 }
 
-func acquireDirLock(dir string) (*dirLock, error) {
+func AcquireDirLock(dir string) (*DirLock, error) {
 	lockPath := filepath.Join(dir, "LOCK")
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|os.O_EXCL, 0644)
 	if err != nil {
@@ -26,10 +26,10 @@ func acquireDirLock(dir string) (*dirLock, error) {
 	}
 	fmt.Fprintf(f, "%d %s\n", os.Getpid(), os.Args[0])
 	f.Sync()
-	return &dirLock{file: f}, nil
+	return &DirLock{file: f}, nil
 }
 
-func (l *dirLock) release() error {
+func (l *DirLock) Release() error {
 	if l == nil || l.file == nil {
 		return nil
 	}

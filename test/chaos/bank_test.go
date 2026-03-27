@@ -1,4 +1,4 @@
-package akwadb
+package chaos_test
 
 import (
 	"flag"
@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/akywaa/akwadb"
 )
 
 var (
@@ -27,7 +29,7 @@ func heavyBankKey(id int) []byte {
 	return []byte(fmt.Sprintf("acct:%06d", id))
 }
 
-func heavyBankSeed(e *Engine) error {
+func heavyBankSeed(e *akwadb.Engine) error {
 	for i := 0; i < heavyBankAccounts; i++ {
 		val := []byte(strconv.Itoa(heavyBankInitialBal))
 		if err := e.Put(string(heavyBankKey(i)), string(val)); err != nil {
@@ -37,7 +39,7 @@ func heavyBankSeed(e *Engine) error {
 	return nil
 }
 
-func readTotalAcrossAccounts(tx *Tx) (int64, error) {
+func readTotalAcrossAccounts(tx *akwadb.Tx) (int64, error) {
 	var total int64
 	for i := 0; i < heavyBankAccounts; i++ {
 		valBytes, err := tx.Get(heavyBankKey(i))
@@ -60,13 +62,13 @@ func TestBank_HeavyChaos(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	opts := DefaultOptions(dir)
+	opts := akwadb.DefaultOptions(dir)
 	opts.MemTableSize = 256 * 1024 // note - it crashed when set to 64 * 1024. find out later why this is happening and fix it.
 
 	opts.CompactionThreshold = 2
 	opts.BlockCacheSize = 2000
 
-	eng, err := OpenEngineWithOpts(opts)
+	eng, err := akwadb.OpenEngineWithOpts(opts)
 	if err != nil {
 		t.Fatalf("Failed to open engine: %v", err)
 	}
@@ -79,7 +81,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 
 	expectedTotal := int64(heavyBankAccounts * heavyBankInitialBal)
 
-	err = eng.View(func(tx *Tx) error {
+	err = eng.View(func(tx *akwadb.Tx) error {
 		tot, err := readTotalAcrossAccounts(tx)
 		if err != nil {
 			return err
@@ -138,7 +140,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 
 				const maxRetries = 5
 				for attempt := 0; attempt < maxRetries; attempt++ {
-					err := eng.Update(func(tx *Tx) error {
+					err := eng.Update(func(tx *akwadb.Tx) error {
 						fromValBytes, err := tx.Get(fromKey)
 						if err != nil {
 							return err
@@ -163,7 +165,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 					if err == nil {
 						txCommitted.Add(1)
 						break
-					} else if err == ErrTxnConflict {
+					} else if err == akwadb.ErrTxnConflict {
 						if attempt == maxRetries-1 {
 							txConflicts.Add(1)
 						} else {
@@ -191,7 +193,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 				default:
 				}
 
-				err := eng.View(func(tx *Tx) error {
+				err := eng.View(func(tx *akwadb.Tx) error {
 					tot, err := readTotalAcrossAccounts(tx)
 					if err != nil {
 						return err
@@ -246,7 +248,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 	<-monitorDone
 
 	var finalTotal int64
-	err = eng.View(func(tx *Tx) error {
+	err = eng.View(func(tx *akwadb.Tx) error {
 		var err error
 		finalTotal, err = readTotalAcrossAccounts(tx)
 		return err
