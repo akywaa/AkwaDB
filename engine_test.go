@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func testEngine(t *testing.T) *Engine {
@@ -298,6 +299,24 @@ func BenchmarkEngine_ParallelPut(b *testing.B) {
 			i++
 		}
 	})
+}
+
+func TestEngine_TTLExpirySweep(t *testing.T) {
+	e := testEngine(t)
+	defer func() { e.Close(); os.RemoveAll(e.dataDir) }()
+
+	if err := e.PutEx("expiring", "value", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, found, deleted, _ := e.activeMemTable().Get([]byte("expiring")); found && deleted {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("expired key was never physically removed from the memtable")
 }
 
 func BenchmarkEngine_ParallelGet(b *testing.B) {

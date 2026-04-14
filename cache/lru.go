@@ -43,6 +43,7 @@ func NewLRUCache(capacity int) *LRUCache {
 	if perShard < 1 {
 		perShard = 1
 	}
+	remainder := capacity % nShards
 
 	c := &LRUCache{
 		shards: make([]shard, nShards),
@@ -52,6 +53,9 @@ func NewLRUCache(capacity int) *LRUCache {
 	for i := range c.shards {
 		s := &c.shards[i]
 		s.cap = perShard
+		if i < remainder {
+			s.cap++
+		}
 		s.tbl = make(map[string]*node, perShard)
 
 		// dummy sentinels avoid edge-case nil checks on head/tail insertions

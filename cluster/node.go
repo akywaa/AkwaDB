@@ -630,7 +630,6 @@ func (n *Node) broadcastAppend() {
 	leaderID := n.config.NodeID
 	term := n.term
 	commitIndex := n.commitIndex
-	logLen := uint64(len(n.log))
 	peers := make([]string, 0, len(n.config.Peers))
 	for _, p := range n.config.Peers {
 		peers = append(peers, p)
@@ -639,18 +638,19 @@ func (n *Node) broadcastAppend() {
 
 	for _, peerAddr := range peers {
 		go func(addr string) {
-			n.sendAppendEntries(addr, leaderID, term, commitIndex, logLen)
+			n.sendAppendEntries(addr, leaderID, term, commitIndex)
 		}(peerAddr)
 	}
 }
 
-func (n *Node) sendAppendEntries(addr, leaderID string, term, commitIndex, logLen uint64) {
+func (n *Node) sendAppendEntries(addr, leaderID string, term, commitIndex uint64) {
 	n.mu.Lock()
 	nextIdx := n.nextIndex[addr]
+	logLen := uint64(len(n.log))
 	var prevLogIndex, prevLogTerm uint64
 	if nextIdx > 1 {
 		prevLogIndex = nextIdx - 1
-		if prevLogIndex-1 < uint64(len(n.log)) {
+		if prevLogIndex-1 < logLen {
 			prevLogTerm = n.log[prevLogIndex-1].Term
 		}
 	}

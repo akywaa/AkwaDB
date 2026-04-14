@@ -231,6 +231,25 @@ func (w *WAL) FlushAndSync() error {
 	return w.file.Sync()
 }
 
+func (w *WAL) Offset() int64 {
+	return w.currentOffset.Load()
+}
+
+func (w *WAL) TruncateTo(offset int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.writer.Reset(w.file)
+	if err := w.file.Truncate(offset); err != nil {
+		return err
+	}
+	if _, err := w.file.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	w.currentOffset.Store(offset)
+	return w.file.Sync()
+}
+
 func (w *WAL) Recover() ([]Record, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
