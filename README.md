@@ -4,6 +4,9 @@ AkwaDB is a high-performance, embedded and networked key-value storage engine wr
 
 Built for low-latency workloads, AkwaDB minimizes write amplification and GC overhead through memory arenas, zero-allocation flat indices, and optional Linux `io_uring` asynchronous I/O.
 
+Architecture & Comparison
+Unlike bare-metal embedded engines (like BadgerDB or RocksDB) that only provide raw byte-to-byte storage, AkwaDB is a hybrid embedded-networked storage engine. It natively implements the Redis RESP protocol, advanced data types (ZSets with IEEE 754 float sign-inversion, Bitmaps, Lists), distributed Raft consensus, and Linux io_uring asynchronous I/O with zero-Cgo memory safety.
+
 ---
 
 ## Features
