@@ -59,22 +59,22 @@ func (s *byteSlab) alloc(data []byte) []byte {
 	}
 
 	s.mu.Lock()
-	// allocate fresh chunk if current slab is exhausted
+	defer s.mu.Unlock()
+
 	if s.off+n > len(s.buf) {
 		sz := byteSlabSize
 		if n > sz {
-			sz = n // oversized key/value payload
+			sz = n
 		}
 		s.buf = make([]byte, sz)
 		s.off = 0
 	}
 
 	copy(s.buf[s.off:s.off+n], data)
-	// 3-index slice [off:off+n:off+n] sets cap == len to prevent accidental append overwrites
-	result := s.buf[s.off : s.off+n : s.off+n]
+	result := make([]byte, n)
+	copy(result, s.buf[s.off:s.off+n])
 	s.off += n
 	s.allocated += int64(n)
-	s.mu.Unlock()
 	return result
 }
 

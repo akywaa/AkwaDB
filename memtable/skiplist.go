@@ -305,7 +305,7 @@ func (s *SkipList) Get(key []byte) ([]byte, bool, bool, int64) {
 			return nil, true, true, 0
 		}
 		if best.expiresAt > 0 && time.Now().Unix() >= best.expiresAt {
-			return nil, false, false, 0
+			return nil, true, true, 0
 		}
 		return best.value, true, false, best.expiresAt
 	}
@@ -381,7 +381,7 @@ func (s *SkipList) GetByVersion(key []byte, maxVersion uint64) ([]byte, bool, bo
 			return nil, true, true, 0
 		}
 		if best.expiresAt > 0 && time.Now().Unix() >= best.expiresAt {
-			return nil, false, false, 0
+			return nil, true, true, 0
 		}
 		return best.value, true, false, best.expiresAt
 	}
@@ -455,11 +455,10 @@ type VersionEntry struct {
 }
 
 type SkipListIterator struct {
-	entries []Entry
-	idx     int
+	sl  *SkipList
+	curr *Node
 }
 
-// VersionIterator iterates over all versions of all keys.
 type SkipListVersionIterator struct {
 	entries []VersionEntry
 	idx     int
@@ -469,7 +468,6 @@ func (s *SkipList) AllVersions() []VersionEntry {
 	var entries []VersionEntry
 	curr := loadForward(s.head, 0)
 	for curr != nil {
-		// include all versions (not just the latest)
 		entries = append(entries, VersionEntry{
 			Key:       curr.key,
 			Value:     curr.value,
@@ -479,10 +477,16 @@ func (s *SkipList) AllVersions() []VersionEntry {
 		})
 		curr = loadForward(curr, 0)
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		cmp := bytes.Compare(entries[i].Key, entries[j].Key)
+		if cmp != 0 {
+			return cmp < 0
+		}
+		return entries[i].Version > entries[j].Version
+	})
 	return entries
 }
 
-// AllVersionsAt returns all versions of all keys that existed at or before maxVersion.
 func (s *SkipList) AllVersionsAt(maxVersion uint64) []VersionEntry {
 	var entries []VersionEntry
 	curr := loadForward(s.head, 0)
@@ -537,20 +541,29 @@ func (it *SkipListVersionIterator) Close() error {
 }
 
 func (s *SkipList) NewIterator() *SkipListIterator {
-	return &SkipListIterator{
-		entries: s.All(),
-		idx:     0,
-	}
+	return &SkipListIterator{sl: s, curr: loadForward(s.head, 0)}
 }
 
 func (it *SkipListIterator) Seek(key []byte) {
-	it.idx = sort.Search(len(it.entries), func(i int) bool {
-		return bytes.Compare(it.entries[i].Key, key) >= 0
-	})
+	it.curr = nil
+	level := int(it.sl.level.Load())
+	node := it.sl.head
+	for i := level - 1; i >= 0; i-- {
+		for n := loadForward(node, i); n != nil && bytes.Compare(n.key, key) < 0; n = loadForward(n, i) {
+			node = n
+		}
+	}
+	it.curr = loadForward(node, 0)
+	for it.curr != nil && bytes.Compare(it.curr.key, key) < 0 {
+		it.curr = loadForward(it.curr, 0)
+	}
 }
 
 func (it *SkipListIterator) Next() bool {
-	it.idx++
+	if it.curr == nil {
+		return false
+	}
+	it.curr = loadForward(it.curr, 0)
 	return it.Valid()
 }
 
@@ -558,42 +571,42 @@ func (it *SkipListIterator) Key() []byte {
 	if !it.Valid() {
 		return nil
 	}
-	return it.entries[it.idx].Key
+	return it.curr.key
 }
 
 func (it *SkipListIterator) Value() []byte {
 	if !it.Valid() {
 		return nil
 	}
-	return it.entries[it.idx].Value
+	return it.curr.value
 }
 
 func (it *SkipListIterator) Deleted() bool {
 	if !it.Valid() {
 		return false
 	}
-	return it.entries[it.idx].Deleted
+	return it.curr.deleted.Load()
 }
 
 func (it *SkipListIterator) ExpiresAt() int64 {
 	if !it.Valid() {
 		return 0
 	}
-	return it.entries[it.idx].ExpiresAt
+	return it.curr.expiresAt
 }
 
 func (it *SkipListIterator) Version() uint64 {
 	if !it.Valid() {
 		return 0
 	}
-	return it.entries[it.idx].Version
+	return it.curr.version
 }
 
 func (it *SkipListIterator) Valid() bool {
-	return it.idx >= 0 && it.idx < len(it.entries)
+	return it.curr != nil
 }
 
 func (it *SkipListIterator) Close() error {
-	it.entries = nil
+	it.curr = nil
 	return nil
 }

@@ -71,6 +71,8 @@ type Oracle struct {
 	awaiting  map[uint64]struct{}
 	history   []committedTxn
 	watermark *WaterMark
+	readMu    sync.Mutex
+	readSeqs  map[uint64]struct{}
 }
 
 func newOracle() *Oracle {
@@ -79,6 +81,7 @@ func newOracle() *Oracle {
 		appliedTs: 1,
 		awaiting:  make(map[uint64]struct{}),
 		watermark: newWaterMark(),
+		readSeqs:  make(map[uint64]struct{}),
 	}
 }
 
@@ -115,12 +118,16 @@ func (o *Oracle) MarkApplied(ts uint64) {
 		return
 	}
 	delete(o.awaiting, ts)
+	delete(o.readSeqs, ts)
 	for {
 		next := o.appliedTs + 1
 		if next > o.nextTs {
 			break
 		}
 		if _, pending := o.awaiting[next]; pending {
+			break
+		}
+		if _, activeRead := o.readSeqs[next]; activeRead {
 			break
 		}
 		o.appliedTs = next
@@ -136,6 +143,11 @@ func (o *Oracle) Bump(minTs uint64) {
 	if minTs > o.appliedTs {
 		o.appliedTs = minTs
 	}
+	for ts := range o.readSeqs {
+		if ts < minTs {
+			delete(o.readSeqs, ts)
+		}
+	}
 }
 
 func (o *Oracle) Done(readTs uint64) {
@@ -143,6 +155,9 @@ func (o *Oracle) Done(readTs uint64) {
 	appliedTs := o.appliedTs
 	o.mu.Unlock()
 	o.watermark.Done(readTs, appliedTs)
+	o.mu.Lock()
+	delete(o.readSeqs, readTs)
+	o.mu.Unlock()
 }
 
 func (o *Oracle) MinReadTs() uint64 {
@@ -150,6 +165,20 @@ func (o *Oracle) MinReadTs() uint64 {
 	appliedTs := o.appliedTs
 	o.mu.Unlock()
 	return o.watermark.MinReadTs(appliedTs)
+}
+
+func (o *Oracle) BeginRead() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	ts := o.nextTs
+	o.readSeqs[ts] = struct{}{}
+	return ts
+}
+
+func (o *Oracle) DoneRead(ts uint64) {
+	o.mu.Lock()
+	delete(o.readSeqs, ts)
+	o.mu.Unlock()
 }
 
 func (o *Oracle) CheckAndCommit(readTs uint64, readSet map[string]struct{}, writes map[string]txEntry) (uint64, error) {

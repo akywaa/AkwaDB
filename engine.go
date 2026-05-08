@@ -292,7 +292,7 @@ type Engine struct {
 }
 
 func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList) incrResult {
-	current, err := e.getWithoutLock(r.key)
+	current, err := e.getForReadAt(r.key, r.seq)
 	if err != nil && err != ErrKeyNotFound {
 		return incrResult{err: err}
 	}
@@ -438,8 +438,12 @@ func (e *Engine) writer() {
 				}
 			}
 
+			sorted := make([]*writeReq, len(batch))
+			copy(sorted, batch)
+			sort.Slice(sorted, func(i, j int) bool { return sorted[i].seq < sorted[j].seq })
+
 			mt := e.activeMemTable()
-			for _, r := range batch {
+			for _, r := range sorted {
 				if r.seq == 0 {
 					r.seq = e.oracle.NewCommitTs()
 					atomic.StoreUint64(&e.nextSeq, r.seq)
@@ -944,55 +948,20 @@ func (e *Engine) Get(key string) (string, error) {
 	return e.getByString([]byte(key))
 }
 
-func (e *Engine) getByString(kBytes []byte) (string, error) {
-	mt, imm := e.getSnapshot()
-
-	if val, found, deleted, _ := mt.Get(kBytes); found {
-		if deleted {
-			return "", ErrKeyNotFound
-		}
-		realVal, err := e.resolveValue(val)
-		return string(realVal), err
+func (e *Engine) getForReadAt(kBytes []byte, seq uint64) (string, error) {
+	if seq == 0 {
+		seq = e.oracle.BeginRead()
+		defer e.oracle.DoneRead(seq)
 	}
-
-	if imm != nil {
-		if val, found, deleted, _ := imm.Get(kBytes); found {
-			if deleted {
-				return "", ErrKeyNotFound
-			}
-			realVal, err := e.resolveValue(val)
-			return string(realVal), err
-		}
-	}
-
-	for lvl := 0; lvl < MaxLevels; lvl++ {
-		e.levelMu[lvl].RLock()
-		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
-		copy(snapshot, e.levels[lvl])
-		e.levelMu[lvl].RUnlock()
-		for i := len(snapshot) - 1; i >= 0; i-- {
-			val, found, deleted, _, _, err := snapshot[i].Get(kBytes)
-			if err != nil {
-				continue
-			}
-			if found {
-				if deleted {
-					return "", ErrKeyNotFound
-				}
-				realVal, err := e.resolveValue(val)
-				return string(realVal), err
-			}
-		}
-	}
-
-	return "", ErrKeyNotFound
+	return e.getByAt(kBytes, seq)
 }
 
-// GetByVersion returns the value for key whose version <= maxVersion.
-// Used by transactions to read a consistent snapshot.
-func (e *Engine) GetByVersion(key string, maxVersion uint64) (string, error) {
+func (e *Engine) getByString(kBytes []byte) (string, error) {
+	return e.getByAt(kBytes, e.activeMemTable().CurrentVersion())
+}
+
+func (e *Engine) getByAt(kBytes []byte, maxVersion uint64) (string, error) {
 	mt, imm := e.getSnapshot()
-	kBytes := []byte(key)
 
 	if val, found, deleted, _ := mt.GetByVersion(kBytes, maxVersion); found {
 		if deleted {
@@ -1033,6 +1002,13 @@ func (e *Engine) GetByVersion(key string, maxVersion uint64) (string, error) {
 	}
 
 	return "", ErrKeyNotFound
+}
+
+
+// GetByVersion returns the value for key whose version <= maxVersion.
+// Used by transactions to read a consistent snapshot.
+func (e *Engine) GetByVersion(key string, maxVersion uint64) (string, error) {
+	return e.getByAt([]byte(key), maxVersion)
 }
 
 // CurrentVersion returns the current version counter.

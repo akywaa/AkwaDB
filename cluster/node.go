@@ -704,6 +704,8 @@ func (n *Node) sendAppendEntries(addr, leaderID string, term, commitIndex uint64
 }
 
 func (n *Node) maybeAdvanceCommitLocked() {
+	totalNodes := 1 + len(n.config.Peers)
+	required := (totalNodes / 2) + 1
 	for idx := uint64(len(n.log)); idx > n.commitIndex; idx-- {
 		if n.log[idx-1].Term != n.term {
 			continue
@@ -714,7 +716,7 @@ func (n *Node) maybeAdvanceCommitLocked() {
 				count++
 			}
 		}
-		if count > len(n.config.Peers)/2 {
+		if count >= required {
 			n.commitIndex = idx
 			n.sendCommittedEntries()
 			break

@@ -684,7 +684,29 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 	if restartIdx >= 0 {
 		startOff = int(br.offsets[restartIdx])
 	}
+	if startOff == 0 && n > 0 {
+		firstOff := int(br.offsets[0])
+		if firstOff+recordHeaderSize <= len(br.data) {
+			var firstHdr RecordHeader
+			firstHdr.Decode(br.data[firstOff:])
+			firstKey := br.data[firstOff+recordHeaderSize : firstOff+recordHeaderSize+int(firstHdr.KeyLen)]
+			if bytes.Compare(firstKey, targetKey) == 0 {
+				restartIdx = 0
+	
+			}
+		}
+	}
+	if restartIdx == -1 {
+		return nil, false, false, 0, nil
+	}
+	startOff = int(br.offsets[restartIdx])
 	endOff := len(br.data)
+
+	var bestVal []byte
+	bestDeleted := false
+	bestExp := int64(0)
+	bestVersion := uint64(0)
+	found := false
 
 	off := startOff
 	for off < endOff {
@@ -693,17 +715,27 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 			break
 		}
 		if bytes.Equal(k, targetKey) {
-			if hdr.ExpiresAt > 0 && time.Now().Unix() >= hdr.ExpiresAt {
-				return nil, false, false, 0, nil
+			if hdr.Version > bestVersion {
+				bestVal = v
+				bestDeleted = hdr.Deleted
+				bestExp = hdr.ExpiresAt
+				bestVersion = hdr.Version
+				found = true
+	
 			}
-			return v, true, hdr.Deleted, hdr.ExpiresAt, nil
-		}
-		if bytes.Compare(k, targetKey) > 0 {
+		} else if bytes.Compare(k, targetKey) > 0 {
 			break
 		}
 		off = nextOff
 	}
-	return nil, false, false, 0, nil
+
+	if !found {
+		return nil, false, false, 0, nil
+	}
+	if bestExp > 0 && time.Now().Unix() >= bestExp {
+		return nil, false, false, 0, nil
+	}
+	return bestVal, true, bestDeleted, bestExp, nil
 }
 
 func scanBlockForKeyVersion(blockContent []byte, targetKey []byte, maxVersion uint64) ([]byte, bool, bool, int64, uint64, error) {
