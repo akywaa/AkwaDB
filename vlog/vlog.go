@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/akywaa/akwadb/internal/crypto"
 )
 
 var (
@@ -25,9 +27,11 @@ const (
 )
 
 const (
-	segmentMagic   uint32 = 0x564C4F47 // "VLOG"
-	segmentVersion uint32 = 1
-	segmentHeaderSize     = 8 // magic(4) + version(4)
+	segmentMagic          uint32 = 0x564C4F47 // "VLOG"
+	segmentVersion        uint32 = 1
+	segmentVersionEncrypt uint32 = 2
+	segmentHeaderSize           = 8  // magic(4) + version(4)
+	encSegmentHeaderSize        = 32 // magic(4) + version(4) + keyID(8) + baseIV(16)
 
 	// Entry format:
 	// +--------+----------+----------+--------+-------------------+------+--------+
@@ -82,9 +86,14 @@ type segment struct {
 	maxSize  int64
 	closed   bool
 	mu       sync.Mutex
+
+	encrypted bool
+	keyID     uint64
+	baseIV    []byte
+	key       []byte
 }
 
-func openSegment(path string, fid uint32, maxSize int64) (*segment, error) {
+func openSegment(path string, fid uint32, maxSize int64, reg *crypto.KeyRegistry) (*segment, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("vlog open %s: %w", path, err)
@@ -103,16 +112,68 @@ func openSegment(path string, fid uint32, maxSize int64) (*segment, error) {
 		maxSize: maxSize,
 	}
 
-	// Write header if the file is new (empty).
-	if s.offset == 0 {
-		var hdr [segmentHeaderSize]byte
-		binary.BigEndian.PutUint32(hdr[0:4], segmentMagic)
-		binary.BigEndian.PutUint32(hdr[4:8], segmentVersion)
-		if _, err := s.writer.Write(hdr[:]); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("vlog write header: %w", err)
+	switch {
+	case stat.Size() == 0:
+		// New segment: write a header, encrypted when a registry is configured.
+		if reg != nil {
+			baseIV, err := crypto.NewBaseIV()
+			if err != nil {
+				f.Close()
+				return nil, err
+			}
+			keyID, key := reg.ActiveKey()
+			var hdr [encSegmentHeaderSize]byte
+			binary.BigEndian.PutUint32(hdr[0:4], segmentMagic)
+			binary.BigEndian.PutUint32(hdr[4:8], segmentVersionEncrypt)
+			binary.BigEndian.PutUint64(hdr[8:16], keyID)
+			copy(hdr[16:32], baseIV)
+			if _, err := s.writer.Write(hdr[:]); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("vlog write header: %w", err)
+			}
+			s.encrypted = true
+			s.keyID = keyID
+			s.baseIV = baseIV
+			s.key = key
+			s.offset = encSegmentHeaderSize
+		} else {
+			var hdr [segmentHeaderSize]byte
+			binary.BigEndian.PutUint32(hdr[0:4], segmentMagic)
+			binary.BigEndian.PutUint32(hdr[4:8], segmentVersion)
+			if _, err := s.writer.Write(hdr[:]); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("vlog write header: %w", err)
+			}
+			s.offset = segmentHeaderSize
 		}
-		s.offset += segmentHeaderSize
+	default:
+		// Existing segment: read its header to detect encryption metadata.
+		var base [segmentHeaderSize]byte
+		if _, err := f.ReadAt(base[:], 0); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("vlog read header: %w", err)
+		}
+		if binary.BigEndian.Uint32(base[0:4]) == segmentMagic &&
+			binary.BigEndian.Uint32(base[4:8]) == segmentVersionEncrypt {
+			var hdr [encSegmentHeaderSize]byte
+			if _, err := f.ReadAt(hdr[:], 0); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("vlog read header: %w", err)
+			}
+			if reg == nil {
+				f.Close()
+				return nil, fmt.Errorf("vlog: segment %s is encrypted but no key registry was provided", path)
+			}
+			s.encrypted = true
+			s.keyID = binary.BigEndian.Uint64(hdr[8:16])
+			s.baseIV = append([]byte(nil), hdr[16:32]...)
+			key, err := reg.GetKey(s.keyID)
+			if err != nil {
+				f.Close()
+				return nil, err
+			}
+			s.key = key
+		}
 	}
 
 	return s, nil
@@ -126,7 +187,19 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 		return 0, fmt.Errorf("vlog: segment %d is closed", s.fid)
 	}
 
-	// Compute CRC over header fields + key + value.
+	// valueOffset points to where the value bytes start.
+	valueOffset = s.offset + int64(entryHeaderSize) + int64(len(e.Key))
+
+	// Encrypt a copy of the value in place; the caller's slice stays intact.
+	val := e.Value
+	if s.encrypted && len(val) > 0 {
+		val = append([]byte(nil), val...)
+		if err := crypto.CryptAtOffset(s.key, s.baseIV, valueOffset, val); err != nil {
+			return 0, err
+		}
+	}
+
+	// Compute CRC over header fields + key + (possibly encrypted) value.
 	crc := crc32.NewIEEE()
 	crc.Write([]byte{e.Op})
 
@@ -135,7 +208,7 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 	crc.Write(kLenBuf[:])
 
 	var vLenBuf [4]byte
-	binary.BigEndian.PutUint32(vLenBuf[:], uint32(len(e.Value)))
+	binary.BigEndian.PutUint32(vLenBuf[:], uint32(len(val)))
 	crc.Write(vLenBuf[:])
 
 	var expBuf [8]byte
@@ -143,17 +216,14 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 	crc.Write(expBuf[:])
 
 	crc.Write(e.Key)
-	crc.Write(e.Value)
+	crc.Write(val)
 
 	// Build entry header: op(1) + kLen(4) + vLen(4) + expAt(8) = 17 bytes
 	var hdr [entryHeaderSize]byte
 	hdr[0] = e.Op
 	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(e.Key)))
-	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(e.Value)))
+	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(val)))
 	binary.BigEndian.PutUint64(hdr[9:17], uint64(e.ExpiresAt))
-
-	// valueOffset points to where the value bytes start.
-	valueOffset = s.offset + int64(entryHeaderSize) + int64(len(e.Key))
 
 	if _, err := s.writer.Write(hdr[:]); err != nil {
 		return 0, err
@@ -161,8 +231,8 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 	if _, err := s.writer.Write(e.Key); err != nil {
 		return 0, err
 	}
-	if len(e.Value) > 0 {
-		if _, err := s.writer.Write(e.Value); err != nil {
+	if len(val) > 0 {
+		if _, err := s.writer.Write(val); err != nil {
 			return 0, err
 		}
 	}
@@ -174,7 +244,7 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 		return 0, err
 	}
 
-	s.offset += int64(entryHeaderSize) + int64(len(e.Key)) + int64(len(e.Value)) + 4
+	s.offset += int64(entryHeaderSize) + int64(len(e.Key)) + int64(len(val)) + 4
 	return valueOffset, nil
 }
 
@@ -216,8 +286,15 @@ func (s *segment) readValue(offset uint64, size uint32) ([]byte, error) {
 	}
 	s.mu.Unlock()
 	buf := make([]byte, size)
-	_, err := s.file.ReadAt(buf, int64(offset))
-	return buf, err
+	if _, err := s.file.ReadAt(buf, int64(offset)); err != nil {
+		return nil, err
+	}
+	if s.encrypted {
+		if err := crypto.CryptAtOffset(s.key, s.baseIV, int64(offset), buf); err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
 }
 
 // ValueLog manages VLog segments and provides the main API.
@@ -226,6 +303,7 @@ type ValueLog struct {
 	dir      string
 	segments map[uint32]*segment // fid -> segment (reference counted)
 	maxSize  int64
+	reg      *crypto.KeyRegistry
 
 	nextFid uint32
 
@@ -235,11 +313,26 @@ type ValueLog struct {
 
 // Open opens or creates a VLog in the given directory.
 func Open(dir string) (*ValueLog, error) {
-	return OpenWithMaxSize(dir, defaultMaxSegmentSize)
+	return openWithMaxSize(dir, defaultMaxSegmentSize, nil)
 }
 
 // OpenWithMaxSize opens or creates a VLog with a custom max segment size.
 func OpenWithMaxSize(dir string, maxSegmentSize int64) (*ValueLog, error) {
+	return openWithMaxSize(dir, maxSegmentSize, nil)
+}
+
+// OpenWithRegistry opens or creates an encrypted VLog using the given registry.
+func OpenWithRegistry(dir string, reg *crypto.KeyRegistry) (*ValueLog, error) {
+	return openWithMaxSize(dir, defaultMaxSegmentSize, reg)
+}
+
+// OpenWithMaxSizeAndRegistry opens or creates an encrypted VLog with a custom
+// max segment size using the given registry.
+func OpenWithMaxSizeAndRegistry(dir string, maxSegmentSize int64, reg *crypto.KeyRegistry) (*ValueLog, error) {
+	return openWithMaxSize(dir, maxSegmentSize, reg)
+}
+
+func openWithMaxSize(dir string, maxSegmentSize int64, reg *crypto.KeyRegistry) (*ValueLog, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("vlog mkdir: %w", err)
 	}
@@ -248,6 +341,7 @@ func OpenWithMaxSize(dir string, maxSegmentSize int64) (*ValueLog, error) {
 		dir:      dir,
 		segments: make(map[uint32]*segment),
 		maxSize:  maxSegmentSize,
+		reg:      reg,
 	}
 
 	// Discover existing segments.
@@ -267,7 +361,7 @@ func OpenWithMaxSize(dir string, maxSegmentSize int64) (*ValueLog, error) {
 			}
 			fid := uint32(fid64)
 			segPath := filepath.Join(dir, name)
-			seg, err := openSegment(segPath, fid, maxSegmentSize)
+			seg, err := openSegment(segPath, fid, maxSegmentSize, reg)
 			if err != nil {
 				continue
 			}
@@ -282,7 +376,7 @@ func OpenWithMaxSize(dir string, maxSegmentSize int64) (*ValueLog, error) {
 
 	// Create or resume the active segment.
 	activePath := filepath.Join(dir, fmt.Sprintf("vlog_%06d.log", vl.nextFid))
-	active, err := openSegment(activePath, vl.nextFid, maxSegmentSize)
+	active, err := openSegment(activePath, vl.nextFid, maxSegmentSize, reg)
 	if err != nil {
 		return nil, fmt.Errorf("vlog create active: %w", err)
 	}
@@ -336,7 +430,7 @@ func (vl *ValueLog) Rotate() error {
 
 	vl.nextFid++
 	activePath := filepath.Join(vl.dir, fmt.Sprintf("vlog_%06d.log", vl.nextFid))
-	active, err := openSegment(activePath, vl.nextFid, vl.maxSize)
+	active, err := openSegment(activePath, vl.nextFid, vl.maxSize, vl.reg)
 	if err != nil {
 		return err
 	}
@@ -478,7 +572,7 @@ func (vl *ValueLog) Recover(fid uint32, fn func(entry ValueEntry, valueOffset in
 	}
 	defer file.Close()
 
-	// Skip segment header (magic + version = 8 bytes).
+	// Read the segment header (magic + version, plus keyID/baseIV when encrypted).
 	var segHdr [segmentHeaderSize]byte
 	if _, err := io.ReadFull(file, segHdr[:]); err != nil {
 		if err == io.EOF {
@@ -491,6 +585,13 @@ func (vl *ValueLog) Recover(fid uint32, fn func(entry ValueEntry, valueOffset in
 	}
 
 	var offset int64 = segmentHeaderSize
+	if seg.encrypted {
+		extra := make([]byte, encSegmentHeaderSize-segmentHeaderSize)
+		if _, err := io.ReadFull(file, extra); err != nil {
+			return err
+		}
+		offset = encSegmentHeaderSize
+	}
 	var hdr [entryHeaderSize]byte
 
 	for {
@@ -519,7 +620,9 @@ func (vl *ValueLog) Recover(fid uint32, fn func(entry ValueEntry, valueOffset in
 			}
 		}
 
-		// Read and verify CRC.
+		valueOffset := offset + int64(entryHeaderSize) + int64(kLen)
+
+		// Read and verify CRC (computed over the on-disk, possibly encrypted bytes).
 		var crcBuf [4]byte
 		if _, err := io.ReadFull(file, crcBuf[:]); err != nil {
 			break
@@ -543,7 +646,11 @@ func (vl *ValueLog) Recover(fid uint32, fn func(entry ValueEntry, valueOffset in
 			break // corrupted entry, stop recovery
 		}
 
-		valueOffset := offset + int64(entryHeaderSize) + int64(kLen)
+		if seg.encrypted && len(val) > 0 {
+			if err := crypto.CryptAtOffset(seg.key, seg.baseIV, valueOffset, val); err != nil {
+				break
+			}
+		}
 
 		if err := fn(ValueEntry{
 			Op:        op,

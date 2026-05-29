@@ -41,9 +41,16 @@ type BatchWriteEntry struct {
 	Deleted   bool
 }
 
+// WriteOptions tunes the durability of a single write.
+type WriteOptions struct {
+	Sync    bool
+	SkipWAL bool
+}
+
 type DB interface {
 	Put(key, val string) error
 	PutEx(key, val string, ttlSeconds int64) error
+	PutWithOptions(key, val string, opts WriteOptions) error
 	Get(key string) (string, error)
 	Delete(key string) (bool, error)
 	TTL(key string) (int64, error)
@@ -727,13 +734,25 @@ func (s *Server) cmdSet(srv *Server, cl *client, args []string) error {
 		srv.writeError(cl, "ERR wrong number of arguments for 'set' command")
 		return nil
 	}
+	var opts WriteOptions
+	for _, arg := range args[2:] {
+		switch strings.ToUpper(arg) {
+		case "SKIPWAL":
+			opts.SkipWAL = true
+		case "SYNC":
+			opts.Sync = true
+		default:
+			srv.writeError(cl, "ERR syntax error")
+			return nil
+		}
+	}
 	if cl.txWrites != nil {
 		cl.txWrites[strKey(args[0])] = txWriteEntry{value: args[1]}
 		srv.writeSimpleString(cl, "OK")
 	} else {
 		if err := srv.checkClusterWrite(cl); err != nil {
 			srv.writeError(cl, err.Error())
-		} else if err := srv.db.Put(strKey(args[0]), args[1]); err != nil {
+		} else if err := srv.db.PutWithOptions(strKey(args[0]), args[1], opts); err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
 			srv.writeSimpleString(cl, "OK")

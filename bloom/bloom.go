@@ -14,11 +14,19 @@ type Filter struct {
 }
 
 func NewFilter(keys [][]byte, bitsPerKey int) *Filter {
+	f := NewFilterSized(len(keys), bitsPerKey)
+	for _, key := range keys {
+		f.Add(key)
+	}
+	return f
+}
+
+// NewFilterSized allocates an empty filter sized for n expected keys.
+func NewFilterSized(n int, bitsPerKey int) *Filter {
 	if bitsPerKey < 1 {
 		bitsPerKey = 10 // sensible default (~1% FPR)
 	}
 
-	n := len(keys)
 	if n == 0 {
 		n = 1 // avoid div-by-zero / empty slice crash
 	}
@@ -39,16 +47,11 @@ func NewFilter(keys [][]byte, bitsPerKey int) *Filter {
 		k = 30
 	}
 
-	f := &Filter{
+	return &Filter{
 		data: make([]byte, byteLen),
 		bits: numBits,
 		k:    k,
 	}
-
-	for _, key := range keys {
-		f.Add(key)
-	}
-	return f
 }
 
 func NewFilterFromBytes(bitmap []byte, bits uint32, k uint8) *Filter {

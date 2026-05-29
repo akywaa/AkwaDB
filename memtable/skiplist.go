@@ -389,6 +389,21 @@ func (s *SkipList) GetByVersion(key []byte, maxVersion uint64) ([]byte, bool, bo
 }
 
 // CurrentVersion returns the latest version counter value.
+// SeedVersion raises the version counter so a fresh memtable inherits the
+// version horizon of the table it replaces. Without this, snapshots taken with
+// a plain version read would no longer see entries already flushed to disk.
+func (s *SkipList) SeedVersion(v uint64) {
+	for {
+		cur := atomic.LoadUint64(&s.versionCounter)
+		if v <= cur {
+			return
+		}
+		if atomic.CompareAndSwapUint64(&s.versionCounter, cur, v) {
+			return
+		}
+	}
+}
+
 func (s *SkipList) CurrentVersion() uint64 {
 	return atomic.LoadUint64(&s.versionCounter)
 }
