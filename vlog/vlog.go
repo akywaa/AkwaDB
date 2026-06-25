@@ -12,17 +12,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/akywaa/akwadb/internal/crypto"
 )
 
 var (
-	ErrCorruptedEntry = errors.New("vlog: corrupted entry (CRC mismatch or truncated)")
+	ErrCorruptedEntry  = errors.New("vlog: corrupted entry (CRC mismatch or truncated)")
 	ErrSegmentNotFound = errors.New("vlog: segment not found")
 )
 
 const (
-	OpPut    byte = iota + 1
+	OpPut byte = iota + 1
 	OpDelete
 )
 
@@ -30,8 +31,8 @@ const (
 	segmentMagic          uint32 = 0x564C4F47 // "VLOG"
 	segmentVersion        uint32 = 1
 	segmentVersionEncrypt uint32 = 2
-	segmentHeaderSize           = 8  // magic(4) + version(4)
-	encSegmentHeaderSize        = 32 // magic(4) + version(4) + keyID(8) + baseIV(16)
+	segmentHeaderSize            = 8  // magic(4) + version(4)
+	encSegmentHeaderSize         = 32 // magic(4) + version(4) + keyID(8) + baseIV(16)
 
 	// Entry format:
 	// +--------+----------+----------+--------+-------------------+------+--------+
@@ -79,13 +80,13 @@ func DecodeValuePointer(b []byte) ValuePointer {
 
 // segment wraps a single VLog file with buffered writing.
 type segment struct {
-	fid      uint32
-	file     *os.File
-	writer   *bufio.Writer
-	offset   int64 // current write offset
-	maxSize  int64
-	closed   bool
-	mu       sync.Mutex
+	fid     uint32
+	file    *os.File
+	writer  *bufio.Writer
+	offset  atomic.Int64 // current write offset
+	maxSize int64
+	closed  bool
+	mu      sync.Mutex
 
 	encrypted bool
 	keyID     uint64
@@ -108,9 +109,9 @@ func openSegment(path string, fid uint32, maxSize int64, reg *crypto.KeyRegistry
 		fid:     fid,
 		file:    f,
 		writer:  bufio.NewWriterSize(f, 64*1024),
-		offset:  stat.Size(),
 		maxSize: maxSize,
 	}
+	s.offset.Store(stat.Size())
 
 	switch {
 	case stat.Size() == 0:
@@ -135,7 +136,7 @@ func openSegment(path string, fid uint32, maxSize int64, reg *crypto.KeyRegistry
 			s.keyID = keyID
 			s.baseIV = baseIV
 			s.key = key
-			s.offset = encSegmentHeaderSize
+			s.offset.Store(encSegmentHeaderSize)
 		} else {
 			var hdr [segmentHeaderSize]byte
 			binary.BigEndian.PutUint32(hdr[0:4], segmentMagic)
@@ -144,7 +145,7 @@ func openSegment(path string, fid uint32, maxSize int64, reg *crypto.KeyRegistry
 				f.Close()
 				return nil, fmt.Errorf("vlog write header: %w", err)
 			}
-			s.offset = segmentHeaderSize
+			s.offset.Store(segmentHeaderSize)
 		}
 	default:
 		// Existing segment: read its header to detect encryption metadata.
@@ -188,7 +189,7 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 	}
 
 	// valueOffset points to where the value bytes start.
-	valueOffset = s.offset + int64(entryHeaderSize) + int64(len(e.Key))
+	valueOffset = s.offset.Load() + int64(entryHeaderSize) + int64(len(e.Key))
 
 	// Encrypt a copy of the value in place; the caller's slice stays intact.
 	val := e.Value
@@ -244,7 +245,7 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 		return 0, err
 	}
 
-	s.offset += int64(entryHeaderSize) + int64(len(e.Key)) + int64(len(val)) + 4
+	s.offset.Add(int64(entryHeaderSize) + int64(len(e.Key)) + int64(len(val)) + 4)
 	return valueOffset, nil
 }
 
@@ -388,21 +389,18 @@ func openWithMaxSize(dir string, maxSegmentSize int64, reg *crypto.KeyRegistry) 
 
 // Write appends a value entry to the active segment and returns the ValuePointer.
 func (vl *ValueLog) Write(e *ValueEntry) (ValuePointer, error) {
+	// The rotation decision and the segment swap happen under vl.mu so
+	// concurrent writers cannot each spawn their own empty segment.
 	vl.mu.Lock()
-	fid := vl.active.fid
-	active := vl.active
-	vl.mu.Unlock()
-
-	// Check if rotation is needed.
-	if active.offset >= active.maxSize {
-		if err := vl.Rotate(); err != nil {
+	if vl.active.offset.Load() >= vl.active.maxSize {
+		if err := vl.rotateLocked(); err != nil {
+			vl.mu.Unlock()
 			return ValuePointer{}, fmt.Errorf("vlog rotate: %w", err)
 		}
-		vl.mu.Lock()
-		fid = vl.active.fid
-		active = vl.active
-		vl.mu.Unlock()
 	}
+	active := vl.active
+	fid := active.fid
+	vl.mu.Unlock()
 
 	offset, err := active.writeEntry(e)
 	if err != nil {
@@ -420,11 +418,13 @@ func (vl *ValueLog) Write(e *ValueEntry) (ValuePointer, error) {
 func (vl *ValueLog) Rotate() error {
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
+	return vl.rotateLocked()
+}
 
+// rotateLocked closes out the active segment and opens the next one.
+// The caller must hold vl.mu.
+func (vl *ValueLog) rotateLocked() error {
 	if err := vl.active.sync(); err != nil {
-		return err
-	}
-	if err := vl.active.close(); err != nil {
 		return err
 	}
 

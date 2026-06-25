@@ -237,23 +237,22 @@ func (m *memoryBackend) IncrBy(key string, delta int64) (int64, error) {
 	return cur, nil
 }
 
-func (m *memoryBackend) MGet(keys []string) ([]string, error) {
+func (m *memoryBackend) MGet(keys []string) ([]string, []bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	res := make([]string, len(keys))
+	present := make([]bool, len(keys))
 	now := time.Now().Unix()
 	for i, k := range keys {
 		if exp, ok := m.ttls[k]; ok && exp > 0 && now >= exp {
-			res[i] = ""
 			continue
 		}
 		if v, ok := m.kv[k]; ok {
 			res[i] = v
-		} else {
-			res[i] = ""
+			present[i] = true
 		}
 	}
-	return res, nil
+	return res, present, nil
 }
 
 func (m *memoryBackend) MSet(kvs map[string]string) error {

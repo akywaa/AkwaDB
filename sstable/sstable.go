@@ -1,15 +1,16 @@
 package sstable
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"github.com/akywaa/akwadb/bloom"
 	"github.com/akywaa/akwadb/cache"
 	"github.com/akywaa/akwadb/internal/crypto"
 	"github.com/akywaa/akwadb/internal/encoding"
 	"github.com/akywaa/akwadb/memtable"
-	"bytes"
-	"encoding/binary"
-	"errors"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -25,8 +26,8 @@ import (
 var ErrBlockCorrupted = errors.New("sstable: data block checksum mismatch")
 
 const (
-	TargetBlockSize = 4096
-	restartInterval = 16
+	TargetBlockSize          = 4096
+	restartInterval          = 16
 	blockRestartMagic uint32 = 0x52535450
 )
 
@@ -92,12 +93,23 @@ type sparseIndexEntry struct {
 }
 
 type cacheKey struct {
-	ptr  uintptr
-	off  int64
+	ptr uintptr
+	off int64
 }
 
 func (s *SSTable) blockCacheKey(blockOffset int64) string {
-	return s.filename + ":" + strconv.FormatInt(blockOffset, 10)
+	return s.filename + s.cacheTag + ":" + strconv.FormatInt(blockOffset, 10)
+}
+
+// blockCacheTag ties block-cache entries to the key that decrypts them. Cached
+// blocks hold decoded plaintext, so opens of the same file under different keys
+// must never observe each other's entries.
+func blockCacheTag(key []byte) string {
+	if len(key) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(key)
+	return fmt.Sprintf(":k%x", sum[:8])
 }
 
 func (s *SSTable) indexCacheKey() string  { return "index:" + s.filename }
@@ -124,12 +136,13 @@ type SSTable struct {
 	prefixBits uint32
 	prefixK    uint8
 
-	cache    cache.Cache
-	refs     int32
-	mu       sync.Mutex
-	closed   bool
-	compress byte
-	removePending bool // defer os.Remove until refs=0 for Windows compat
+	cache         cache.Cache
+	refs          int32
+	mu            sync.Mutex
+	closed        bool
+	compress      byte
+	cacheTag      string // distinguishes decoded blocks by decrypting key
+	removePending bool   // defer os.Remove until refs=0 for Windows compat
 
 	encrypted bool
 	keyID     uint64
@@ -666,6 +679,7 @@ func open(filename string, blockCache cache.Cache, reg *crypto.KeyRegistry) (*SS
 		encrypted:      encrypted,
 		keyID:          keyID,
 		blockKey:       blockKey,
+		cacheTag:       blockCacheTag(blockKey),
 		tombstoneRatio: tombstoneRatio,
 	}
 	if numBlocks > 0 {
@@ -686,7 +700,7 @@ func open(filename string, blockCache cache.Cache, reg *crypto.KeyRegistry) (*SS
 			mkOff := minKeyOffset + 4 + int64(mkLen)
 			if _, err := mm.ReadAt(lenBuf[:], mkOff); err == nil {
 				mkLen = int(binary.BigEndian.Uint32(lenBuf[:]))
-				if mkLen > 0 && mkOff+4+int64(mkLen) < int64(fileSize)-32 {
+				if mkLen > 0 && mkOff+4+int64(mkLen) <= int64(fileSize)-32 {
 					maxKeyBuf := make([]byte, mkLen)
 					if _, err := mm.ReadAt(maxKeyBuf, mkOff+4); err == nil {
 						sst.maxKey = maxKeyBuf
@@ -746,32 +760,30 @@ func (s *SSTable) Get(key []byte) ([]byte, bool, bool, int64, uint64, error) {
 
 	_, blockOffset, blockSize := s.getEntryAt(targetBlockIdx)
 
-	cacheKey := fmt.Sprintf("%s:%d", s.filename, blockOffset)
-	var blockData []byte
+	cacheKey := s.blockCacheKey(blockOffset)
+	var blockContent []byte
 	if s.cache != nil {
 		if cached, ok := s.cache.Get(cacheKey); ok {
-			blockData = cached
+			blockContent = cached
 		}
 	}
 
-	if blockData == nil {
-		var err error
-		blockData, err = s.readBlock(blockOffset, blockSize)
+	if blockContent == nil {
+		blockData, err := s.readBlock(blockOffset, blockSize)
+		if err != nil {
+			return nil, false, false, 0, 0, err
+		}
+		blockContent, err = s.decodeBlock(blockData)
 		if err != nil {
 			return nil, false, false, 0, 0, err
 		}
 		if s.cache != nil {
-			s.cache.Put(cacheKey, blockData)
+			s.cache.Put(cacheKey, blockContent)
 		}
 	}
 
-	blockContent, err := s.decodeBlock(blockData)
-	if err != nil {
-		return nil, false, false, 0, 0, err
-	}
-
-	val, found, deleted, exp, err := scanBlockForKey(blockContent, key)
-	return val, found, deleted, exp, 0, err
+	val, found, deleted, exp, version, err := scanBlockForKey(blockContent, key)
+	return val, found, deleted, exp, version, err
 }
 
 func (s *SSTable) Filename() string {
@@ -923,7 +935,7 @@ func readEntryAt(block []byte, off int) (hdr RecordHeader, key, val []byte, next
 	return
 }
 
-func scanBlockForKey(blockContent []byte, targetKey []byte) ([]byte, bool, bool, int64, error) {
+func scanBlockForKey(blockContent []byte, targetKey []byte) ([]byte, bool, bool, int64, uint64, error) {
 	br := parseBlockRestarts(blockContent)
 	if br != nil && len(br.offsets) > 1 {
 		return scanBlockForKeyBinary(br, targetKey)
@@ -934,9 +946,15 @@ func scanBlockForKey(blockContent []byte, targetKey []byte) ([]byte, bool, bool,
 	return scanBlockForKeyLinear(blockContent, targetKey)
 }
 
-func scanBlockForKeyLinear(blockContent []byte, targetKey []byte) ([]byte, bool, bool, int64, error) {
+func scanBlockForKeyLinear(blockContent []byte, targetKey []byte) ([]byte, bool, bool, int64, uint64, error) {
 	reader := bytes.NewReader(blockContent)
 	var hdrBuf [recordHeaderSize]byte
+
+	var bestVal []byte
+	bestDeleted := false
+	bestExp := int64(0)
+	bestVersion := uint64(0)
+	found := false
 
 	for reader.Len() > 0 {
 		if _, err := io.ReadFull(reader, hdrBuf[:]); err != nil {
@@ -960,17 +978,26 @@ func scanBlockForKeyLinear(blockContent []byte, targetKey []byte) ([]byte, bool,
 		}
 
 		if bytes.Equal(k, targetKey) {
-			if hdr.ExpiresAt > 0 && time.Now().Unix() >= hdr.ExpiresAt {
-				return nil, false, false, 0, nil
+			if !found || hdr.Version > bestVersion {
+				bestVal = v
+				bestDeleted = hdr.Deleted
+				bestExp = hdr.ExpiresAt
+				bestVersion = hdr.Version
+				found = true
 			}
-			return v, true, hdr.Deleted, hdr.ExpiresAt, nil
 		}
 	}
 
-	return nil, false, false, 0, nil
+	if !found {
+		return nil, false, false, 0, 0, nil
+	}
+	if bestExp > 0 && time.Now().Unix() >= bestExp {
+		return nil, true, true, 0, bestVersion, nil
+	}
+	return bestVal, true, bestDeleted, bestExp, bestVersion, nil
 }
 
-func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, bool, int64, error) {
+func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, bool, int64, uint64, error) {
 	n := len(br.offsets)
 	lo, hi := 0, n-1
 	restartIdx := -1
@@ -1004,12 +1031,12 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 			firstKey := br.data[firstOff+recordHeaderSize : firstOff+recordHeaderSize+int(firstHdr.KeyLen)]
 			if bytes.Compare(firstKey, targetKey) == 0 {
 				restartIdx = 0
-	
+
 			}
 		}
 	}
 	if restartIdx == -1 {
-		return nil, false, false, 0, nil
+		return nil, false, false, 0, 0, nil
 	}
 	startOff = int(br.offsets[restartIdx])
 	endOff := len(br.data)
@@ -1033,7 +1060,6 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 				bestExp = hdr.ExpiresAt
 				bestVersion = hdr.Version
 				found = true
-	
 			}
 		} else if bytes.Compare(k, targetKey) > 0 {
 			break
@@ -1042,12 +1068,12 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 	}
 
 	if !found {
-		return nil, false, false, 0, nil
+		return nil, false, false, 0, 0, nil
 	}
 	if bestExp > 0 && time.Now().Unix() >= bestExp {
-		return nil, false, false, 0, nil
+		return nil, true, true, 0, bestVersion, nil
 	}
-	return bestVal, true, bestDeleted, bestExp, nil
+	return bestVal, true, bestDeleted, bestExp, bestVersion, nil
 }
 
 func scanBlockForKeyVersion(blockContent []byte, targetKey []byte, maxVersion uint64) ([]byte, bool, bool, int64, uint64, error) {
@@ -1106,7 +1132,7 @@ func scanBlockForKeyVersionLinear(blockContent []byte, targetKey []byte, maxVers
 		return nil, false, false, 0, 0, nil
 	}
 	if bestExp > 0 && time.Now().Unix() >= bestExp {
-		return nil, false, false, 0, 0, nil
+		return nil, true, true, 0, 0, nil
 	}
 	return bestVal, true, bestDel, bestExp, bestVer, nil
 }
@@ -1170,7 +1196,7 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		return nil, false, false, 0, 0, nil
 	}
 	if bestExp > 0 && time.Now().Unix() >= bestExp {
-		return nil, false, false, 0, 0, nil
+		return nil, true, true, 0, 0, nil
 	}
 	return bestVal, true, bestDel, bestExp, bestVer, nil
 }
@@ -1208,28 +1234,26 @@ func (s *SSTable) GetByVersion(key []byte, maxVersion uint64) ([]byte, bool, boo
 
 	_, blockOffset, blockSize := s.getEntryAt(targetBlockIdx)
 
-	cacheKey := fmt.Sprintf("%s:%d", s.filename, blockOffset)
-	var blockData []byte
+	cacheKey := s.blockCacheKey(blockOffset)
+	var blockContent []byte
 	if s.cache != nil {
 		if cached, ok := s.cache.Get(cacheKey); ok {
-			blockData = cached
+			blockContent = cached
 		}
 	}
 
-	if blockData == nil {
-		var err error
-		blockData, err = s.readBlock(blockOffset, blockSize)
+	if blockContent == nil {
+		blockData, err := s.readBlock(blockOffset, blockSize)
+		if err != nil {
+			return nil, false, false, 0, 0, err
+		}
+		blockContent, err = s.decodeBlock(blockData)
 		if err != nil {
 			return nil, false, false, 0, 0, err
 		}
 		if s.cache != nil {
-			s.cache.Put(cacheKey, blockData)
+			s.cache.Put(cacheKey, blockContent)
 		}
-	}
-
-	blockContent, err := s.decodeBlock(blockData)
-	if err != nil {
-		return nil, false, false, 0, 0, err
 	}
 
 	return scanBlockForKeyVersion(blockContent, key, maxVersion)
@@ -1308,27 +1332,25 @@ func (it *SSTableIterator) loadBlock(idx int) bool {
 	_, blockOffset, blockSize := it.sst.getEntryAt(idx)
 	cacheKey := it.sst.blockCacheKey(blockOffset)
 
-	var data []byte
+	var blockContent []byte
 	if it.sst.cache != nil {
 		if cached, ok := it.sst.cache.Get(cacheKey); ok {
-			data = cached
+			blockContent = cached
 		}
 	}
 
-	if data == nil {
-		var err error
-		data, err = it.sst.readBlock(blockOffset, blockSize)
+	if blockContent == nil {
+		data, err := it.sst.readBlock(blockOffset, blockSize)
+		if err != nil {
+			return false
+		}
+		blockContent, err = it.sst.decodeBlock(data)
 		if err != nil {
 			return false
 		}
 		if it.sst.cache != nil {
-			it.sst.cache.Put(cacheKey, data)
+			it.sst.cache.Put(cacheKey, blockContent)
 		}
-	}
-
-	blockContent, err := it.sst.decodeBlock(data)
-	if err != nil {
-		return false
 	}
 
 	it.blockData = blockContent

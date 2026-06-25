@@ -63,8 +63,8 @@ func TestSSTable_LevelCompression(t *testing.T) {
 				if !found || deleted || string(val) != want {
 					t.Fatalf("Get(%s) = %q found=%v deleted=%v, want %q", key, val, found, deleted, want)
 				}
-				if ver != 0 {
-					t.Fatalf("Get(%s) version = %d, want 0", key, ver)
+				if ver != uint64(idx+1) {
+					t.Fatalf("Get(%s) version = %d, want %d", key, ver, idx+1)
 				}
 				valV, foundV, _, _, verV, err := sst.GetByVersion([]byte(key), uint64(idx+1))
 				if err != nil || !foundV || string(valV) != want {

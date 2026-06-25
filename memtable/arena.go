@@ -2,38 +2,17 @@ package memtable
 
 import "sync"
 
-// bump / slab allocators for memtable insertions.
-// cuts GC overhead down by pooling Node allocations and raw byte slices
-// into contiguous pre-allocated chunks instead of per-insert heap escapes.
-
-const (
-	byteSlabSize = 64 * 1024 // 64KB per byte batch (stays below Go large-alloc threshold)
-)
+const byteSlabSize = 64 * 1024
 
 type byteSlab struct {
 	mu        sync.Mutex
 	buf       []byte
 	off       int
 	allocated int64
-	pooled    bool
-}
-
-var byteSlabPool = sync.Pool{
-	New: func() interface{} {
-		return &byteSlab{buf: make([]byte, byteSlabSize)}
-	},
 }
 
 func newByteSlab() *byteSlab {
-	s := byteSlabPool.Get().(*byteSlab)
-	if cap(s.buf) != byteSlabSize {
-		s.buf = make([]byte, byteSlabSize)
-	}
-	s.buf = s.buf[:byteSlabSize]
-	s.off = 0
-	s.allocated = 0
-	s.pooled = false
-	return s
+	return &byteSlab{buf: make([]byte, byteSlabSize)}
 }
 
 func (s *byteSlab) release() {
@@ -41,15 +20,10 @@ func (s *byteSlab) release() {
 		return
 	}
 	s.mu.Lock()
-	if s.pooled {
-		s.mu.Unlock()
-		return
-	}
-	s.pooled = true
+	s.buf = nil
 	s.off = 0
 	s.allocated = 0
 	s.mu.Unlock()
-	byteSlabPool.Put(s)
 }
 
 func (s *byteSlab) alloc(data []byte) []byte {
@@ -70,11 +44,9 @@ func (s *byteSlab) alloc(data []byte) []byte {
 		s.off = 0
 	}
 
-	copy(s.buf[s.off:s.off+n], data)
-	result := make([]byte, n)
-	copy(result, s.buf[s.off:s.off+n])
+	result := s.buf[s.off : s.off+n]
+	copy(result, data)
 	s.off += n
 	s.allocated += int64(n)
 	return result
 }
-

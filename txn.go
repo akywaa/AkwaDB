@@ -188,9 +188,13 @@ func (tx *Tx) CommitAt(commitTs uint64) error {
 		return nil
 	}
 
-	entries := tx.batchEntries()
+	tx.db.oracle.CommitLock()
+	tx.db.oracle.Bump(commitTs)
+	tx.db.oracle.RecordCommitted(commitTs, tx.writes)
+	err := tx.db.BatchApplyWithVersion(tx.batchEntries(), commitTs)
+	tx.db.oracle.CommitUnlock()
 	tx.writes = nil
-	return tx.db.BatchApplyWithVersion(entries, commitTs)
+	return err
 }
 
 func (tx *Tx) Rollback() {

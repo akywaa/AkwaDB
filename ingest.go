@@ -26,6 +26,13 @@ func (e *Engine) Ingest(sstPaths []string) error {
 		return nil
 	}
 
+	// Overlap is only checked against on-disk levels below, so any keys already
+	// sitting in the MemTable must be flushed first. Otherwise stale MemTable
+	// values would shadow the freshly ingested tables on point lookups.
+	if err := e.submitFlush(); err != nil {
+		return err
+	}
+
 	staged := make([]*sstable.SSTable, 0, len(sstPaths))
 	for _, p := range sstPaths {
 		sst, err := sstable.OpenWithRegistry(p, nil, e.opts.KeyRegistry)
@@ -60,15 +67,14 @@ func (e *Engine) Ingest(sstPaths []string) error {
 		}
 	}
 
-	targetLevel := -1
-	for lvl := MaxLevels - 1; lvl >= 1; lvl-- {
-		if !e.levelOverlapsAny(lvl, staged) {
+	targetLevel := 0
+	if !e.levelOverlapsAny(0, staged) {
+		for lvl := 1; lvl < MaxLevels; lvl++ {
+			if e.levelOverlapsAny(lvl, staged) {
+				break
+			}
 			targetLevel = lvl
-			break
 		}
-	}
-	if targetLevel < 0 {
-		return ErrIngestOverlap
 	}
 
 	// Release the validation handles before moving the files, otherwise the
@@ -96,10 +102,20 @@ func (e *Engine) Ingest(sstPaths []string) error {
 	_ = fsutil.SyncDir(e.dataDir)
 
 	e.levelMu[targetLevel].Lock()
+	if targetLevel > 0 && e.levelOverlapsAnyLocked(targetLevel, moved) {
+		e.levelMu[targetLevel].Unlock()
+		targetLevel = 0
+		e.levelMu[0].Lock()
+	}
+	for _, s := range moved {
+		s.SetLevel(targetLevel)
+	}
 	e.levels[targetLevel] = append(e.levels[targetLevel], moved...)
-	sort.Slice(e.levels[targetLevel], func(i, j int) bool {
-		return bytes.Compare(e.levels[targetLevel][i].MinKey(), e.levels[targetLevel][j].MinKey()) < 0
-	})
+	if targetLevel > 0 {
+		sort.Slice(e.levels[targetLevel], func(i, j int) bool {
+			return bytes.Compare(e.levels[targetLevel][i].MinKey(), e.levels[targetLevel][j].MinKey()) < 0
+		})
+	}
 	e.levelMu[targetLevel].Unlock()
 
 	for _, s := range moved {
@@ -111,6 +127,10 @@ func (e *Engine) Ingest(sstPaths []string) error {
 func (e *Engine) levelOverlapsAny(lvl int, tables []*sstable.SSTable) bool {
 	e.levelMu[lvl].RLock()
 	defer e.levelMu[lvl].RUnlock()
+	return e.levelOverlapsAnyLocked(lvl, tables)
+}
+
+func (e *Engine) levelOverlapsAnyLocked(lvl int, tables []*sstable.SSTable) bool {
 	for _, existing := range e.levels[lvl] {
 		for _, t := range tables {
 			if rangesOverlap(t, existing) {

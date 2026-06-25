@@ -7,16 +7,17 @@ import (
 	"io"
 
 	"github.com/akywaa/akwadb/server"
+	"github.com/hashicorp/raft"
 )
 
-// raftCommand is the serialized form of a write operation replicated via Raft.
 type raftCommand struct {
 	Op      string
 	Entries []server.BatchWriteEntry
+	Args    []string
+	Version uint64
 }
 
 const raftCmdDeletedFlag byte = 1 << 0
-
 var errTruncatedRaftCommand = errors.New("cluster: truncated raft command")
 
 func encodeRaftCommand(cmd raftCommand) []byte {
@@ -48,6 +49,17 @@ func encodeRaftCommand(cmd raftCommand) []byte {
 		}
 		buf = append(buf, flags)
 	}
+
+	binary.BigEndian.PutUint32(scratch[:4], uint32(len(cmd.Args)))
+	buf = append(buf, scratch[:4]...)
+	for _, a := range cmd.Args {
+		binary.BigEndian.PutUint32(scratch[:4], uint32(len(a)))
+		buf = append(buf, scratch[:4]...)
+		buf = append(buf, a...)
+	}
+
+	binary.BigEndian.PutUint64(scratch[:8], cmd.Version)
+	buf = append(buf, scratch[:8]...)
 
 	return buf
 }
@@ -112,11 +124,28 @@ func decodeRaftCommand(data []byte) (raftCommand, error) {
 	}
 
 	cmd.Entries = entries
+
+	if off+4 <= len(data) {
+		argCount := binary.BigEndian.Uint32(data[off : off+4])
+		off += 4
+		args := make([]string, 0, argCount)
+		for i := uint32(0); i < argCount; i++ {
+			arg, err := readBytes()
+			if err != nil {
+				return cmd, err
+			}
+			args = append(args, string(arg))
+		}
+		cmd.Args = args
+	}
+
+	if off+8 <= len(data) {
+		cmd.Version = binary.BigEndian.Uint64(data[off : off+8])
+	}
+
 	return cmd, nil
 }
 
-// EngineFSM implements the Raft FSM interface, applying committed log entries
-// to the underlying database.
 type EngineFSM struct {
 	db server.DB
 }
@@ -125,39 +154,41 @@ func NewEngineFSM(db server.DB) *EngineFSM {
 	return &EngineFSM{db: db}
 }
 
-// Apply is called by Raft when a log entry is committed by a quorum.
-func (f *EngineFSM) Apply(data []byte) interface{} {
-	cmd, err := decodeRaftCommand(data)
+func (f *EngineFSM) Apply(l *raft.Log) interface{} {
+	cmd, err := decodeRaftCommand(l.Data)
 	if err != nil {
 		return err
 	}
-	return f.db.BatchApply(cmd.Entries)
+	if cmd.Op == "batch_apply" {
+		if cmd.Version > 0 {
+			return f.db.BatchApplyWithVersion(cmd.Entries, cmd.Version)
+		}
+		return f.db.BatchApply(cmd.Entries)
+	}
+	return server.ExecuteReplicatedCommand(f.db, cmd.Op, cmd.Args)
 }
 
-// Snapshot returns a point-in-time snapshot of the database.
-// NOTE: For very large datasets this will allocate significant memory.
-// Consider using StreamSnapshot for replication snapshots instead.
-func (f *EngineFSM) Snapshot() ([]byte, error) {
-	entries := f.db.SnapshotEntries()
-	return json.Marshal(entries)
+func (f *EngineFSM) Snapshot() (raft.FSMSnapshot, error) {
+	return &engineSnapshot{db: f.db}, nil
 }
 
-// Restore replaces the database state from a snapshot.
-func (f *EngineFSM) Restore(r io.Reader) error {
+func (f *EngineFSM) Restore(rc io.ReadCloser) error {
+	defer rc.Close()
 	if err := f.db.Clear(); err != nil {
 		return err
 	}
 
-	decoder := json.NewDecoder(r)
+	decoder := json.NewDecoder(rc)
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+
 	var batch []server.BatchWriteEntry
 	const batchSize = 1000
 
-	for {
+	for decoder.More() {
 		var entry server.SnapshotEntry
 		if err := decoder.Decode(&entry); err != nil {
-			if err == io.EOF {
-				break
-			}
 			return err
 		}
 		batch = append(batch, server.BatchWriteEntry{
@@ -178,3 +209,45 @@ func (f *EngineFSM) Restore(r io.Reader) error {
 	}
 	return nil
 }
+
+type engineSnapshot struct {
+	db server.DB
+}
+
+func (s *engineSnapshot) Persist(sink raft.SnapshotSink) error {
+	encoder := json.NewEncoder(sink)
+	if _, err := sink.Write([]byte("[")); err != nil {
+		sink.Cancel()
+		return err
+	}
+
+	first := true
+	_, err := s.db.StreamSnapshot(func(op byte, key, val []byte, expiresAt int64) error {
+		if !first {
+			if _, err := sink.Write([]byte(",")); err != nil {
+				return err
+			}
+		}
+		first = false
+		return encoder.Encode(server.SnapshotEntry{
+			Key:       key,
+			Value:     val,
+			Deleted:   op == 2,
+			ExpiresAt: expiresAt,
+		})
+	})
+
+	if err != nil {
+		sink.Cancel()
+		return err
+	}
+
+	if _, err := sink.Write([]byte("]")); err != nil {
+		sink.Cancel()
+		return err
+	}
+
+	return sink.Close()
+}
+
+func (s *engineSnapshot) Release() {}

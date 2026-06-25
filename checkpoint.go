@@ -82,7 +82,17 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 		return err
 	}
 
-	for _, sst := range e.allSSTables() {
+	tables := e.allSSTables()
+	for _, sst := range tables {
+		sst.IncrRef()
+	}
+	defer func() {
+		for _, sst := range tables {
+			_ = sst.DecrRef()
+		}
+	}()
+
+	for _, sst := range tables {
 		if err := linkOrCopy(sst.Filename(), filepath.Join(backupDir, filepath.Base(sst.Filename()))); err != nil {
 			return err
 		}
@@ -93,40 +103,55 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 		if _, err := os.Stat(src); err != nil {
 			continue
 		}
-		if err := linkOrCopy(src, filepath.Join(backupDir, name)); err != nil {
+		if err := copyFile(src, filepath.Join(backupDir, name)); err != nil {
 			return err
 		}
 	}
 
-	// The WAL is copied before the active VLog segment: value bytes are always
-	// written to the VLog before the WAL record that points at them, so a WAL
-	// snapshot taken first can never reference data missing from the VLog copy.
-	if err := copyFile(filepath.Join(e.dataDir, "wal.log"), filepath.Join(backupDir, "wal.log")); err != nil {
-		return err
-	}
+	// Freeze the append path: walAppendMu serializes every WAL and VLog append
+	// in the writer pipeline, so holding it after a flush/sync yields a
+	// consistent on-disk image instead of a torn record mid-copy. The WAL is
+	// copied before the active VLog segment because value bytes are always
+	// written to the VLog before the WAL record that points at them.
+	e.walMu.RLock()
+	e.walAppendMu.Lock()
 
-	activeFid := e.vl.ActiveFid()
-	srcVlogDir := filepath.Join(e.dataDir, "vlog")
-	entries, err := os.ReadDir(srcVlogDir)
-	if err != nil {
-		return err
-	}
-	for _, f := range entries {
-		if f.IsDir() {
-			continue
+	var copyErr error
+	if err := e.wal.FlushAndSync(); err != nil {
+		copyErr = err
+	} else if err := e.vl.Sync(); err != nil {
+		copyErr = err
+	} else if err := copyFile(filepath.Join(e.dataDir, "wal.log"), filepath.Join(backupDir, "wal.log")); err != nil {
+		copyErr = err
+	} else {
+		activeFid := e.vl.ActiveFid()
+		srcVlogDir := filepath.Join(e.dataDir, "vlog")
+		vlogFiles, rerr := os.ReadDir(srcVlogDir)
+		if rerr != nil {
+			copyErr = rerr
 		}
-		src := filepath.Join(srcVlogDir, f.Name())
-		dst := filepath.Join(vlogDir, f.Name())
-		fid, ok := vlogFid(f.Name())
-		if ok && fid == activeFid {
-			if err := copyFile(src, dst); err != nil {
-				return err
+		for _, f := range vlogFiles {
+			if copyErr != nil {
+				break
 			}
-			continue
+			if f.IsDir() {
+				continue
+			}
+			src := filepath.Join(srcVlogDir, f.Name())
+			dst := filepath.Join(vlogDir, f.Name())
+			fid, ok := vlogFid(f.Name())
+			if ok && fid == activeFid {
+				copyErr = copyFile(src, dst)
+				continue
+			}
+			copyErr = linkOrCopy(src, dst)
 		}
-		if err := linkOrCopy(src, dst); err != nil {
-			return err
-		}
+	}
+
+	e.walAppendMu.Unlock()
+	e.walMu.RUnlock()
+	if copyErr != nil {
+		return copyErr
 	}
 
 	return nil

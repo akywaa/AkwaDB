@@ -119,6 +119,10 @@ func (o *Oracle) MarkApplied(ts uint64) {
 	}
 	delete(o.awaiting, ts)
 	delete(o.readSeqs, ts)
+	o.advanceAppliedLocked()
+}
+
+func (o *Oracle) advanceAppliedLocked() {
 	for {
 		next := o.appliedTs + 1
 		if next > o.nextTs {
@@ -178,7 +182,14 @@ func (o *Oracle) BeginRead() uint64 {
 func (o *Oracle) DoneRead(ts uint64) {
 	o.mu.Lock()
 	delete(o.readSeqs, ts)
+	o.advanceAppliedLocked()
 	o.mu.Unlock()
+}
+
+func (o *Oracle) NextTs() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.nextTs
 }
 
 func (o *Oracle) CheckAndCommit(readTs uint64, readSet map[string]struct{}, writes map[string]txEntry) (uint64, error) {
@@ -232,16 +243,43 @@ func (o *Oracle) checkAndCommitInternal(readTs uint64, readFps map[uint64]struct
 		writes:   writeFps,
 	})
 
-	minActiveTs := o.watermark.MinReadTs(o.appliedTs)
+	o.trimHistoryLocked(o.watermark.MinReadTs(o.appliedTs))
+
+	return commitTs, nil
+}
+
+// trimHistoryLocked drops committed transactions every active reader has moved
+// past. The removed slots are zeroed so their write maps are not kept alive by
+// the backing array of the history slice.
+func (o *Oracle) trimHistoryLocked(minActiveTs uint64) {
 	i := 0
 	for ; i < len(o.history); i++ {
 		if o.history[i].commitTs >= minActiveTs {
 			break
 		}
 	}
-	if i > 0 {
-		o.history = o.history[i:]
+	if i == 0 {
+		return
 	}
+	for j := 0; j < i; j++ {
+		o.history[j] = committedTxn{}
+	}
+	o.history = o.history[i:]
+}
 
-	return commitTs, nil
+// RecordCommitted registers the writes of a transaction committed with an
+// externally assigned timestamp (distributed commit), so concurrent local SSI
+// transactions see the conflict instead of committing against stale history.
+func (o *Oracle) RecordCommitted(commitTs uint64, writes map[string]txEntry) {
+	if len(writes) == 0 {
+		return
+	}
+	writeFps := make(map[uint64]struct{}, len(writes))
+	for k := range writes {
+		writeFps[xxhash.Sum64String(k)] = struct{}{}
+	}
+	o.mu.Lock()
+	o.history = append(o.history, committedTxn{commitTs: commitTs, writes: writeFps})
+	o.trimHistoryLocked(o.watermark.MinReadTs(o.appliedTs))
+	o.mu.Unlock()
 }

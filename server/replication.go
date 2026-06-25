@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,8 @@ import (
 const (
 	opSnapshotStart byte = 3
 	opSnapshotEnd   byte = 4
+	opResume        byte = 5
+	opSeqSync       byte = 6
 )
 
 type replEntry struct {
@@ -23,17 +26,19 @@ type replEntry struct {
 	key       []byte
 	val       []byte
 	expiresAt int64
+	seq       uint64
 }
 
 // ReplBacklog is a fixed-size ring buffer that stores recent replication entries
 // so reconnecting replicas can resume from a partial sync instead of a full snapshot.
 type ReplBacklog struct {
-	mu      sync.Mutex
-	entries []replEntry
-	head    int
-	tail    int
-	count   int
+	mu       sync.Mutex
+	entries  []replEntry
+	head     int
+	tail     int
+	count    int
 	capacity int
+	nextSeq  uint64
 }
 
 func NewReplBacklog(capacity int) *ReplBacklog {
@@ -46,6 +51,8 @@ func NewReplBacklog(capacity int) *ReplBacklog {
 func (rb *ReplBacklog) Push(e replEntry) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
+	rb.nextSeq++
+	e.seq = rb.nextSeq
 	rb.entries[rb.tail] = e
 	rb.tail = (rb.tail + 1) % rb.capacity
 	if rb.count < rb.capacity {
@@ -55,33 +62,65 @@ func (rb *ReplBacklog) Push(e replEntry) {
 	}
 }
 
-// Drain returns all buffered entries and clears the backlog.
-func (rb *ReplBacklog) Drain() []replEntry {
+func (rb *ReplBacklog) CurrentSeq() uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	out := make([]replEntry, rb.count)
-	for i := 0; i < rb.count; i++ {
-		out[i] = rb.entries[(rb.head+i)%rb.capacity]
+	return rb.nextSeq
+}
+
+// Since returns the entries a replica still needs. ok is false when the
+// requested position has already fallen out of the ring and a full sync is
+// required instead.
+func (rb *ReplBacklog) Since(lastSeq uint64) ([]replEntry, bool) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if lastSeq == 0 {
+		return nil, false
 	}
-	rb.head = 0
-	rb.tail = 0
-	rb.count = 0
-	return out
+	if rb.count == 0 {
+		return nil, lastSeq == rb.nextSeq
+	}
+	oldest := rb.nextSeq - uint64(rb.count) + 1
+	if lastSeq+1 < oldest {
+		return nil, false
+	}
+	out := make([]replEntry, 0, rb.count)
+	for i := 0; i < rb.count; i++ {
+		e := rb.entries[(rb.head+i)%rb.capacity]
+		if e.seq > lastSeq {
+			out = append(out, e)
+		}
+	}
+	return out, true
+}
+
+// replWriter is the mutex-guarded writer shared with the connection goroutine.
+// Replication must not touch the bare bufio.Writer, which is not safe for
+// concurrent use.
+type replWriter interface {
+	Write(p []byte) (int, error)
+	Flush() error
 }
 
 // replicaConn tracks a single replica connected to this master.
 type replicaConn struct {
-	mu        sync.Mutex
-	conn      net.Conn
-	w         *bufio.Writer
-	addr      string
-	running   bool
-	stopCh    chan struct{}
-	closeOnce sync.Once
-	lastPing  time.Time
-	sendCh    chan replEntry
+	mu             sync.Mutex
+	conn           net.Conn
+	w              replWriter
+	addr           string
+	running        bool
+	stopCh         chan struct{}
+	closeOnce      sync.Once
+	lastPing       time.Time
+	sendCh         chan replEntry
 	snapshotActive atomic.Bool // true while the initial snapshot is streaming
+	pendingMu      sync.Mutex
+	pending        []replEntry // entries buffered while the snapshot streams
 }
+
+// replPendingLimit bounds how many live entries are buffered for a replica
+// that is still receiving its initial snapshot.
+const replPendingLimit = 10000
 
 // stopReplica safely closes stopCh exactly once, preventing double-close panics.
 func (rc *replicaConn) stopReplica() {
@@ -92,21 +131,24 @@ func (rc *replicaConn) stopReplica() {
 
 // handleReplicaSync handles a replica sending SYNC <lastSeq>.
 func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
-	// technically lastSeq could be used to resume from a specific point,
-	// but for now we just start from wherever we are
-	_ = args
-
 	addr := cl.conn.RemoteAddr().String()
 	slog.Info("replica connected", "addr", addr)
 
+	var lastSeq uint64
+	if len(args) > 0 {
+		if v, err := strconv.ParseUint(args[0], 10, 64); err == nil {
+			lastSeq = v
+		}
+	}
+
 	rc := &replicaConn{
-		conn:    cl.conn,
-		w:       cl.writer.w,
-		addr:    addr,
-		running: true,
-		stopCh:  make(chan struct{}),
+		conn:     cl.conn,
+		w:        cl.writer,
+		addr:     addr,
+		running:  true,
+		stopCh:   make(chan struct{}),
 		lastPing: time.Now(),
-		sendCh:  make(chan replEntry, 1024),
+		sendCh:   make(chan replEntry, 1024),
 	}
 
 	s.replicasMu.Lock()
@@ -121,37 +163,90 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 		slog.Info("replica disconnected", "addr", addr)
 	}()
 
-	rc.snapshotActive.Store(true)
-	sendsnapshot := func() error {
-		if _, err := rc.w.Write([]byte{opSnapshotStart}); err != nil {
-			return err
+	resumed := false
+	if entries, ok := s.replBacklog.Since(lastSeq); ok {
+		resumed = true
+		if _, err := rc.w.Write([]byte{opResume}); err != nil {
+			return
+		}
+		marker := lastSeq
+		for _, entry := range entries {
+			if err := writeReplicaEntry(rc.w, entry.op, entry.key, entry.val, entry.expiresAt); err != nil {
+				slog.Error("replica backlog resume failed", "addr", addr, "err", err)
+				return
+			}
+			marker = entry.seq
+		}
+		if err := writeSeqMarker(rc.w, marker); err != nil {
+			return
 		}
 		if err := rc.w.Flush(); err != nil {
-			return err
+			return
 		}
-
-		// stream entries one at a time — constant memory usage
-		count, err := s.db.StreamSnapshot(func(op byte, key, val []byte, expiresAt int64) error {
-			return writeReplicaEntry(rc.w, op, key, val, expiresAt)
-		})
-		if err != nil {
-			return err
-		}
-		_ = count
-
-		if _, err := rc.w.Write([]byte{opSnapshotEnd}); err != nil {
-			return err
-		}
-		return rc.w.Flush()
+		slog.Info("incremental sync accepted", "addr", addr, "from_seq", lastSeq, "to_seq", marker)
 	}
 
-	err := sendsnapshot()
-	if err != nil {
-		slog.Error("snapshot send failed", "addr", addr, "err", err)
-		return
+	if !resumed {
+		rc.snapshotActive.Store(true)
+		startSeq := s.replBacklog.CurrentSeq()
+		sendsnapshot := func() error {
+			if _, err := rc.w.Write([]byte{opSnapshotStart}); err != nil {
+				return err
+			}
+			if err := rc.w.Flush(); err != nil {
+				return err
+			}
+
+			count, err := s.db.StreamSnapshot(func(op byte, key, val []byte, expiresAt int64) error {
+				return writeReplicaEntry(rc.w, op, key, val, expiresAt)
+			})
+			if err != nil {
+				return err
+			}
+			_ = count
+
+			if _, err := rc.w.Write([]byte{opSnapshotEnd}); err != nil {
+				return err
+			}
+			return rc.w.Flush()
+		}
+
+		if err := sendsnapshot(); err != nil {
+			slog.Error("snapshot send failed", "addr", addr, "err", err)
+			return
+		}
+
+		rc.pendingMu.Lock()
+		var flushErr error
+		marker := startSeq
+		for _, entry := range rc.pending {
+			if flushErr = writeReplicaEntry(rc.w, entry.op, entry.key, entry.val, entry.expiresAt); flushErr != nil {
+				break
+			}
+			marker = entry.seq
+		}
+		rc.pending = nil
+		if flushErr == nil {
+			flushErr = writeSeqMarker(rc.w, marker)
+		}
+		if flushErr == nil {
+			flushErr = rc.w.Flush()
+		}
+		if flushErr != nil {
+			rc.mu.Lock()
+			rc.running = false
+			rc.mu.Unlock()
+		}
+		rc.snapshotActive.Store(false)
+		rc.pendingMu.Unlock()
+		if flushErr != nil {
+			slog.Error("replica backlog flush failed", "addr", addr, "err", flushErr)
+			return
+		}
+		slog.Info("snapshot sent", "addr", addr)
 	}
-	rc.snapshotActive.Store(false)
-	slog.Info("snapshot sent", "addr", addr)	// drain goroutine: reads entries from sendCh and writes them to the replica,
+
+	// drain goroutine: reads entries from sendCh and writes them to the replica,
 	// flushing once per burst instead of once per entry.
 	go func() {
 		for {
@@ -168,8 +263,16 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 					continue
 				}
 				err := writeReplicaEntry(rc.w, entry.op, entry.key, entry.val, entry.expiresAt)
+				lastWritten := entry.seq
 				if err == nil {
-					err = writeReplicaBurst(rc, 256)
+					var burstLast uint64
+					burstLast, err = writeReplicaBurst(rc, 256)
+					if burstLast > lastWritten {
+						lastWritten = burstLast
+					}
+				}
+				if err == nil {
+					err = writeSeqMarker(rc.w, lastWritten)
 				}
 				if err == nil {
 					err = rc.w.Flush()
@@ -241,18 +344,22 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 	s.replicasMu.RUnlock()
 
 	for _, rc := range targets {
-		// While the initial snapshot streams, entries go to the backlog instead
-		// of force-disconnecting a slow replica — otherwise it could never
-		// finish syncing. After the snapshot, a full backlog means the replica
-		// cannot keep up: drop it so it reconnects with a fresh SYNC rather
-		// than silently missing entries.
-		select {
-		case rc.sendCh <- entry:
-		default:
-			if rc.snapshotActive.Load() {
-				s.replBacklog.Push(entry)
+		// While the initial snapshot streams, entries are buffered for replay
+		// once it finishes instead of force-disconnecting a slow replica —
+		// otherwise it could never finish syncing. After the snapshot, a full
+		// send channel means the replica cannot keep up: drop it so it
+		// reconnects with a fresh SYNC rather than silently missing entries.
+		rc.pendingMu.Lock()
+		if rc.snapshotActive.Load() {
+			if len(rc.pending) < replPendingLimit {
+				rc.pending = append(rc.pending, entry)
+				rc.pendingMu.Unlock()
 				continue
 			}
+			// The replica cannot keep up even with the snapshot backlog:
+			// drop it so it reconnects and requests a fresh sync instead of
+			// silently missing writes.
+			rc.pendingMu.Unlock()
 			rc.mu.Lock()
 			rc.running = false
 			rc.mu.Unlock()
@@ -260,13 +367,26 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 			if rc.conn != nil {
 				_ = rc.conn.Close()
 			}
-			s.replBacklog.Push(entry)
+			continue
+		}
+		rc.pendingMu.Unlock()
+
+		select {
+		case rc.sendCh <- entry:
+		default:
+			rc.mu.Lock()
+			rc.running = false
+			rc.mu.Unlock()
+			rc.stopReplica()
+			if rc.conn != nil {
+				_ = rc.conn.Close()
+			}
 		}
 	}
 }
 
 // writeReplicaEntry sends a single WAL entry over the wire.
-func writeReplicaEntry(w *bufio.Writer, op byte, key, val []byte, expiresAt int64) error {
+func writeReplicaEntry(w replWriter, op byte, key, val []byte, expiresAt int64) error {
 	var hdr [9]byte // op(1) + keyLen(4) + valLen(4) = 9 bytes
 	hdr[0] = op
 	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(key)))
@@ -292,18 +412,28 @@ func writeReplicaEntry(w *bufio.Writer, op byte, key, val []byte, expiresAt int6
 	return nil
 }
 
-func writeReplicaBurst(rc *replicaConn, max int) error {
+func writeReplicaBurst(rc *replicaConn, max int) (uint64, error) {
+	var lastSeq uint64
 	for i := 0; i < max; i++ {
 		select {
 		case entry := <-rc.sendCh:
 			if err := writeReplicaEntry(rc.w, entry.op, entry.key, entry.val, entry.expiresAt); err != nil {
-				return err
+				return lastSeq, err
 			}
+			lastSeq = entry.seq
 		default:
-			return nil
+			return lastSeq, nil
 		}
 	}
-	return nil
+	return lastSeq, nil
+}
+
+func writeSeqMarker(w replWriter, seq uint64) error {
+	var b [9]byte
+	b[0] = opSeqSync
+	binary.BigEndian.PutUint64(b[1:], seq)
+	_, err := w.Write(b[:])
+	return err
 }
 
 // --- Replica side ---
@@ -344,11 +474,12 @@ func (s *Server) cmdReplicaOf(srv *Server, cl *client, args []string) error {
 
 	srv.writeSimpleString(cl, "OK")
 	return nil
-}// startReplication connects to a master and streams WAL entries until disconnect.
+} // startReplication connects to a master and streams WAL entries until disconnect.
 // It reconnects automatically and requests a full SYNC snapshot on each reconnect.
 func (s *Server) startReplication(ctx context.Context, addr string) {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	var lastSeq uint64
 
 	for {
 		select {
@@ -394,9 +525,10 @@ func (s *Server) startReplication(ctx context.Context, addr string) {
 			reader := bufio.NewReaderSize(conn, 128*1024)
 			writer := bufio.NewWriterSize(conn, 32*1024)
 
-			fmt.Fprintf(writer, "*2\r\n$4\r\nSYNC\r\n$1\r\n0\r\n")
+			seqStr := strconv.FormatUint(lastSeq, 10)
+			fmt.Fprintf(writer, "*2\r\n$5\r\nPSYNC\r\n$%d\r\n%s\r\n", len(seqStr), seqStr)
 			if err := writer.Flush(); err != nil {
-				slog.Error("repl SYNC send failed", "err", err)
+				slog.Error("repl PSYNC send failed", "err", err)
 				return
 			}
 
@@ -436,6 +568,18 @@ func (s *Server) startReplication(ctx context.Context, addr string) {
 				}
 				if op == opSnapshotEnd {
 					slog.Info("repl snapshot complete")
+					continue
+				}
+				if op == opResume {
+					slog.Info("incremental sync accepted")
+					continue
+				}
+				if op == opSeqSync {
+					var seqBuf [8]byte
+					if _, err := io.ReadFull(reader, seqBuf[:]); err != nil {
+						return
+					}
+					lastSeq = binary.BigEndian.Uint64(seqBuf[:])
 					continue
 				}
 
