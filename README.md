@@ -7,7 +7,7 @@
 [![Isolation](https://img.shields.io/badge/isolation-SSI_%2F_MVCC-green?style=flat-square)]()
 [![Pure Go](https://img.shields.io/badge/dependencies-zero--Cgo-success?style=flat-square)]()
 
-AkwaDB is a persistent, hybrid embedded-and-networked key-value storage engine engineered in Go. It fuses a multi-level LSM-tree, WiscKey-style Key-Value separation, Serializable Snapshot Isolation (SSI / MVCC), and drop-in compatibility with the Redis (RESP) protocol.
+**AkwaDB** is a high-performance, flash-optimized persistent key-value storage engine engineered in pure Go. It combines a multi-level LSM-tree with WiscKey key-value separation, Serializable Snapshot Isolation (SSI / MVCC), enterprise at-rest encryption (TDE), and drop-in Redis (RESP) protocol compatibility.
 
 Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provides rich native data structures (Strings, Hashes, Lists, Sets, ZSets, Bitmaps) backed by a flash-optimized storage engine with native Linux `io_uring` support, zero-allocation memory arenas, and distributed Raft consensus — compiled as a single zero-Cgo static binary.
 
