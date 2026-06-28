@@ -29,69 +29,9 @@ Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provi
 
 ## Core Architecture
 
-```mermaid
-flowchart TD
-    classDef client fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
-    classDef memory fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff;
-    classDef disk fill:#059669,stroke:#047857,stroke-width:2px,color:#fff;
-    classDef engine fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc;
-    classDef crypto fill:#b45309,stroke:#d97706,stroke-width:2px,color:#fff;
-
-    Client["Redis Client / SDK (RESP)"]:::client
-
-    subgraph Srv ["AkwaDB Server Layer"]
-        RESP["RESP Parser & Router"]:::engine
-        Raft["HashiCorp Raft Consensus"]:::engine
-        Oracle["Concurrency Oracle (SSI / MVCC)"]:::engine
-    end
-
-    subgraph Memory ["In-Memory Write Pipeline"]
-        Writers["Pipelined Writers (Worker Pool)"]:::memory
-        MemTable["Lock-Free SkipList<br/>(64KB Slab Bump Arena + Fixed Tower)"]:::memory
-        WAL["Write-Ahead Log (WAL)<br/>(Group Commit + AES-CTR)"]:::disk
-    end
-
-    subgraph WiscKey ["WiscKey Value Separation"]
-        Router{"Payload Size vs Threshold"}:::crypto
-    end
-
-    subgraph Storage ["Flash Storage Engine (LSM & VLog)"]
-        direction TB
-        subgraph LSM ["Multi-Level LSM Tree"]
-            L0["L0: SSTables (Flush Target)"]:::disk
-            L1["L1: Hot Tables (S2/Snappy)"]:::disk
-            L2["L2+: Cold Tables (ZSTD)"]:::disk
-        end
-        VLog["Segmented Value Log (VLog)<br/>(AES-CTR Encrypted Segments)"]:::disk
-        Cache["Two-Level Block Cache<br/>(LRU / TinyLFU / Prefix Bloom)"]:::memory
-    end
-
-    subgraph Background ["Autonomous Background Workers"]
-        Compaction["Compaction Worker<br/>(Size-Ratio + Tombstones)"]:::engine
-        VLogGC["Value Log GC<br/>(Discard-Ratio Prioritized)"]:::engine
-    end
-
-    Client -->|TCP Wire| RESP
-    RESP --> Raft
-    RESP --> Oracle
-    RESP --> Writers
-
-    Writers --> WAL
-    Writers --> Router
-
-    Router -->|Small: Inline| MemTable
-    Router -->|Large: Pointer| VLog
-    VLog -.->|ValuePointer 16B| MemTable
-
-    MemTable -->|Async Flush| L0
-    L0 --> L1
-    L1 --> L2
-
-    Cache <--> L0
-    Cache <--> L1
-    Compaction --> L0
-    VLogGC --> VLog
-```
+<p align="center">
+  <img src="assets/architecture.png" alt="AkwaDB Architecture" width="100%">
+</p>
 
 ### Storage Subsystems
 
