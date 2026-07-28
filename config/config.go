@@ -19,6 +19,28 @@ type Config struct {
 	// EncryptionKey is a hex-encoded master key (32 bytes / 64 hex chars for AES-256).
 	EncryptionKey     string `mapstructure:"encryption_key"`
 	EncryptionKeyPath string `mapstructure:"encryption_key_path"`
+
+	RaftID        string `mapstructure:"raft_id"`
+	RaftAddr      string `mapstructure:"raft_addr"`
+	RaftBootstrap bool   `mapstructure:"raft_bootstrap"`
+
+	TLSCertFile string `mapstructure:"tls_cert_file"`
+	TLSKeyFile  string `mapstructure:"tls_key_file"`
+
+	ArchiveDir string `mapstructure:"archive_dir"`
+
+	CheckpointDir      string `mapstructure:"checkpoint_dir"`
+	CheckpointInterval int    `mapstructure:"checkpoint_interval_seconds"`
+	CheckpointKeep     int    `mapstructure:"checkpoint_keep"`
+
+	S3Endpoint  string `mapstructure:"s3_endpoint"`
+	S3Region    string `mapstructure:"s3_region"`
+	S3Bucket    string `mapstructure:"s3_bucket"`
+	S3Prefix    string `mapstructure:"s3_prefix"`
+	S3AccessKey string `mapstructure:"s3_access_key"`
+	S3SecretKey string `mapstructure:"s3_secret_key"`
+	S3PathStyle bool   `mapstructure:"s3_path_style"`
+	S3UseTLS    bool   `mapstructure:"s3_use_tls"`
 }
 
 func Default() *Config {
@@ -50,6 +72,23 @@ func Load(path string) *Config {
 	v.SetDefault("repl_backlog_size", cfg.ReplBacklogSize)
 	v.SetDefault("encryption_key", "")
 	v.SetDefault("encryption_key_path", "")
+	v.SetDefault("raft_id", "")
+	v.SetDefault("raft_addr", "")
+	v.SetDefault("raft_bootstrap", false)
+	v.SetDefault("tls_cert_file", "")
+	v.SetDefault("tls_key_file", "")
+	v.SetDefault("archive_dir", "")
+	v.SetDefault("checkpoint_dir", "")
+	v.SetDefault("checkpoint_interval_seconds", 0)
+	v.SetDefault("checkpoint_keep", 0)
+	v.SetDefault("s3_endpoint", "")
+	v.SetDefault("s3_region", "")
+	v.SetDefault("s3_bucket", "")
+	v.SetDefault("s3_prefix", "")
+	v.SetDefault("s3_access_key", "")
+	v.SetDefault("s3_secret_key", "")
+	v.SetDefault("s3_path_style", false)
+	v.SetDefault("s3_use_tls", true)
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {

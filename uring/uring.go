@@ -1,12 +1,12 @@
 package uring
 
 import (
-	"os"
+	"io"
 	"sync"
 )
 
 type AsyncReader interface {
-	ReadBlocks(fd int, offsets []int64, bufs [][]byte) error
+	ReadBlocks(r io.ReaderAt, offsets []int64, bufs [][]byte) error
 	Close() error
 }
 
@@ -16,12 +16,10 @@ func NewAsyncReader(_ int) (AsyncReader, error) {
 	return &concurrentReader{}, nil
 }
 
-func (c *concurrentReader) ReadBlocks(fd int, offsets []int64, bufs [][]byte) error {
+func (c *concurrentReader) ReadBlocks(r io.ReaderAt, offsets []int64, bufs [][]byte) error {
 	if len(offsets) == 0 {
 		return nil
 	}
-
-	file := os.NewFile(uintptr(fd), "")
 
 	var wg sync.WaitGroup
 	var firstErr error
@@ -31,7 +29,7 @@ func (c *concurrentReader) ReadBlocks(fd int, offsets []int64, bufs [][]byte) er
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			_, err := file.ReadAt(bufs[idx], offsets[idx])
+			_, err := r.ReadAt(bufs[idx], offsets[idx])
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {

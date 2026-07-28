@@ -48,7 +48,7 @@ func NewReplBacklog(capacity int) *ReplBacklog {
 	}
 }
 
-func (rb *ReplBacklog) Push(e replEntry) {
+func (rb *ReplBacklog) Push(e replEntry) uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	rb.nextSeq++
@@ -60,6 +60,7 @@ func (rb *ReplBacklog) Push(e replEntry) {
 	} else {
 		rb.head = (rb.head + 1) % rb.capacity
 	}
+	return rb.nextSeq
 }
 
 func (rb *ReplBacklog) CurrentSeq() uint64 {
@@ -75,6 +76,9 @@ func (rb *ReplBacklog) Since(lastSeq uint64) ([]replEntry, bool) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	if lastSeq == 0 {
+		return nil, false
+	}
+	if lastSeq > rb.nextSeq {
 		return nil, false
 	}
 	if rb.count == 0 {
@@ -328,7 +332,7 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 	entry := replEntry{op: op, key: key, val: val, expiresAt: expiresAt}
 
 	// push to the ring buffer so PSYNC replicas can catch up
-	s.replBacklog.Push(entry)
+	entry.seq = s.replBacklog.Push(entry)
 
 	s.replicasMu.RLock()
 	if len(s.replicas) == 0 {
@@ -563,6 +567,7 @@ func (s *Server) startReplication(ctx context.Context, addr string) {
 					if err := s.db.Clear(); err != nil {
 						slog.Error("repl clear failed", "err", err)
 					}
+					lastSeq = 0
 					slog.Info("received snapshot start, clearing local state")
 					continue
 				}

@@ -232,6 +232,62 @@ func TestVLog_EmptyRecovery(t *testing.T) {
 	}
 }
 
+func TestVLog_DeleteSegmentDeferredWhileReading(t *testing.T) {
+	vl, dir := tempVLog(t)
+	defer os.RemoveAll(dir)
+	defer vl.Close()
+
+	vp, err := vl.Write(&ValueEntry{Op: OpPut, Key: []byte("k"), Value: []byte("v")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vl.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+
+	vl.mu.Lock()
+	seg := vl.segments[vp.Fid]
+	vl.mu.Unlock()
+	if seg == nil {
+		t.Fatal("segment not found")
+	}
+
+	seg.IncrRef()
+	if err := vl.DeleteSegment(vp.Fid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(seg.path); err != nil {
+		t.Fatalf("segment removed while a reader was active: %v", err)
+	}
+
+	seg.DecrRef()
+	if _, err := os.Stat(seg.path); !os.IsNotExist(err) {
+		t.Fatalf("segment still present after last reader released it: %v", err)
+	}
+}
+
+func TestVLog_ReadAfterRotate(t *testing.T) {
+	vl, dir := tempVLog(t)
+	defer os.RemoveAll(dir)
+	defer vl.Close()
+
+	vp, err := vl.Write(&ValueEntry{Op: OpPut, Key: []byte("k"), Value: []byte("payload")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vl.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := vl.ReadValue(vp)
+	if err != nil {
+		t.Fatalf("read from a rotated segment failed: %v", err)
+	}
+	if string(val) != "payload" {
+		t.Fatalf("ReadValue = %q, want payload", val)
+	}
+}
+
 func TestVLog_DiscardStats(t *testing.T) {
 	ds := NewDiscardStats()
 

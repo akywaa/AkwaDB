@@ -36,6 +36,8 @@ import (
 
 var ErrKeyNotFound = errors.New("key not found")
 var ErrNoRewrite = errors.New("vlog: no segments eligible for GC")
+var ErrDiskFull = errors.New("OOM command not allowed when disk is full")
+var ErrWriteTimeout = errors.New("write queue overloaded, try again")
 
 const (
 	valPtrSize = 16
@@ -141,6 +143,29 @@ func (e *Engine) addDiscard(valBytes []byte) {
 	}
 }
 
+// addCompactionDiscard records a ValuePointer that compaction provably dropped
+// from every level. Unlike addDiscard it ignores read-path skips, so the count
+// can be trusted to decide when a VLog segment is safe to unlink.
+func (e *Engine) addCompactionDiscard(valBytes []byte) {
+	if isValuePointer(valBytes) {
+		vp := decodeValuePointer(valBytes)
+		if e.vlogDiscards != nil {
+			e.vlogDiscards.AddDiscard(vp.Fid, int64(vp.Size))
+		}
+	}
+	e.addDiscard(valBytes)
+}
+
+func (e *Engine) vlogStillReferenced(fid uint32, totalValueBytes int64) bool {
+	if totalValueBytes <= 0 {
+		return false
+	}
+	if e.vlogDiscards == nil {
+		return true
+	}
+	return e.vlogDiscards.Get(fid) < totalValueBytes
+}
+
 func discardPath(dataDir string) string {
 	return filepath.Join(dataDir, "DISCARD")
 }
@@ -184,7 +209,6 @@ const levelSizeRatio = 10         // each level is 10x larger than the one above
 const l0BackpressureThreshold = 8 // start throttling writers at this L0 count
 const keyLockStripes = 256
 const l0StopThreshold = 16
-const subcompactionSplits = 4 // number of parallel key-range splits per compaction
 const tombstoneCompactionRatio = 0.40
 const maxWriterGoroutines = 8
 
@@ -208,6 +232,10 @@ type Options struct {
 	// observed value-size distribution, up to ValueThresholdMax.
 	AdaptiveValueThreshold bool
 	ValueThresholdMax      int
+
+	CheckpointDir      string
+	CheckpointInterval time.Duration
+	CheckpointKeep     int
 }
 
 func (o Options) levelRatio() int {
@@ -292,12 +320,15 @@ type Engine struct {
 
 	manifest   *os.File
 	manifestMu sync.Mutex
+	metaMu     sync.Mutex
 
 	discardMu    sync.Mutex
 	discardStats map[uint32]int64 // fid -> stale bytes from discarded pointers
+	gcPending    map[uint32]int64
 	vlogDiscards *vlog.DiscardStats
 
 	gcDiscardTs uint64 // max version at start of GC; tombstones above this are preserved
+	diskFull    atomic.Bool
 
 	oracle *Oracle
 	lock   *dirlock.DirLock
@@ -309,6 +340,14 @@ type Engine struct {
 	keyLocks    [keyLockStripes]sync.Mutex
 	incrMu      [keyLockStripes]sync.Mutex
 	walAppendMu sync.Mutex
+
+	archiver  Archiver
+	archiveMu sync.Mutex
+	archiveCh chan archiveItem
+	archiveWG sync.WaitGroup
+
+	checkpointStop chan struct{}
+	checkpointWG   sync.WaitGroup
 
 	expiries sync.Map
 	expireMu sync.Mutex
@@ -468,6 +507,7 @@ func (e *Engine) writer() {
 			e.throttleL0()
 
 			if err := e.ctx.Err(); err != nil {
+				e.oracle.MarkApplied(req.seq)
 				req.errCh <- incrResult{err: err}
 				continue
 			}
@@ -483,11 +523,7 @@ func (e *Engine) writer() {
 				}
 			}
 
-			sorted := make([]*writeReq, len(batch))
-			copy(sorted, batch)
-			sort.Slice(sorted, func(i, j int) bool { return sorted[i].seq < sorted[j].seq })
-
-			for _, r := range sorted {
+			for _, r := range batch {
 				r.errCh <- e.dispatch(r)
 			}
 
@@ -504,6 +540,7 @@ func (e *Engine) writer() {
 					if !ok {
 						return
 					}
+					e.oracle.MarkApplied(r.seq)
 					r.errCh <- incrResult{err: err}
 				default:
 					return
@@ -519,6 +556,12 @@ func (e *Engine) writer() {
 func (e *Engine) dispatch(r *writeReq) incrResult {
 	if r.op == opIncr {
 		return e.dispatchIncr(r)
+	}
+	if e.diskFull.Load() && (r.op == wal.OpPut || (len(r.batch) > 0 && batchHasWrites(r.batch))) {
+		if r.seq != 0 {
+			e.oracle.MarkApplied(r.seq)
+		}
+		return incrResult{err: ErrDiskFull}
 	}
 	if r.seq == 0 {
 		r.seq = e.oracle.NewCommitTs()
@@ -585,6 +628,12 @@ func (e *Engine) dispatch(r *writeReq) incrResult {
 // timestamp inside that critical section, so a later increment always reads a
 // version at or above the one written by its predecessor.
 func (e *Engine) dispatchIncr(r *writeReq) incrResult {
+	if e.diskFull.Load() {
+		if r.seq != 0 {
+			e.oracle.MarkApplied(r.seq)
+		}
+		return incrResult{err: ErrDiskFull}
+	}
 	stripe := e.keyStripe(r.key)
 	e.incrMu[stripe].Lock()
 	if r.seq == 0 {
@@ -599,6 +648,15 @@ func (e *Engine) dispatchIncr(r *writeReq) incrResult {
 	e.incrMu[stripe].Unlock()
 	e.oracle.MarkApplied(r.seq)
 	return res
+}
+
+func batchHasWrites(batch []server.BatchWriteEntry) bool {
+	for _, entry := range batch {
+		if !entry.Deleted {
+			return true
+		}
+	}
+	return false
 }
 
 type batchResult struct {
@@ -763,6 +821,19 @@ func bumpUint64(addr *uint64, v uint64) {
 	}
 }
 
+const writeQueueTimeout = 5 * time.Second
+
+func (e *Engine) submitWrite(req *writeReq) error {
+	select {
+	case e.writeReq <- req:
+		return nil
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case <-time.After(writeQueueTimeout):
+		return ErrWriteTimeout
+	}
+}
+
 func writerCount() int {
 	n := runtime.GOMAXPROCS(0)
 	if n > maxWriterGoroutines {
@@ -819,6 +890,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 		cancel:       cancel,
 		opts:         opts,
 		discardStats: make(map[uint32]int64),
+		gcPending:    make(map[uint32]int64),
 		writeReq:     make(chan *writeReq, 4096),
 	}
 	e.l0Cond = sync.NewCond(&e.memTableMu)
@@ -950,6 +1022,14 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 		}
 	}
 
+	e.checkDiskUsage()
+
+	if e.opts.CheckpointInterval > 0 && e.opts.CheckpointDir != "" {
+		e.checkpointStop = make(chan struct{})
+		e.checkpointWG.Add(1)
+		go e.checkpointWorker()
+	}
+
 	e.wg.Add(3)
 	go e.flushWorker()
 	go e.compactionWorker()
@@ -1003,7 +1083,7 @@ func (e *Engine) executeFlush(task flushTask) {
 	if len(allVersions) == 0 {
 		if task.oldWal != nil {
 			task.oldWal.Close()
-			_ = os.Remove(task.oldWalPath)
+			e.removeOrArchive(task.oldWalPath)
 		}
 		return
 	}
@@ -1026,18 +1106,18 @@ func (e *Engine) executeFlush(task flushTask) {
 	}
 	_ = fsutil.SyncDir(e.dataDir)
 
+	e.metaMu.Lock()
 	e.levelMu[0].Lock()
 	e.levels[0] = append(e.levels[0], sst)
 	e.levelMu[0].Unlock()
-
-	// record in manifest
 	e.appendManifest('A', 0, task.seq, sst.MinKey(), sst.MaxKey())
+	e.metaMu.Unlock()
 
 	if task.oldWal != nil {
 		task.oldWal.Close()
 	}
 	if task.oldWalPath != "" {
-		_ = os.Remove(task.oldWalPath)
+		e.removeOrArchive(task.oldWalPath)
 	}
 
 	// Track old VLog segment for GC. After the SSTable is written,
@@ -1071,21 +1151,28 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 	activeWalPath := filepath.Join(e.dataDir, "wal.log")
 
 	e.walMu.Lock()
+	e.walAppendMu.Lock()
 	oldWal := e.wal
+	syncOnWrite := oldWal.SyncOnWrite()
 
 	_ = oldWal.Close()
 	if err := os.Rename(activeWalPath, oldWalPath); err != nil {
+		e.walAppendMu.Unlock()
 		e.walMu.Unlock()
 		return nil, fmt.Errorf("rotate active wal: %w", err)
 	}
+	_ = fsutil.SyncDir(e.dataDir)
 
 	reopenedOldWal, _ := wal.OpenWithOptionsAndRegistry(oldWalPath, false, e.opts.KeyRegistry)
-	newWal, err := wal.OpenWithOptionsAndRegistry(activeWalPath, false, e.opts.KeyRegistry)
+	newWal, err := wal.OpenWithOptionsAndRegistry(activeWalPath, syncOnWrite, e.opts.KeyRegistry)
 	if err != nil {
+		e.walAppendMu.Unlock()
 		e.walMu.Unlock()
 		return nil, fmt.Errorf("create new wal: %w", err)
 	}
 	e.wal = newWal
+	_ = fsutil.SyncDir(e.dataDir)
+	e.walAppendMu.Unlock()
 	e.walMu.Unlock()
 
 	// Rotate VLog segment to create a clean GC boundary.
@@ -1134,9 +1221,14 @@ func (e *Engine) PutExWithOptions(key, val string, ttlSeconds int64, opts server
 		syncWAL:   opts.Sync,
 		errCh:     make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return err
+	}
 	res := <-req.errCh
 	if res.err != nil {
+		if errors.Is(res.err, ErrDiskFull) {
+			return res.err
+		}
 		return fmt.Errorf("wal write: %w", res.err)
 	}
 	e.metrics.incPut()
@@ -1314,7 +1406,9 @@ func (e *Engine) Delete(key string) (bool, error) {
 		checkExists: true,
 		errCh:       make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return false, err
+	}
 	res := <-req.errCh
 	if res.err != nil {
 		return false, res.err
@@ -1324,6 +1418,20 @@ func (e *Engine) Delete(key string) (bool, error) {
 	}
 	e.metrics.incDel()
 	return true, nil
+}
+
+func (e *Engine) GetDel(key string) (string, error) {
+	mu := e.lockKey(key)
+	defer mu.Unlock()
+
+	val, err := e.getByKey([]byte(key))
+	if err != nil {
+		return "", ErrKeyNotFound
+	}
+	if err := e.submitBatch([]server.BatchWriteEntry{{Key: key, Deleted: true}}); err != nil {
+		return "", err
+	}
+	return string(val), nil
 }
 
 func (e *Engine) existsWithoutLock(kBytes []byte) bool {
@@ -1458,7 +1566,9 @@ func (e *Engine) submitBatch(entries []server.BatchWriteEntry) error {
 		batch: entries,
 		errCh: make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return err
+	}
 	res := <-req.errCh
 	return res.err
 }
@@ -1555,7 +1665,10 @@ func (e *Engine) compactionWorker() {
 				if e.ctx.Err() != nil {
 					return
 				}
-				if err := e.Compact(); err != nil {
+				e.metaMu.Lock()
+				err := e.Compact()
+				e.metaMu.Unlock()
+				if err != nil {
 					slog.Error("compaction error", "err", err)
 					break
 				}
@@ -1655,9 +1768,7 @@ func (e *Engine) maintenanceWorker() {
 				manifestTicks = 0
 				_ = e.compactManifest()
 			}
-			if e.opts.MaxDiskBytes > 0 {
-				e.evictIfNeeded()
-			}
+			e.checkDiskUsage()
 		case <-gcTicker.C:
 			activeVlogFid := e.vl.ActiveFid()
 			e.discardMu.Lock()
@@ -1665,6 +1776,9 @@ func (e *Engine) maintenanceWorker() {
 			var maxDiscard int64
 			for fid, discBytes := range e.discardStats {
 				if fid == activeVlogFid {
+					continue
+				}
+				if pending, ok := e.gcPending[fid]; ok && e.vlogDiscards != nil && e.vlogDiscards.Get(fid) < pending {
 					continue
 				}
 				if discBytes > maxDiscard {
@@ -1721,32 +1835,18 @@ func (e *Engine) totalDiskUsage() int64 {
 	return total
 }
 
-// evictIfNeeded drops the oldest SSTable from the lowest non-empty level
-// when total disk usage exceeds MaxDiskBytes. This is a simple LRU-style
-// eviction for LSM trees — older levels contain older data.
-func (e *Engine) evictIfNeeded() {
-	usage := e.totalDiskUsage()
-	if usage <= e.opts.MaxDiskBytes {
+func (e *Engine) checkDiskUsage() {
+	if e.opts.MaxDiskBytes <= 0 {
 		return
 	}
-
-	for lvl := MaxLevels - 1; lvl >= 0; lvl-- {
-		e.levelMu[lvl].Lock()
-		if len(e.levels[lvl]) == 0 {
-			e.levelMu[lvl].Unlock()
-			continue
+	if e.totalDiskUsage() > e.opts.MaxDiskBytes {
+		if e.diskFull.CompareAndSwap(false, true) {
+			slog.Warn("disk usage exceeded limit, rejecting writes", "max_disk_bytes", e.opts.MaxDiskBytes)
 		}
-
-		victim := e.levels[lvl][0]
-		e.levels[lvl] = e.levels[lvl][1:]
-		e.levelMu[lvl].Unlock()
-
-		e.discardSSTablePointers(victim)
-		victim.MarkRemove()
-		e.appendManifest('D', lvl, sstSeqNum(victim), victim.MinKey(), victim.MaxKey())
-
-		slog.Info("evicted sst", "level", lvl, "file", filepath.Base(victim.Filename()), "disk_usage", e.totalDiskUsage())
 		return
+	}
+	if e.diskFull.CompareAndSwap(true, false) {
+		slog.Info("disk usage back under limit, accepting writes")
 	}
 }
 
@@ -1873,9 +1973,9 @@ func (e *Engine) compactLevel0() error {
 		iters = append(iters, it)
 	}
 
-	consolidated := e.drainMergedIterator(iters, baseLevel)
-
-	newTables := e.writeSSTablesAtLevel(consolidated, baseLevel)
+	w := &sstLevelWriter{e: e, level: baseLevel}
+	e.drainMergedIterator(iters, baseLevel, w)
+	newTables := w.finish()
 
 	e.levelMu[baseLevel].Lock()
 	var remainingBase []*sstable.SSTable
@@ -1952,7 +2052,6 @@ func (e *Engine) compactLevelTable(fromLevel int, pick *sstable.SSTable) error {
 	}
 	e.levelMu[toLevel].RUnlock()
 
-	// parallel sub-compaction: split key range and merge in parallel
 	var iters []iterator.VersionedIterator
 	for _, t := range overlaps {
 		it := t.NewIterator()
@@ -1963,57 +2062,9 @@ func (e *Engine) compactLevelTable(fromLevel int, pick *sstable.SSTable) error {
 	pickIt.Seek([]byte(""))
 	iters = append(iters, pickIt)
 
-	consolidated := e.drainMergedIterator(iters, toLevel)
-
-	// split consolidated entries into subcompactionSplits chunks and write in parallel
-	eng := e
-	n := len(consolidated)
-	var newTables []*sstable.SSTable
-	if n > 0 {
-		numSplits := subcompactionSplits
-		if numSplits > n {
-			numSplits = n
-		}
-		chunkSize := (n + numSplits - 1) / numSplits
-
-		var bounds []int
-		start := 0
-		for start < n {
-			end := start + chunkSize
-			if end > n {
-				end = n
-			}
-			for end < n && bytes.Equal(consolidated[end-1].Key, consolidated[end].Key) {
-				end++
-			}
-			bounds = append(bounds, start, end)
-			start = end
-		}
-
-		type splitResult struct {
-			tables []*sstable.SSTable
-		}
-		numChunks := len(bounds) / 2
-		results := make([]splitResult, numChunks)
-		syncCh := make(chan int, numChunks)
-
-		for i := 0; i < numChunks; i++ {
-			s, ed := bounds[i*2], bounds[i*2+1]
-			go func(idx, s, ed int) {
-				results[idx].tables = eng.writeSSTablesAtLevel(consolidated[s:ed], toLevel)
-				syncCh <- idx
-			}(i, s, ed)
-		}
-
-		for i := 0; i < numChunks; i++ {
-			<-syncCh
-		}
-
-		// merge all results and insert into target level
-		for _, r := range results {
-			newTables = append(newTables, r.tables...)
-		}
-	}
+	w := &sstLevelWriter{e: e, level: toLevel}
+	e.drainMergedIterator(iters, toLevel, w)
+	newTables := w.finish()
 
 	e.levelMu[toLevel].Lock()
 	var remaining []*sstable.SSTable
@@ -2061,7 +2112,7 @@ type compactionVersion struct {
 	expAt   int64
 }
 
-func (e *Engine) drainMergedIterator(iters []iterator.VersionedIterator, targetLevel int) []memtable.Entry {
+func (e *Engine) drainMergedIterator(iters []iterator.VersionedIterator, targetLevel int, w *sstLevelWriter) {
 	now := time.Now().Unix()
 	minReadTs := e.oracle.MinReadTs()
 	hasActiveTxns := minReadTs < e.oracle.NextTs()
@@ -2070,8 +2121,6 @@ func (e *Engine) drainMergedIterator(iters []iterator.VersionedIterator, targetL
 
 	merged := iterator.NewMergedVersionIterator(iters)
 	defer merged.Close()
-
-	var consolidated []memtable.Entry
 
 	for merged.Valid() {
 		groupKey := merged.Entry().Key
@@ -2109,14 +2158,14 @@ func (e *Engine) drainMergedIterator(iters []iterator.VersionedIterator, targetL
 				kept = append(kept, g)
 				continue
 			}
-			e.addDiscard(g.value)
+			e.addCompactionDiscard(g.value)
 		}
 
 		if len(kept) == 1 {
 			head := kept[0]
 			dead := head.deleted || (head.expAt > 0 && now >= head.expAt)
 			if dead && isBottomLevel && !hasActiveTxns && gcTs == 0 && !e.keyMayExistBelow(targetLevel, head.key) {
-				e.addDiscard(head.value)
+				e.addCompactionDiscard(head.value)
 				continue
 			}
 		}
@@ -2131,54 +2180,53 @@ func (e *Engine) drainMergedIterator(iters []iterator.VersionedIterator, targetL
 			if g.deleted || (g.expAt > 0 && now >= g.expAt) {
 				entry.Deleted = true
 			}
-			consolidated = append(consolidated, entry)
+			w.add(entry)
 		}
+		w.maybeFlush()
 	}
-
-	return consolidated
 }
 
-// writes consolidated entries as new sstables at the given level,
-// splitting into roughly 8mb chunks
-func (e *Engine) writeSSTablesAtLevel(entries []memtable.Entry, level int) []*sstable.SSTable {
-	const chunkSize = 8 * 1024 * 1024 // ~8mb per table
-	var tables []*sstable.SSTable
+const compactionTableBytes = 8 * 1024 * 1024
 
-	for len(entries) > 0 {
-		// rough size estimate
-		chunk := 0
-		end := 0
-		for i, ent := range entries {
-			// ~17 bytes for header + 16 for index entry approximation
-			chunk += len(ent.Key) + len(ent.Value) + 33
-			if i > 0 && chunk >= chunkSize {
-				end = i
-				break
-			}
-			end = i + 1
-		}
-		if end == 0 {
-			end = 1
-		}
-		for end < len(entries) && bytes.Equal(entries[end-1].Key, entries[end].Key) {
-			end++
-		}
+type sstLevelWriter struct {
+	e      *Engine
+	level  int
+	buf    []memtable.Entry
+	bytes  int
+	tables []*sstable.SSTable
+}
 
-		batch := entries[:end]
-		entries = entries[end:]
+func (w *sstLevelWriter) add(entry memtable.Entry) {
+	w.buf = append(w.buf, entry)
+	w.bytes += len(entry.Key) + len(entry.Value) + 33
+}
 
-		seq := atomic.AddUint64(&e.nextSeq, 1)
-		sstName := filepath.Join(e.dataDir, fmt.Sprintf("%06d.sst", seq))
-		sst, err := sstable.CreateAtLevelWithRegistry(sstName, batch, e.blockCache, level, e.opts.KeyRegistry)
-		if err != nil {
-			slog.Error("error creating sstable", "level", level, "err", err)
-			continue
-		}
-		_ = fsutil.SyncDir(e.dataDir)
-		tables = append(tables, sst)
+func (w *sstLevelWriter) maybeFlush() {
+	if w.bytes >= compactionTableBytes {
+		w.flush()
 	}
+}
 
-	return tables
+func (w *sstLevelWriter) flush() {
+	if len(w.buf) == 0 {
+		return
+	}
+	seq := atomic.AddUint64(&w.e.nextSeq, 1)
+	sstName := filepath.Join(w.e.dataDir, fmt.Sprintf("%06d.sst", seq))
+	sst, err := sstable.CreateAtLevelWithRegistry(sstName, w.buf, w.e.blockCache, w.level, w.e.opts.KeyRegistry)
+	if err != nil {
+		slog.Error("error creating sstable", "level", w.level, "err", err)
+	} else {
+		_ = fsutil.SyncDir(w.e.dataDir)
+		w.tables = append(w.tables, sst)
+	}
+	w.buf = w.buf[:0]
+	w.bytes = 0
+}
+
+func (w *sstLevelWriter) finish() []*sstable.SSTable {
+	w.flush()
+	return w.tables
 }
 
 func (e *Engine) removeFromLevel(lvl int, remove []*sstable.SSTable) {
@@ -2421,8 +2469,173 @@ func (e *Engine) ScanKeys(pattern string) ([]string, error) {
 	return keys, nil
 }
 
+func (e *Engine) ScanAllKeys(pattern string) ([]string, error) {
+	merged, iters := e.buildMergedIterator([]byte(""))
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	seen := make(map[string]struct{})
+	var keys []string
+	var prevKey []byte
+	now := time.Now().Unix()
+
+	for merged.Valid() {
+		k := merged.Key()
+		if prevKey != nil && bytes.Equal(k, prevKey) {
+			merged.Next()
+			continue
+		}
+		prevKey = append(prevKey[:0], k...)
+
+		if merged.Deleted() || (merged.ExpiresAt() > 0 && now >= merged.ExpiresAt()) {
+			merged.Next()
+			continue
+		}
+
+		name := logicalKey(k)
+		if name == "" {
+			merged.Next()
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			merged.Next()
+			continue
+		}
+		seen[name] = struct{}{}
+		if matched, _ := path.Match(pattern, name); matched || pattern == "*" {
+			keys = append(keys, name)
+		}
+		merged.Next()
+	}
+
+	sort.Strings(keys)
+	return keys, nil
+}
+
+func logicalKey(k []byte) string {
+	if len(k) < 2 || k[1] != 0 {
+		return string(k)
+	}
+	switch k[0] {
+	case 's':
+		return string(k[2:])
+	case 'h', 't', 'l', 'z', 'b':
+		rest := k[2:]
+		if i := bytes.IndexByte(rest, 0); i >= 0 {
+			return string(rest[:i])
+		}
+	}
+	return ""
+}
+
+const deleteBatchSize = 1024
+
+func (e *Engine) DeleteCollection(key string) (int64, error) {
+	var total int64
+	for _, prefix := range collectionPrefixes(key) {
+		n, err := e.deletePrefixChunked(prefix)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func collectionPrefixes(key string) [][]byte {
+	return [][]byte{
+		hashPrefix(key),
+		setPrefix(key),
+		listStorePrefix(key),
+		bitmapPrefix(key),
+		zsetStorePrefix(key),
+	}
+}
+
+func listStorePrefix(key string) []byte {
+	b := make([]byte, 0, len(key)+2)
+	b = append(b, 'l', 0)
+	b = append(b, key...)
+	b = append(b, 0)
+	return b
+}
+
+func zsetStorePrefix(key string) []byte {
+	b := make([]byte, 0, len(key)+2)
+	b = append(b, 'z', 0)
+	b = append(b, key...)
+	b = append(b, 0)
+	return b
+}
+
+func (e *Engine) deletePrefixChunked(prefix []byte) (int64, error) {
+	merged, iters := e.buildMergedIterator(prefix)
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	var deleted int64
+	batch := make([]server.BatchWriteEntry, 0, deleteBatchSize)
+	var prevKey []byte
+	now := time.Now().Unix()
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		err := e.submitBatch(batch)
+		if err == nil {
+			deleted += int64(len(batch))
+		}
+		batch = batch[:0]
+		return err
+	}
+
+	for merged.Valid() {
+		k := merged.Key()
+		if !bytes.HasPrefix(k, prefix) {
+			break
+		}
+		if prevKey != nil && bytes.Equal(k, prevKey) {
+			merged.Next()
+			continue
+		}
+		prevKey = append(prevKey[:0], k...)
+
+		if !merged.Deleted() && (merged.ExpiresAt() == 0 || now < merged.ExpiresAt()) {
+			kb := make([]byte, len(k))
+			copy(kb, k)
+			batch = append(batch, server.BatchWriteEntry{Key: string(kb), Deleted: true})
+			if len(batch) >= deleteBatchSize {
+				if err := flush(); err != nil {
+					return deleted, err
+				}
+			}
+		}
+		merged.Next()
+	}
+	if err := flush(); err != nil {
+		return deleted, err
+	}
+	return deleted, nil
+}
+
+func hashPrefix(hash string) []byte {
+	b := make([]byte, 0, len(hash)+2)
+	b = append(b, 'h', 0)
+	b = append(b, hash...)
+	b = append(b, 0)
+	return b
+}
+
 func hashFieldKey(hash, field string) []byte {
-	return []byte("h\x00" + hash + "\x00" + field)
+	b := hashPrefix(hash)
+	return append(b, field...)
 }
 
 func (e *Engine) HSet(hash, field, val string) (bool, error) {
@@ -2469,7 +2682,7 @@ func (e *Engine) HDel(hash, field string) (bool, error) {
 }
 
 func (e *Engine) HGetAll(hash string) (map[string]string, error) {
-	prefix := []byte("h\x00" + hash + "\x00")
+	prefix := hashPrefix(hash)
 	pairs := e.getByPrefix(prefix)
 
 	result := make(map[string]string, len(pairs))
@@ -2481,13 +2694,13 @@ func (e *Engine) HGetAll(hash string) (map[string]string, error) {
 }
 
 func (e *Engine) HLen(hash string) (int64, error) {
-	prefix := []byte("h\x00" + hash + "\x00")
+	prefix := hashPrefix(hash)
 	pairs := e.getByPrefix(prefix)
 	return int64(len(pairs)), nil
 }
 
 func (e *Engine) HKeys(hash string) ([]string, error) {
-	prefix := []byte("h\x00" + hash + "\x00")
+	prefix := hashPrefix(hash)
 	pairs := e.getByPrefix(prefix)
 
 	keys := make([]string, 0, len(pairs))
@@ -2515,7 +2728,9 @@ func (e *Engine) IncrBy(key string, delta int64) (int64, error) {
 		delta: delta,
 		errCh: make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return 0, err
+	}
 	res := <-req.errCh
 	if res.err != nil {
 		return 0, res.err
@@ -2666,7 +2881,9 @@ func (e *Engine) Clear() error {
 		op:    opClear,
 		errCh: make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return err
+	}
 	res := <-req.errCh
 	return res.err
 }
@@ -2675,8 +2892,10 @@ func (e *Engine) Clear() error {
 func (e *Engine) clearInternal() error {
 	e.memTableMu.Lock()
 	e.walMu.Lock()
+	e.walAppendMu.Lock()
 	defer e.memTableMu.Unlock()
 	defer e.walMu.Unlock()
+	defer e.walAppendMu.Unlock()
 
 	e.memTable.Store(memtable.NewSkipList())
 	e.immMemTable.Store(nil)
@@ -2714,6 +2933,7 @@ func (e *Engine) clearInternal() error {
 	}
 	e.discardMu.Lock()
 	e.discardStats = make(map[uint32]int64)
+	e.gcPending = make(map[uint32]int64)
 	e.discardMu.Unlock()
 	_ = os.Remove(discardPath(e.dataDir))
 
@@ -2735,7 +2955,9 @@ func (e *Engine) BatchApply(entries []server.BatchWriteEntry) error {
 		batch: entries,
 		errCh: make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return err
+	}
 	res := <-req.errCh
 	return res.err
 }
@@ -2746,7 +2968,9 @@ func (e *Engine) enqueueBatchWithVersion(entries []server.BatchWriteEntry, versi
 		seq:   version,
 		errCh: make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		req.errCh <- incrResult{err: err}
+	}
 	return req.errCh
 }
 
@@ -2757,7 +2981,9 @@ func (e *Engine) BatchApplyWithVersion(entries []server.BatchWriteEntry, version
 		seq:   version,
 		errCh: make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return err
+	}
 	res := <-req.errCh
 	return res.err
 }
@@ -2830,6 +3056,9 @@ func (e *Engine) RunValueLogGC(discardRatio float64) error {
 		if fid == activeFid {
 			continue
 		}
+		if pending, ok := e.gcPending[fid]; ok && e.vlogDiscards != nil && e.vlogDiscards.Get(fid) < pending {
+			continue
+		}
 		if stale > maxStale {
 			maxStale = stale
 			bestFid = fid
@@ -2863,7 +3092,9 @@ func (e *Engine) runValueLogGCInternal(targetFid uint32) error {
 
 	// Replay live entries from the target VLog segment into the current WAL/VLog.
 	var entriesToRewrite []gcRewriteEntry
+	var totalValueBytes int64
 	err := e.vl.Recover(targetFid, func(entry vlog.ValueEntry, valueOffset int64) error {
+		totalValueBytes += int64(len(entry.Value))
 		if entry.Op == vlog.OpDelete || len(entry.Value) == 0 {
 			return nil
 		}
@@ -2887,7 +3118,10 @@ func (e *Engine) runValueLogGCInternal(targetFid uint32) error {
 			},
 			errCh: make(chan incrResult, 1),
 		}
-		e.writeReq <- req
+		if err := e.submitWrite(req); err != nil {
+			slog.Error("vlog gc rewrite submit failed", "err", err)
+			break
+		}
 		<-req.errCh
 	}
 
@@ -2895,15 +3129,36 @@ func (e *Engine) runValueLogGCInternal(targetFid uint32) error {
 
 	// Wait until no active MVCC readers can still reference this vlog.
 	for e.oracle.MinReadTs() < gcTs {
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-e.ctx.Done():
+			return e.ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 
-	// Remove the segment from VLog and discard stats.
+	// Old ValuePointers may still sit in SSTables until compaction drops those
+	// versions. Unlinking the file now would let a read resolve a dangling
+	// pointer, so wait until compaction has provably discarded all of them.
+	if e.vlogStillReferenced(targetFid, totalValueBytes) {
+		e.discardMu.Lock()
+		e.gcPending[targetFid] = totalValueBytes
+		e.discardMu.Unlock()
+		select {
+		case e.compactChan <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+
 	e.discardMu.Lock()
 	delete(e.discardStats, targetFid)
+	delete(e.gcPending, targetFid)
 	e.discardMu.Unlock()
-	e.vlogDiscards.Delete(targetFid)
+	if e.vlogDiscards != nil {
+		e.vlogDiscards.Delete(targetFid)
+	}
 
+	e.archivePath(filepath.Join(e.dataDir, "vlog", fmt.Sprintf("vlog_%06d.log", targetFid)))
 	return e.vl.DeleteSegment(targetFid)
 }
 
@@ -2924,11 +3179,19 @@ const listMetaSuffix = "\x00meta"
 func listElemKey(key string, index int64) []byte {
 	// Bias index by 2^62 to ensure all values are positive and sort correctly.
 	biased := index + (1 << 62)
-	return []byte("l\x00" + key + "\x00" + fmt.Sprintf("%016d", biased))
+	b := make([]byte, 0, len(key)+2+16)
+	b = append(b, 'l', 0)
+	b = append(b, key...)
+	b = append(b, 0)
+	return fmt.Appendf(b, "%016d", biased)
 }
 
 func listMetaKey(key string) []byte {
-	return []byte("l\x00" + key + listMetaSuffix)
+	b := make([]byte, 0, len(key)+len(listMetaSuffix)+2)
+	b = append(b, 'l', 0)
+	b = append(b, key...)
+	b = append(b, listMetaSuffix...)
+	return b
 }
 
 func (e *Engine) listLen(key string) int64 {
@@ -3005,13 +3268,16 @@ func (e *Engine) LPop(key string) (string, error) {
 		return "", err
 	}
 	metaK := listMetaKey(key)
-	metaBuf := make([]byte, 16)
-	binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head+1))
-	binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail))
-	if err := e.submitBatch([]server.BatchWriteEntry{
-		{Key: string(kBytes), Deleted: true},
-		{Key: string(metaK), Value: string(metaBuf)},
-	}); err != nil {
+	entries := []server.BatchWriteEntry{{Key: string(kBytes), Deleted: true}}
+	if head+1 >= tail {
+		entries = append(entries, server.BatchWriteEntry{Key: string(metaK), Deleted: true})
+	} else {
+		metaBuf := make([]byte, 16)
+		binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head+1))
+		binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail))
+		entries = append(entries, server.BatchWriteEntry{Key: string(metaK), Value: string(metaBuf)})
+	}
+	if err := e.submitBatch(entries); err != nil {
 		return "", err
 	}
 	return string(val), nil
@@ -3032,13 +3298,16 @@ func (e *Engine) RPop(key string) (string, error) {
 		return "", err
 	}
 	metaK := listMetaKey(key)
-	metaBuf := make([]byte, 16)
-	binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head))
-	binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail-1))
-	if err := e.submitBatch([]server.BatchWriteEntry{
-		{Key: string(kBytes), Deleted: true},
-		{Key: string(metaK), Value: string(metaBuf)},
-	}); err != nil {
+	entries := []server.BatchWriteEntry{{Key: string(kBytes), Deleted: true}}
+	if tail-1 <= head {
+		entries = append(entries, server.BatchWriteEntry{Key: string(metaK), Deleted: true})
+	} else {
+		metaBuf := make([]byte, 16)
+		binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head))
+		binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail-1))
+		entries = append(entries, server.BatchWriteEntry{Key: string(metaK), Value: string(metaBuf)})
+	}
+	if err := e.submitBatch(entries); err != nil {
 		return "", err
 	}
 	return string(val), nil
@@ -3094,8 +3363,17 @@ func (e *Engine) LRange(key string, start, stop int64) ([]string, error) {
 // ==========================================
 //
 // Each member is stored as a separate key: t\x00<setKey>\x00<member> -> ""
+func setPrefix(key string) []byte {
+	b := make([]byte, 0, len(key)+2)
+	b = append(b, 't', 0)
+	b = append(b, key...)
+	b = append(b, 0)
+	return b
+}
+
 func setMemberKey(key, member string) []byte {
-	return []byte("t\x00" + key + "\x00" + member)
+	b := setPrefix(key)
+	return append(b, member...)
 }
 
 func (e *Engine) SAdd(key string, members []string) (int64, error) {
@@ -3127,7 +3405,7 @@ func (e *Engine) SAdd(key string, members []string) (int64, error) {
 
 func (e *Engine) SMembers(key string) ([]string, error) {
 
-	prefix := []byte("t\x00" + key + "\x00")
+	prefix := setPrefix(key)
 	existing := e.getByPrefix(prefix)
 
 	members := make([]string, 0, len(existing))
@@ -3172,9 +3450,43 @@ func (e *Engine) SRem(key string, members []string) (int64, error) {
 
 func (e *Engine) SCard(key string) (int64, error) {
 
-	prefix := []byte("t\x00" + key + "\x00")
+	prefix := setPrefix(key)
 	existing := e.getByPrefix(prefix)
 	return int64(len(existing)), nil
+}
+
+func (e *Engine) SInter(keys []string) ([]string, error) {
+	if len(keys) == 0 {
+		return []string{}, nil
+	}
+
+	basePrefix := setPrefix(keys[0])
+	result := make(map[string]struct{})
+	for k := range e.getByPrefix(basePrefix) {
+		result[k[len(basePrefix):]] = struct{}{}
+	}
+
+	for _, key := range keys[1:] {
+		if len(result) == 0 {
+			return []string{}, nil
+		}
+		prefix := setPrefix(key)
+		next := make(map[string]struct{})
+		for k := range e.getByPrefix(prefix) {
+			member := k[len(prefix):]
+			if _, ok := result[member]; ok {
+				next[member] = struct{}{}
+			}
+		}
+		result = next
+	}
+
+	members := make([]string, 0, len(result))
+	for member := range result {
+		members = append(members, member)
+	}
+	sort.Strings(members)
+	return members, nil
 }
 
 // ==========================================
@@ -3218,6 +3530,9 @@ func (e *Engine) ZAdd(key string, score float64, member string) (bool, error) {
 func (e *Engine) ZScore(key, member string) (float64, bool, error) {
 	val, err := e.getByKey(encoding.ZValKey(key, member))
 	if err != nil {
+		if err == ErrKeyNotFound {
+			return 0, false, nil
+		}
 		return 0, false, err
 	}
 	if len(val) != 8 {
@@ -3299,6 +3614,29 @@ func (e *Engine) ZRem(key string, members ...string) (int64, error) {
 // ==========================================
 // BITMAPS
 // ==========================================
+//
+// Bitmaps are split into fixed 4KB pages so a single far-away bit only ever
+// touches one small chunk instead of materialising a multi-megabyte string.
+// Page key: b\x00<key>\x00<page(8B BigEndian)>
+
+const (
+	bitmapPageBits = 8 * 4096
+)
+
+func bitmapPrefix(key string) []byte {
+	b := make([]byte, 0, len(key)+2)
+	b = append(b, 'b', 0)
+	b = append(b, key...)
+	b = append(b, 0)
+	return b
+}
+
+func bitmapPageKey(key string, page int64) []byte {
+	b := bitmapPrefix(key)
+	var idx [8]byte
+	binary.BigEndian.PutUint64(idx[:], uint64(page))
+	return append(b, idx[:]...)
+}
 
 func (e *Engine) SetBit(key string, offset int64, val int) (int, error) {
 	if offset < 0 {
@@ -3307,33 +3645,30 @@ func (e *Engine) SetBit(key string, offset int64, val int) (int, error) {
 	mu := e.lockKey(key)
 	defer mu.Unlock()
 
-	old, err := e.Get(key)
+	page := offset / bitmapPageBits
+	byteIdx := int((offset % bitmapPageBits) / 8)
+	bitIdx := uint(7 - (offset % 8))
+	pageKey := string(bitmapPageKey(key, page))
+
+	old, err := e.Get(pageKey)
 	if err != nil && err != ErrKeyNotFound {
 		return 0, err
 	}
 	data := []byte(old)
-	byteIdx := offset / 8
-	bitIdx := 7 - (offset % 8)
-
-	var oldBit int
-	if int(byteIdx) < len(data) {
-		oldBit = int((data[byteIdx] >> bitIdx) & 1)
+	if byteIdx >= len(data) {
+		grown := make([]byte, byteIdx+1)
+		copy(grown, data)
+		data = grown
 	}
 
-	// expand if needed
-	if int(byteIdx) >= len(data) {
-		newData := make([]byte, byteIdx+1)
-		copy(newData, data)
-		data = newData
-	}
-
+	oldBit := int((data[byteIdx] >> bitIdx) & 1)
 	if val != 0 {
 		data[byteIdx] |= 1 << bitIdx
 	} else {
 		data[byteIdx] &^= 1 << bitIdx
 	}
 
-	if err := e.Put(key, string(data)); err != nil {
+	if err := e.Put(pageKey, string(data)); err != nil {
 		return 0, err
 	}
 	return oldBit, nil
@@ -3343,30 +3678,48 @@ func (e *Engine) GetBit(key string, offset int64) (int, error) {
 	if offset < 0 {
 		return 0, errors.New("ERR bit offset is not an integer or out of range")
 	}
-	old, err := e.Get(key)
+	page := offset / bitmapPageBits
+	byteIdx := int((offset % bitmapPageBits) / 8)
+	bitIdx := uint(7 - (offset % 8))
+
+	old, err := e.Get(string(bitmapPageKey(key, page)))
 	if err != nil {
+		if err == ErrKeyNotFound {
+			return 0, nil
+		}
 		return 0, err
 	}
 	data := []byte(old)
-	byteIdx := offset / 8
-	bitIdx := 7 - (offset % 8)
-
-	if int(byteIdx) >= len(data) {
+	if byteIdx >= len(data) {
 		return 0, nil
 	}
 	return int((data[byteIdx] >> bitIdx) & 1), nil
 }
 
 func (e *Engine) BitCount(key string) (int64, error) {
-	old, err := e.Get(key)
-	if err != nil {
-		return 0, err
-	}
+	pages := e.getByPrefix(bitmapPrefix(key))
 	var count int64
-	for _, b := range []byte(old) {
-		count += int64(bits.OnesCount8(b))
+	for _, page := range pages {
+		for _, b := range page {
+			count += int64(bits.OnesCount8(b))
+		}
 	}
 	return count, nil
+}
+
+func (e *Engine) DeleteBitmap(key string) error {
+	mu := e.lockKey(key)
+	defer mu.Unlock()
+
+	pages := e.getByPrefix(bitmapPrefix(key))
+	if len(pages) == 0 {
+		return nil
+	}
+	entries := make([]server.BatchWriteEntry, 0, len(pages))
+	for k := range pages {
+		entries = append(entries, server.BatchWriteEntry{Key: k, Deleted: true})
+	}
+	return e.submitBatch(entries)
 }
 
 func (e *Engine) Close() error {
@@ -3377,8 +3730,14 @@ func (e *Engine) Close() error {
 	e.walMu.Lock()
 	e.walMu.Unlock()
 
+	if e.checkpointStop != nil {
+		close(e.checkpointStop)
+		e.checkpointWG.Wait()
+	}
+
 	close(e.writeReq)
 	e.wg.Wait()
+	e.archiveWG.Wait()
 
 	var firstErr error
 	if e.wal != nil {

@@ -1,10 +1,87 @@
 package wal
 
 import (
+	"errors"
 	"os"
 	"sync"
 	"testing"
 )
+
+func TestWAL_WriteAfterCloseReturnsError(t *testing.T) {
+	f, err := os.CreateTemp("", "wal_closed_*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+
+	w, err := OpenWithOptions(name, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteVersion(OpPut, []byte("k"), []byte("v"), 0, 1); !errors.Is(err, ErrWALClosed) {
+		t.Fatalf("WriteVersion after Close = %v, want ErrWALClosed", err)
+	}
+}
+
+func TestWAL_RecoverRealignsOffset(t *testing.T) {
+	f, err := os.CreateTemp("", "wal_realign_*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+
+	w, err := Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := w.WriteVersion(OpPut, []byte("k"), []byte("v"), 0, uint64(i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := w.Offset()
+	if err := os.Truncate(name, before-3); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	w2, err := Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, err := w2.Recover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) == 0 {
+		t.Fatal("expected records after recovery")
+	}
+	if _, err := w2.WriteVersion(OpPut, []byte("after"), []byte("recover"), 0, 99); err != nil {
+		t.Fatal(err)
+	}
+	w2.Close()
+
+	w3, err := Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w3.Close()
+	recs, err = w3.Recover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := recs[len(recs)-1]
+	if string(last.Key) != "after" || string(last.Value) != "recover" {
+		t.Fatalf("last recovered record = %q/%q, want after/recover", last.Key, last.Value)
+	}
+}
 
 func tempWAL(t *testing.T) (*WAL, string) {
 	t.Helper()

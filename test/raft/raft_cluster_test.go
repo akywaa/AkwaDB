@@ -50,6 +50,17 @@ func (m *memoryDB) Delete(key string) (bool, error) {
 func (m *memoryDB) TTL(_ string) (int64, error)                  { return -1, nil }
 func (m *memoryDB) Expire(_ string, _ int64) (bool, error)       { return true, nil }
 func (m *memoryDB) ScanKeys(_ string) ([]string, error)          { return nil, nil }
+func (m *memoryDB) ScanAllKeys(_ string) ([]string, error)       { return nil, nil }
+func (m *memoryDB) DeleteCollection(_ string) (int64, error)     { return 0, nil }
+func (m *memoryDB) GetDel(key string) (string, error) {
+	v, err := m.Get(key)
+	if err != nil {
+		return "", err
+	}
+	_, _ = m.Delete(key)
+	return v, nil
+}
+func (m *memoryDB) SInter(_ []string) ([]string, error) { return nil, nil }
 func (m *memoryDB) HSet(_, _, _ string) (bool, error)            { return true, nil }
 func (m *memoryDB) HGet(_, _ string) (string, error)             { return "", nil }
 func (m *memoryDB) HDel(_, _ string) (bool, error)               { return true, nil }
@@ -118,6 +129,7 @@ func (m *memoryDB) ZRem(_ string, _ ...string) (int64, error)  { return 0, nil }
 func (m *memoryDB) SetBit(_ string, _ int64, _ int) (int, error) { return 0, nil }
 func (m *memoryDB) GetBit(_ string, _ int64) (int, error)      { return 0, nil }
 func (m *memoryDB) BitCount(_ string) (int64, error)           { return 0, nil }
+func (m *memoryDB) DeleteBitmap(_ string) error                { return nil }
 
 func freePort(t *testing.T) string {
 	t.Helper()

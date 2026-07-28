@@ -6,13 +6,15 @@ const byteSlabSize = 64 * 1024
 
 type byteSlab struct {
 	mu        sync.Mutex
+	slabs     [][]byte
 	buf       []byte
 	off       int
 	allocated int64
 }
 
 func newByteSlab() *byteSlab {
-	return &byteSlab{buf: make([]byte, byteSlabSize)}
+	buf := make([]byte, byteSlabSize)
+	return &byteSlab{slabs: [][]byte{buf}, buf: buf}
 }
 
 func (s *byteSlab) release() {
@@ -20,6 +22,7 @@ func (s *byteSlab) release() {
 		return
 	}
 	s.mu.Lock()
+	s.slabs = nil
 	s.buf = nil
 	s.off = 0
 	s.allocated = 0
@@ -41,6 +44,7 @@ func (s *byteSlab) alloc(data []byte) []byte {
 			sz = n
 		}
 		s.buf = make([]byte, sz)
+		s.slabs = append(s.slabs, s.buf)
 		s.off = 0
 	}
 
