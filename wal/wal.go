@@ -69,6 +69,7 @@ type WAL struct {
 	syncOnWrite   bool
 	headerBuf     [walHeaderSize]byte
 	writeQueue    chan writeTask // group commit queue, nil when syncOnWrite=false
+	syncHook      func() error
 	currentOffset atomic.Int64
 
 	encrypted bool
@@ -321,6 +322,9 @@ func (w *WAL) groupCommitLoop(queue chan writeTask) {
 		}
 		if writeErr == nil {
 			_ = w.writer.Flush()
+			writeErr = w.runSyncHookLocked()
+		}
+		if writeErr == nil {
 			writeErr = w.file.Sync()
 		}
 		w.mu.Unlock()
@@ -331,10 +335,26 @@ func (w *WAL) groupCommitLoop(queue chan writeTask) {
 	}
 }
 
+func (w *WAL) SetSyncHook(fn func() error) {
+	w.mu.Lock()
+	w.syncHook = fn
+	w.mu.Unlock()
+}
+
+func (w *WAL) runSyncHookLocked() error {
+	if w.syncHook == nil {
+		return nil
+	}
+	return w.syncHook()
+}
+
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.writer.Flush(); err != nil {
+		return err
+	}
+	if err := w.runSyncHookLocked(); err != nil {
 		return err
 	}
 	return w.file.Sync()
@@ -346,6 +366,9 @@ func (w *WAL) FlushAndSync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.writer.Flush(); err != nil {
+		return err
+	}
+	if err := w.runSyncHookLocked(); err != nil {
 		return err
 	}
 	return w.file.Sync()

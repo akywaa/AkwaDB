@@ -59,18 +59,7 @@ func Restore(opts Options) (Stats, error) {
 		return Stats{}, err
 	}
 
-	baseWalPath := filepath.Join(opts.OutDir, "wal.log")
 	var records []wal.Record
-	if _, err := os.Stat(baseWalPath); err == nil {
-		recs, rerr := readWALRecords(baseWalPath, opts.Registry)
-		if rerr != nil {
-			return Stats{}, fmt.Errorf("read base wal: %w", rerr)
-		}
-		records = append(records, recs...)
-		if err := os.Remove(baseWalPath); err != nil {
-			return Stats{}, err
-		}
-	}
 
 	archived, err := archivedWALSegments(opts.ArchiveDir)
 	if err != nil {
@@ -94,6 +83,25 @@ func Restore(opts Options) (Stats, error) {
 		}
 		records = append(records, recs...)
 	}
+
+	baseWalPath := filepath.Join(opts.OutDir, "wal.log")
+	if _, err := os.Stat(baseWalPath); err == nil {
+		recs, rerr := readWALRecords(baseWalPath, opts.Registry)
+		if rerr != nil {
+			return Stats{}, fmt.Errorf("read base wal: %w", rerr)
+		}
+		records = append(records, recs...)
+		if err := os.Remove(baseWalPath); err != nil {
+			return Stats{}, err
+		}
+	}
+
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].Version != records[j].Version {
+			return records[i].Version < records[j].Version
+		}
+		return records[i].Timestamp < records[j].Timestamp
+	})
 
 	untilNano := int64(0)
 	if !opts.Until.IsZero() {

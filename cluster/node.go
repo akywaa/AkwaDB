@@ -121,7 +121,31 @@ func (n *Node) nextWriteVersion() uint64 {
 }
 
 func (n *Node) ApplyWrite(entries []server.BatchWriteEntry) error {
-	cmd := raftCommand{Op: "batch_apply", Entries: entries, Version: n.nextWriteVersion()}
+	return n.applyVersioned(entries, n.nextWriteVersion())
+}
+
+func (n *Node) ApplyWriteVersion(entries []server.BatchWriteEntry, version uint64) error {
+	if version == 0 {
+		return n.ApplyWrite(entries)
+	}
+	n.bumpVersion(version)
+	err := n.applyVersioned(entries, version)
+	if err != nil {
+		releaseCommitVersion(n.db, version)
+	}
+	return err
+}
+
+func (n *Node) bumpVersion(version uint64) {
+	n.verMu.Lock()
+	if version > n.nextVersion.Load() {
+		n.nextVersion.Store(version)
+	}
+	n.verMu.Unlock()
+}
+
+func (n *Node) applyVersioned(entries []server.BatchWriteEntry, version uint64) error {
+	cmd := raftCommand{Op: "batch_apply", Entries: entries, Version: version}
 	data := encodeRaftCommand(cmd)
 
 	future := n.raftNode.Apply(data, 5*time.Second)
@@ -136,6 +160,16 @@ func (n *Node) ApplyWrite(entries []server.BatchWriteEntry) error {
 		return err
 	}
 	return nil
+}
+
+type commitVersionReleaser interface {
+	ReleaseVersion(version uint64)
+}
+
+func releaseCommitVersion(db server.DB, version uint64) {
+	if r, ok := db.(commitVersionReleaser); ok {
+		r.ReleaseVersion(version)
+	}
 }
 
 func (n *Node) ApplyCommand(op string, args []string) (interface{}, error) {

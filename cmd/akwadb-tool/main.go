@@ -44,7 +44,7 @@ func main() {
 			slog.Error("encryption key must be hex-encoded", "err", derr)
 			os.Exit(1)
 		}
-		reg, err = crypto.OpenKeyRegistry(*outDir, keyBytes)
+		reg, err = crypto.OpenKeyRegistry(*baseDir, keyBytes)
 		if err != nil {
 			slog.Error("failed to open key registry", "err", err)
 			os.Exit(1)

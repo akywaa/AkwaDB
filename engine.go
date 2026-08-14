@@ -261,7 +261,6 @@ func DefaultOptions(dataDir string) Options {
 type flushTask struct {
 	seq        uint64
 	memTable   *memtable.SkipList
-	oldWal     *wal.WAL
 	oldWalPath string
 	oldVlogFid uint32 // fid of VLog segment that was active before flush
 }
@@ -766,8 +765,15 @@ func (e *Engine) gcRewrite(r *writeReq) error {
 }
 
 func (e *Engine) flushBackpressure() {
+	if e.ctx.Err() != nil {
+		return
+	}
 	e.memTableMu.Lock()
 	defer e.memTableMu.Unlock()
+
+	if e.ctx.Err() != nil {
+		return
+	}
 
 	if e.activeMemTable().SizeInBytes() < e.opts.MemTableSize {
 		return
@@ -781,7 +787,10 @@ func (e *Engine) flushBackpressure() {
 	if task, err := e.triggerFlushLocked(); err == nil {
 		select {
 		case e.flushChan <- *task:
-		case <-e.ctx.Done():
+	case <-e.ctx.Done():
+			if task.oldWalPath != "" {
+				e.removeOrArchive(task.oldWalPath)
+			}
 		}
 	}
 }
@@ -859,12 +868,6 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 		return nil, err
 	}
 
-	walPath := filepath.Join(opts.DataDir, "wal.log")
-	w, err := wal.OpenWithOptionsAndRegistry(walPath, true, opts.KeyRegistry)
-	if err != nil {
-		return nil, fmt.Errorf("open active wal: %w", err)
-	}
-
 	var blockCache cache.Cache
 	switch opts.CacheBackend {
 	case CacheBackendLRU:
@@ -881,7 +884,6 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 
 	e := &Engine{
 		memTable:     atomic.Pointer[memtable.SkipList]{},
-		wal:          w,
 		dataDir:      opts.DataDir,
 		blockCache:   blockCache,
 		flushChan:    make(chan flushTask, 16),
@@ -914,67 +916,78 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	vlogDir := filepath.Join(opts.DataDir, "vlog")
 	e.vl, err = vlog.OpenWithRegistry(vlogDir, opts.KeyRegistry)
 	if err != nil {
-		w.Close()
 		cancel()
 		return nil, fmt.Errorf("open vlog: %w", err)
 	}
 	e.vlogDiscards = vlog.NewDiscardStats()
 	e.vlogDiscards.Load(vlogDir)
 
-	// open or create manifest
 	manifestPath := filepath.Join(opts.DataDir, "MANIFEST")
 	mf, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
-		w.Close()
 		cancel()
 		return nil, fmt.Errorf("open manifest: %w", err)
 	}
 	e.manifest = mf
+	manifestLevels := e.readManifest(mf)
 
 	files, err := os.ReadDir(opts.DataDir)
 	if err != nil {
-		w.Close()
+		_ = mf.Close()
 		cancel()
 		return nil, err
 	}
 
-	// discover sst files and determine max sequence number
-	sstBySeq := make(map[uint64]string) // seq - path
 	var maxSeq uint64
+	sstBySeq := make(map[uint64]string)
+
+	type uncommittedWAL struct {
+		seq  uint64
+		path string
+	}
+	var uncommittedWALs []uncommittedWAL
+
 	for _, f := range files {
 		name := f.Name()
 		if strings.HasSuffix(name, ".sst") {
 			base := strings.TrimSuffix(name, ".sst")
 			if seqNum, err := strconv.ParseUint(base, 10, 64); err == nil {
-				path := filepath.Join(opts.DataDir, name)
-				sstBySeq[seqNum] = path
 				if seqNum > maxSeq {
 					maxSeq = seqNum
+				}
+				path := filepath.Join(opts.DataDir, name)
+				if _, ok := manifestLevels[seqNum]; ok {
+					sstBySeq[seqNum] = path
+				} else {
+					_ = os.Remove(path)
+				}
+			}
+		} else if strings.HasPrefix(name, "wal_flush_") && strings.HasSuffix(name, ".log") {
+			base := strings.TrimSuffix(strings.TrimPrefix(name, "wal_flush_"), ".log")
+			if seqNum, err := strconv.ParseUint(base, 10, 64); err == nil {
+				if seqNum > maxSeq {
+					maxSeq = seqNum
+				}
+				path := filepath.Join(opts.DataDir, name)
+				if _, ok := manifestLevels[seqNum]; ok {
+					_ = os.Remove(path)
+				} else {
+					uncommittedWALs = append(uncommittedWALs, uncommittedWAL{seq: seqNum, path: path})
 				}
 			}
 		}
 	}
-	e.nextSeq = maxSeq
-	if maxSeq > 0 {
-		e.oracle.Bump(maxSeq)
-	}
-	e.activeMemTable().SeedVersion(e.oracle.NextTs())
+	sort.Slice(uncommittedWALs, func(i, j int) bool {
+		return uncommittedWALs[i].seq < uncommittedWALs[j].seq
+	})
 
-	// read manifest to figure out which level each table belongs to
-	manifestLevels := e.readManifest(mf)
-	// fmt.Printf("[engine] manifest has %d entries\n", len(manifestLevels))
-
-	// load tables into their correct levels
 	for seq, path := range sstBySeq {
 		sst, err := sstable.OpenWithRegistry(path, blockCache, opts.KeyRegistry)
 		if err != nil {
 			slog.Warn("skipping corrupt sstable", "file", path, "err", err)
 			continue
 		}
-		lvl, ok := manifestLevels[seq]
-		if !ok {
-			lvl = 0
-		}
+		lvl := manifestLevels[seq]
 		if lvl < 0 || lvl >= MaxLevels {
 			lvl = 0
 		}
@@ -982,45 +995,120 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 		e.levels[lvl] = append(e.levels[lvl], sst)
 	}
 
-	records, err := w.Recover()
+	walPath := filepath.Join(opts.DataDir, "wal.log")
+	var records []wal.Record
+
+	if len(uncommittedWALs) > 0 {
+		for _, uw := range uncommittedWALs {
+			uwWal, err := wal.OpenWithOptionsAndRegistry(uw.path, false, opts.KeyRegistry)
+			if err == nil {
+				recs, rerr := uwWal.Recover()
+				_ = uwWal.Close()
+				if rerr == nil {
+					records = append(records, recs...)
+				}
+			}
+		}
+
+		if fi, serr := os.Stat(walPath); serr == nil && fi.Size() > 0 {
+			actWal, err := wal.OpenWithOptionsAndRegistry(walPath, false, opts.KeyRegistry)
+			if err == nil {
+				recs, rerr := actWal.Recover()
+				_ = actWal.Close()
+				if rerr == nil {
+					records = append(records, recs...)
+				}
+			}
+		}
+
+		tmpWalPath := filepath.Join(opts.DataDir, "wal.log.recover")
+		_ = os.Remove(tmpWalPath)
+		rw, rerr := wal.OpenWithOptionsAndRegistry(tmpWalPath, false, opts.KeyRegistry)
+		if rerr == nil {
+			for _, rec := range records {
+				_, _ = rw.WriteVersion(rec.Op, rec.Key, rec.Value, rec.ExpiresAt, rec.Version)
+			}
+			_ = rw.Sync()
+			_ = rw.Close()
+			_ = os.Remove(walPath)
+			_ = os.Rename(tmpWalPath, walPath)
+			_ = fsutil.SyncDir(opts.DataDir)
+			for _, uw := range uncommittedWALs {
+				_ = os.Remove(uw.path)
+			}
+			_ = fsutil.SyncDir(opts.DataDir)
+		}
+	}
+
+	w, err := wal.OpenWithOptionsAndRegistry(walPath, true, opts.KeyRegistry)
 	if err != nil {
-		w.Close()
+		_ = mf.Close()
 		cancel()
-		return nil, fmt.Errorf("wal recovery failed: %w", err)
+		return nil, fmt.Errorf("open active wal: %w", err)
+	}
+	e.wal = w
+	w.SetSyncHook(e.vl.Sync)
+
+	if len(uncommittedWALs) == 0 {
+		recs, err := w.Recover()
+		if err != nil {
+			w.Close()
+			_ = mf.Close()
+			cancel()
+			return nil, fmt.Errorf("wal recovery failed: %w", err)
+		}
+		records = recs
+	} else {
+		_, _ = w.Recover()
 	}
 
 	now := time.Now().Unix()
-	// WAL recovery: replay into current memtable
 	recThreshold := opts.ValueThreshold
 	if recThreshold <= 0 {
 		recThreshold = defaultValueThreshold
 	}
+	var maxWalVer uint64
+
 	for _, rec := range records {
-		if rec.ExpiresAt == 0 || now < rec.ExpiresAt {
-			if rec.Op == wal.OpPut {
-				e.trackExpiry(rec.Key, rec.ExpiresAt)
-				if vp, ok := decodeWalValuePointer(rec.Value); ok {
-					e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vp), rec.ExpiresAt, rec.Version)
-				} else if len(rec.Value) < recThreshold {
+		if rec.Version > maxWalVer {
+			maxWalVer = rec.Version
+		}
+		if rec.ExpiresAt > 0 && now >= rec.ExpiresAt {
+			e.activeMemTable().DeleteVersion(rec.Key, rec.Version)
+			continue
+		}
+		if rec.Op == wal.OpPut {
+			e.trackExpiry(rec.Key, rec.ExpiresAt)
+			if vp, ok := decodeWalValuePointer(rec.Value); ok {
+				e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vp), rec.ExpiresAt, rec.Version)
+			} else if len(rec.Value) < recThreshold {
+				e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
+			} else {
+				vvp, verr := e.vl.Write(&vlog.ValueEntry{
+					Op:        vlog.OpPut,
+					Key:       rec.Key,
+					Value:     rec.Value,
+					ExpiresAt: rec.ExpiresAt,
+				})
+				if verr != nil {
 					e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
 				} else {
-					vvp, verr := e.vl.Write(&vlog.ValueEntry{
-						Op:        vlog.OpPut,
-						Key:       rec.Key,
-						Value:     rec.Value,
-						ExpiresAt: rec.ExpiresAt,
-					})
-					if verr != nil {
-						e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
-					} else {
-						e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vpFromVlog(vvp)), rec.ExpiresAt, rec.Version)
-					}
+					e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vpFromVlog(vvp)), rec.ExpiresAt, rec.Version)
 				}
-			} else if rec.Op == wal.OpDelete {
-				e.activeMemTable().Delete(rec.Key)
 			}
+		} else if rec.Op == wal.OpDelete {
+			e.activeMemTable().DeleteVersion(rec.Key, rec.Version)
 		}
 	}
+
+	if maxWalVer > maxSeq {
+		maxSeq = maxWalVer
+	}
+	e.nextSeq = maxSeq
+	if maxSeq > 0 {
+		e.oracle.Bump(maxSeq)
+	}
+	e.activeMemTable().SeedVersion(e.oracle.NextTs())
 
 	e.checkDiskUsage()
 
@@ -1065,13 +1153,8 @@ func (e *Engine) flushWorker() {
 }
 
 func (e *Engine) executeFlush(task flushTask) {
-	// Return the flushed MemTable's slabs to the pool once it is detached, so
-	// repeated flushes do not leak the byte slabs of every retired table.
 	defer task.memTable.ReleaseArena()
 
-	// Always release the immutable MemTable and wake any writers blocked on
-	// backpressure, even when the flush fails. Otherwise a transient I/O error
-	// would leave immMemTable set forever and stall the whole engine.
 	defer func() {
 		e.immMemTable.Store(nil)
 		e.memTableMu.Lock()
@@ -1081,8 +1164,7 @@ func (e *Engine) executeFlush(task flushTask) {
 
 	allVersions := task.memTable.AllVersions()
 	if len(allVersions) == 0 {
-		if task.oldWal != nil {
-			task.oldWal.Close()
+		if task.oldWalPath != "" {
 			e.removeOrArchive(task.oldWalPath)
 		}
 		return
@@ -1113,21 +1195,13 @@ func (e *Engine) executeFlush(task flushTask) {
 	e.appendManifest('A', 0, task.seq, sst.MinKey(), sst.MaxKey())
 	e.metaMu.Unlock()
 
-	if task.oldWal != nil {
-		task.oldWal.Close()
-	}
 	if task.oldWalPath != "" {
 		e.removeOrArchive(task.oldWalPath)
 	}
 
-	// Track old VLog segment for GC. After the SSTable is written,
-	// values pointed to by this segment are now in the SSTable,
-	// so the segment can be reclaimed during GC.
 	if task.oldVlogFid > 0 {
-		// Mark the segment as fully discardable. The actual stale bytes
-		// will be computed during GC when it reads live values.
 		e.vlogMu.Lock()
-		e.discardStats[task.oldVlogFid] = 1 // trigger GC for this segment
+		e.discardStats[task.oldVlogFid] = 1
 		e.vlogMu.Unlock()
 	}
 
@@ -1163,7 +1237,6 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 	}
 	_ = fsutil.SyncDir(e.dataDir)
 
-	reopenedOldWal, _ := wal.OpenWithOptionsAndRegistry(oldWalPath, false, e.opts.KeyRegistry)
 	newWal, err := wal.OpenWithOptionsAndRegistry(activeWalPath, syncOnWrite, e.opts.KeyRegistry)
 	if err != nil {
 		e.walAppendMu.Unlock()
@@ -1171,6 +1244,7 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 		return nil, fmt.Errorf("create new wal: %w", err)
 	}
 	e.wal = newWal
+	newWal.SetSyncHook(e.vl.Sync)
 	_ = fsutil.SyncDir(e.dataDir)
 	e.walAppendMu.Unlock()
 	e.walMu.Unlock()
@@ -1184,7 +1258,6 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 	task := &flushTask{
 		seq:        seq,
 		memTable:   old,
-		oldWal:     reopenedOldWal,
 		oldWalPath: oldWalPath,
 		oldVlogFid: oldVlogFid,
 	}
@@ -2931,6 +3004,13 @@ func (e *Engine) clearInternal() error {
 			_ = os.Remove(filepath.Join(vlogDir, ent.Name()))
 		}
 	}
+	if dirFiles, err := os.ReadDir(e.dataDir); err == nil {
+		for _, f := range dirFiles {
+			if strings.HasPrefix(f.Name(), "wal_flush_") && strings.HasSuffix(f.Name(), ".log") {
+				_ = os.Remove(filepath.Join(e.dataDir, f.Name()))
+			}
+		}
+	}
 	e.discardMu.Lock()
 	e.discardStats = make(map[uint32]int64)
 	e.gcPending = make(map[uint32]int64)
@@ -2945,6 +3025,7 @@ func (e *Engine) clearInternal() error {
 		return err
 	}
 	e.wal = newWal
+	newWal.SetSyncHook(e.vl.Sync)
 
 	return nil
 }
@@ -2968,7 +3049,9 @@ func (e *Engine) enqueueBatchWithVersion(entries []server.BatchWriteEntry, versi
 		seq:   version,
 		errCh: make(chan incrResult, 1),
 	}
+	e.oracle.ReserveVersion(version)
 	if err := e.submitWrite(req); err != nil {
+		e.oracle.MarkApplied(version)
 		req.errCh <- incrResult{err: err}
 	}
 	return req.errCh
@@ -2981,11 +3064,17 @@ func (e *Engine) BatchApplyWithVersion(entries []server.BatchWriteEntry, version
 		seq:   version,
 		errCh: make(chan incrResult, 1),
 	}
+	e.oracle.ReserveVersion(version)
 	if err := e.submitWrite(req); err != nil {
+		e.oracle.MarkApplied(version)
 		return err
 	}
 	res := <-req.errCh
 	return res.err
+}
+
+func (e *Engine) ReleaseVersion(version uint64) {
+	e.oracle.MarkApplied(version)
 }
 
 func (e *Engine) compactManifest() error {
@@ -3179,11 +3268,11 @@ const listMetaSuffix = "\x00meta"
 func listElemKey(key string, index int64) []byte {
 	// Bias index by 2^62 to ensure all values are positive and sort correctly.
 	biased := index + (1 << 62)
-	b := make([]byte, 0, len(key)+2+16)
+	b := make([]byte, 0, len(key)+2+20)
 	b = append(b, 'l', 0)
 	b = append(b, key...)
 	b = append(b, 0)
-	return fmt.Appendf(b, "%016d", biased)
+	return fmt.Appendf(b, "%020d", biased)
 }
 
 func listMetaKey(key string) []byte {
