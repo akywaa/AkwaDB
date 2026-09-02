@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+
+# Data directories
+/data/
+/akwadata/
+*.sst
+*.log
+MANIFEST
+DISCARD
+LOCK
+
+# Profiling and tests
+*.prof
+*.out
+*.test
+
+# OS specific
+.DS_Store

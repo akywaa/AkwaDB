@@ -1,0 +1,2758 @@
+package akwadb
+
+import (
+	"github.com/akywaa/akwadb/cache"
+	"github.com/akywaa/akwadb/iterator"
+	"github.com/akywaa/akwadb/memtable"
+	"github.com/akywaa/akwadb/server"
+	"github.com/akywaa/akwadb/sstable"
+	"github.com/akywaa/akwadb/wal"
+	"bytes"
+	"context"
+	"encoding/binary"
+		"errors"
+	"hash/crc32"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/bits"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var ErrKeyNotFound = errors.New("key not found")
+
+const (
+	valPtrSize = 16
+
+	valFlagInline  byte = 0
+	valFlagPointer byte = 1
+
+	defaultValueThreshold = 128 // bytes: values smaller than this are stored inline in the SSTable
+)
+
+type ValuePointer struct {
+	Fid    uint32
+	Offset uint64
+	Size   uint32
+}
+
+func encodeInlineValue(val []byte) []byte {
+	buf := make([]byte, 1+len(val))
+	buf[0] = valFlagInline
+	copy(buf[1:], val)
+	return buf
+}
+
+func encodeValuePointer(vp ValuePointer) []byte {
+	buf := make([]byte, 1+valPtrSize)
+	buf[0] = valFlagPointer
+	binary.BigEndian.PutUint32(buf[1:5], vp.Fid)
+	binary.BigEndian.PutUint64(buf[5:13], vp.Offset)
+	binary.BigEndian.PutUint32(buf[13:17], vp.Size)
+	return buf
+}
+
+func isValuePointer(b []byte) bool {
+	return len(b) == 1+valPtrSize && b[0] == valFlagPointer
+}
+
+func decodeValuePointer(b []byte) ValuePointer {
+	return ValuePointer{
+		Fid:    binary.BigEndian.Uint32(b[1:5]),
+		Offset: binary.BigEndian.Uint64(b[5:13]),
+		Size:   binary.BigEndian.Uint32(b[13:17]),
+	}
+}
+
+func (e *Engine) resolveValue(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	if raw[0] == valFlagInline {
+		return raw[1:], nil
+	}
+	if !isValuePointer(raw) {
+		return raw, nil // backwards compat with old unflagged entries
+	}
+
+	vp := decodeValuePointer(raw)
+	if vp.Size == 0 {
+		return nil, nil
+	}
+
+	if vp.Fid == atomic.LoadUint32(&e.currentWalFid) {
+		return e.wal.ReadValue(vp.Offset, vp.Size)
+	}
+
+	e.vlogMu.RLock()
+	vlogRef, exists := e.oldVLogs[vp.Fid]
+	if exists {
+		vlogRef.IncrRef()
+	}
+	e.vlogMu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("vlog %d not found", vp.Fid)
+	}
+	defer vlogRef.DecrRef()
+
+	buf := make([]byte, vp.Size)
+	if _, err := vlogRef.ReadAt(buf, int64(vp.Offset)); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func (e *Engine) addDiscard(valBytes []byte) {
+	if isValuePointer(valBytes) {
+		vp := decodeValuePointer(valBytes)
+		e.discardMu.Lock()
+		e.discardStats[vp.Fid] += int64(vp.Size)
+		e.discardMu.Unlock()
+	}
+}
+
+func discardPath(dataDir string) string {
+	return filepath.Join(dataDir, "DISCARD")
+}
+
+func (e *Engine) loadDiscardStats() {
+	path := discardPath(e.dataDir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	const entrySize = 12 // fid(4) + bytes(8)
+	n := len(data) / entrySize
+	for i := 0; i < n; i++ {
+		off := i * entrySize
+		fid := binary.BigEndian.Uint32(data[off : off+4])
+		disc := int64(binary.BigEndian.Uint64(data[off+4 : off+12]))
+		if disc > 0 {
+			e.discardStats[fid] = disc
+		}
+	}
+}
+
+func (e *Engine) saveDiscardStats() {
+	e.discardMu.Lock()
+	defer e.discardMu.Unlock()
+	if len(e.discardStats) == 0 {
+		return
+	}
+	buf := make([]byte, 0, len(e.discardStats)*12)
+	for fid, disc := range e.discardStats {
+		var entry [12]byte
+		binary.BigEndian.PutUint32(entry[0:4], fid)
+		binary.BigEndian.PutUint64(entry[4:12], uint64(disc))
+		buf = append(buf, entry[:]...)
+	}
+	_ = os.WriteFile(discardPath(e.dataDir), buf, 0644)
+}
+
+const MaxLevels = 5
+const levelSizeRatio = 10 // each level is 10x larger than the one above
+const l0BackpressureThreshold = 8 // start throttling writers at this L0 count
+const subcompactionSplits = 4 // number of parallel key-range splits per compaction
+
+const (
+	CacheBackendLRU    = 0
+	CacheBackendTinyLFU = 1
+)
+
+type Options struct {
+	DataDir             string
+	MemTableSize        int
+	CompactionThreshold int
+	BlockCacheSize      int
+	MaxDiskBytes        int64
+	LevelSizeRatio      int  // dynamic level size ratio (default 10)
+	ValueThreshold      int  // values smaller than this are stored inline (default 128)
+	CacheBackend        int  // CacheBackendLRU (default) or CacheBackendTinyLFU
+}
+
+func (o Options) levelRatio() int {
+	if o.LevelSizeRatio > 0 {
+		return o.LevelSizeRatio
+	}
+	return levelSizeRatio
+}
+
+func DefaultOptions(dataDir string) Options {
+	return Options{
+		DataDir:             dataDir,
+		MemTableSize:        4 * 1024 * 1024,
+		CompactionThreshold: 4,
+		BlockCacheSize:      1000,
+		ValueThreshold:      defaultValueThreshold,
+		CacheBackend:        CacheBackendTinyLFU,
+	}
+}
+
+type flushTask struct {
+	seq        uint64
+	memTable   *memtable.SkipList
+	oldWal     *wal.WAL
+	oldWalPath string
+}
+
+const opIncr byte = 128
+const opGCRewrite byte = 129
+
+type writeReq struct {
+	op          byte
+	key         []byte
+	val         []byte
+	expiresAt   int64
+	delta       int64
+	seq         uint64
+	expectedVp  ValuePointer
+	batch       []server.BatchWriteEntry // atomic batch writes
+	errCh       chan incrResult
+}
+
+type incrResult struct {
+	val int64
+	err error
+}
+
+// vlogRef wraps an old vlog file with reference counting for safe concurrent access.
+type vlogRef struct {
+	file *os.File
+	refs int32
+}
+
+func newVlogRef(f *os.File) *vlogRef {
+	return &vlogRef{file: f, refs: 1}
+}
+
+func (v *vlogRef) IncrRef() { atomic.AddInt32(&v.refs, 1) }
+func (v *vlogRef) DecrRef() {
+	if atomic.AddInt32(&v.refs, -1) == 0 {
+		v.file.Close()
+	}
+}
+func (v *vlogRef) ReadAt(buf []byte, offset int64) (int, error) {
+	return v.file.ReadAt(buf, offset)
+}
+
+type Engine struct {
+	levelMu  [MaxLevels]sync.RWMutex
+	metrics  metricsCollector
+	memTable atomic.Pointer[memtable.SkipList]
+	immMemTable atomic.Pointer[memtable.SkipList]
+	memTableMu sync.Mutex
+
+	levels [MaxLevels][]*sstable.SSTable
+
+	wal           *wal.WAL
+	currentWalFid uint32
+	oldVLogs      map[uint32]*vlogRef
+	vlogMu        sync.RWMutex
+	dataDir       string
+	nextSeq       uint64
+	blockCache    cache.Cache
+	flushChan     chan flushTask
+	compactChan   chan struct{}
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	opts          Options
+
+	manifest   *os.File
+	manifestMu sync.Mutex
+
+	discardMu    sync.Mutex
+	discardStats map[uint32]int64 // fid -> stale bytes from discarded pointers
+
+	gcDiscardTs uint64 // max version at start of GC; tombstones above this are preserved
+
+	oracle *Oracle
+	lock     *dirLock
+
+	writeReq chan *writeReq
+
+	l0Cond *sync.Cond // backpressure: writers sleep when L0 is full
+
+	OnWrite func(op byte, key, val []byte, expiresAt int64)
+}
+
+func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList, fid uint32) incrResult {
+	current, err := e.getWithoutLock(r.key)
+	if err != nil && err != ErrKeyNotFound {
+		return incrResult{err: err}
+	}
+	var cur int64
+	if len(current) > 0 {
+		cur, err = strconv.ParseInt(string(current), 10, 64)
+		if err != nil {
+			return incrResult{err: errors.New("ERR value is not an integer or out of range")}
+		}
+	}
+	newVal := cur + r.delta
+	newBytes := []byte(strconv.FormatInt(newVal, 10))
+	offset, werr := e.wal.WriteVersion(wal.OpPut, r.key, newBytes, 0, r.seq)
+	if werr != nil {
+		return incrResult{err: werr}
+	}
+	threshold := e.opts.ValueThreshold
+	if threshold <= 0 {
+		threshold = defaultValueThreshold
+	}
+	if len(newBytes) < threshold {
+		mt.PutVersion(r.key, encodeInlineValue(newBytes), 0, r.seq)
+	} else {
+		vp := ValuePointer{Fid: fid, Offset: uint64(offset), Size: uint32(len(newBytes))}
+		mt.PutVersion(r.key, encodeValuePointer(vp), 0, r.seq)
+	}
+	return incrResult{val: newVal}
+}
+
+func (e *Engine) activeMemTable() *memtable.SkipList {
+	return e.memTable.Load()
+}
+
+func (e *Engine) immutableMemTable() *memtable.SkipList {
+	return e.immMemTable.Load()
+}
+
+func (e *Engine) getSnapshot() (active, immutable *memtable.SkipList) {
+	return e.memTable.Load(), e.immMemTable.Load()
+}
+
+func (e *Engine) calcLevelLimits() ([MaxLevels]int64, int) {
+	var limits [MaxLevels]int64
+	baseBytes := int64(e.opts.MemTableSize)
+	ratio := int64(e.opts.levelRatio())
+
+	// use actual size of the last level as the starting point
+	lmaxSize := e.totalLevelSize(MaxLevels - 1)
+	if lmaxSize < baseBytes*ratio {
+		lmaxSize = baseBytes * ratio
+	}
+	limits[MaxLevels-1] = lmaxSize
+
+	// compute limits from the bottom up
+	baseLevel := MaxLevels - 1
+	for lvl := MaxLevels - 2; lvl >= 1; lvl-- {
+		target := limits[lvl+1] / ratio
+		if target <= baseBytes {
+			limits[lvl] = 0
+		} else {
+			limits[lvl] = target
+			baseLevel = lvl
+		}
+	}
+	return limits, baseLevel
+}
+
+func (e *Engine) findBaseLevel() int {
+	_, baseLevel := e.calcLevelLimits()
+	return baseLevel
+}
+
+func (e *Engine) writer() {
+	defer e.wg.Done()
+	var batch []*writeReq
+	for {
+		select {
+		case req, ok := <-e.writeReq:
+			if !ok {
+				return
+			}
+
+			// L0 backpressure: wait if L0 is too full
+			e.memTableMu.Lock()
+			e.levelMu[0].RLock()
+			for len(e.levels[0]) >= l0BackpressureThreshold && e.ctx.Err() == nil {
+				e.levelMu[0].RUnlock()
+				e.l0Cond.Wait()
+				e.levelMu[0].RLock()
+			}
+			e.levelMu[0].RUnlock()
+			e.memTableMu.Unlock()
+
+			if e.ctx.Err() != nil {
+				return
+			}
+
+			batch = append(batch[:0], req)
+			drain:
+			for len(batch) < 256 {
+				select {
+				case t := <-e.writeReq:
+					batch = append(batch, t)
+				default:
+					break drain
+				}
+			}
+
+			mt := e.activeMemTable()
+			fid := atomic.LoadUint32(&e.currentWalFid)
+			threshold := e.opts.ValueThreshold
+			if threshold <= 0 {
+				threshold = defaultValueThreshold
+			}
+			for _, r := range batch {
+				if r.seq == 0 {
+					r.seq = atomic.AddUint64(&e.nextSeq, 1)
+				}
+
+				if r.op == opClear {
+					r.errCh <- incrResult{err: e.clearInternal()}
+					continue
+			}
+
+			if r.op == opIncr {
+					r.errCh <- e.processIncr(r, mt, fid)
+					continue
+			}
+
+				if r.op == opGCRewrite {
+					curVal, err := e.getWithoutLock(r.key)
+					if err == nil && isValuePointer(curVal) {
+						curVp := decodeValuePointer(curVal)
+						if curVp.Fid == r.expectedVp.Fid && curVp.Offset == r.expectedVp.Offset {
+							offset, werr := e.wal.WriteVersion(wal.OpPut, r.key, r.val, r.expiresAt, r.seq)
+							if werr == nil {
+								newVp := ValuePointer{Fid: fid, Offset: uint64(offset), Size: uint32(len(r.val))}
+								mt.PutVersion(r.key, encodeValuePointer(newVp), r.expiresAt, r.seq)
+							}
+						}
+					}
+					r.errCh <- incrResult{}
+					continue
+				}
+
+				if len(r.batch) > 0 {
+					type walResult struct {
+						kBytes  []byte
+						vBytes  []byte
+						offset  int64
+						deleted bool
+						expAt   int64
+					}
+					var results []walResult
+					var batchErr error
+					for _, entry := range r.batch {
+						kBytes := []byte(entry.Key)
+						if entry.Deleted {
+							_, werr := e.wal.WriteVersion(wal.OpDelete, kBytes, nil, 0, r.seq)
+							if werr != nil {
+								batchErr = werr
+								break
+							}
+							results = append(results, walResult{kBytes: kBytes, deleted: true})
+						} else {
+							vBytes := []byte(entry.Value)
+							offset, werr := e.wal.WriteVersion(wal.OpPut, kBytes, vBytes, entry.ExpiresAt, r.seq)
+							if werr != nil {
+								batchErr = werr
+								break
+							}
+							results = append(results, walResult{kBytes: kBytes, vBytes: vBytes, offset: offset, expAt: entry.ExpiresAt})
+						}
+					}
+					if batchErr == nil {
+						for _, res := range results {
+							if res.deleted {
+								mt.Delete(res.kBytes)
+							} else {
+								if len(res.vBytes) < threshold {
+									mt.PutVersion(res.kBytes, encodeInlineValue(res.vBytes), res.expAt, r.seq)
+								} else {
+									vp := ValuePointer{Fid: fid, Offset: uint64(res.offset), Size: uint32(len(res.vBytes))}
+									mt.PutVersion(res.kBytes, encodeValuePointer(vp), res.expAt, r.seq)
+								}
+							}
+					}
+					}
+					r.errCh <- incrResult{err: batchErr}
+					continue
+				}
+
+				var err error
+				var offset int64
+				switch r.op {
+				case wal.OpPut:
+					offset, err = e.wal.WriteVersion(wal.OpPut, r.key, r.val, r.expiresAt, r.seq)
+				case wal.OpDelete:
+					offset, err = e.wal.WriteVersion(wal.OpDelete, r.key, nil, 0, r.seq)
+				}
+				if err != nil {
+					r.errCh <- incrResult{err: err}
+					continue
+				}
+				if r.op == wal.OpPut {
+					if len(r.val) < threshold {
+						mt.PutVersion(r.key, encodeInlineValue(r.val), r.expiresAt, r.seq)
+					} else {
+						vp := ValuePointer{Fid: fid, Offset: uint64(offset), Size: uint32(len(r.val))}
+						mt.PutVersion(r.key, encodeValuePointer(vp), r.expiresAt, r.seq)
+					}
+				} else {
+					mt.Delete(r.key)
+				}
+				r.errCh <- incrResult{}
+			}
+
+			// flush backpressure: wait if immutable memtable is still being flushed
+			e.memTableMu.Lock()
+			if e.activeMemTable().SizeInBytes() >= e.opts.MemTableSize {
+				if e.immutableMemTable() != nil {
+					// wait for flush to complete before continuing writes
+					for e.immutableMemTable() != nil && e.ctx.Err() == nil {
+						e.l0Cond.Wait()
+					}
+				} else if task, err := e.triggerFlushLocked(); err == nil {
+					select {
+					case e.flushChan <- *task:
+					default:
+					}
+				}
+			}
+			e.memTableMu.Unlock()
+
+			if e.OnWrite != nil {
+				for _, r := range batch {
+					if r.op == wal.OpPut || r.op == wal.OpDelete {
+						e.OnWrite(r.op, r.key, r.val, r.expiresAt)
+					}
+					for _, entry := range r.batch {
+						op := wal.OpPut
+						if entry.Deleted {
+							op = wal.OpDelete
+						}
+						e.OnWrite(op, []byte(entry.Key), []byte(entry.Value), entry.ExpiresAt)
+					}
+				}
+			}
+		case <-e.ctx.Done():
+			return
+		}
+	}
+}
+
+
+
+func OpenEngine(dataDir string) (*Engine, error) {
+	return OpenEngineWithOpts(DefaultOptions(dataDir))
+}
+
+func OpenEngineWithOpts(opts Options) (*Engine, error) {
+	if err := os.MkdirAll(opts.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+
+	lock, err := acquireDirLock(opts.DataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	walPath := filepath.Join(opts.DataDir, "wal.log")
+	w, err := wal.Open(walPath)
+	if err != nil {
+		return nil, fmt.Errorf("open active wal: %w", err)
+	}
+
+	var blockCache cache.Cache
+	switch opts.CacheBackend {
+	case CacheBackendLRU:
+		blockCache = cache.NewLRUCache(opts.BlockCacheSize)
+	default:
+		c, err := cache.NewTinyLFUCache(int64(opts.BlockCacheSize*10), int64(opts.BlockCacheSize))
+		if err != nil {
+			blockCache = cache.NewLRUCache(opts.BlockCacheSize) // fallback
+		} else {
+			blockCache = c
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	e := &Engine{
+		memTable:    atomic.Pointer[memtable.SkipList]{},
+		wal:         w,
+		oldVLogs:    make(map[uint32]*vlogRef),
+		dataDir:     opts.DataDir,
+		blockCache:  blockCache,
+		flushChan:   make(chan flushTask, 16),
+		compactChan: make(chan struct{}, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+		opts:        opts,
+		discardStats: make(map[uint32]int64),
+		writeReq:    make(chan *writeReq, 4096),
+	}
+	e.l0Cond = sync.NewCond(&e.memTableMu)
+	e.oracle = newOracle()
+	e.lock = lock
+	e.memTable.Store(memtable.NewSkipList())
+	e.loadDiscardStats()
+
+	// open or create manifest
+	manifestPath := filepath.Join(opts.DataDir, "MANIFEST")
+	mf, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		w.Close()
+		cancel()
+		return nil, fmt.Errorf("open manifest: %w", err)
+	}
+	e.manifest = mf
+
+	files, err := os.ReadDir(opts.DataDir)
+	if err != nil {
+		w.Close()
+		cancel()
+		return nil, err
+	}
+
+	// discover sst files and determine max sequence number
+	sstBySeq := make(map[uint64]string) // seq - path
+	var maxSeq uint64
+	for _, f := range files {
+		name := f.Name()
+		if strings.HasSuffix(name, ".sst") {
+			base := strings.TrimSuffix(name, ".sst")
+			if seqNum, err := strconv.ParseUint(base, 10, 64); err == nil {
+				path := filepath.Join(opts.DataDir, name)
+				sstBySeq[seqNum] = path
+				if seqNum > maxSeq {
+					maxSeq = seqNum
+				}
+			}
+		}
+	}
+	e.nextSeq = maxSeq
+	atomic.StoreUint32(&e.currentWalFid, uint32(maxSeq+1))
+	if maxSeq > 0 {
+		e.oracle.nextTs = maxSeq + 1
+	}
+
+	// read manifest to figure out which level each table belongs to
+	manifestLevels := e.readManifest(mf)
+	// fmt.Printf("[engine] manifest has %d entries\n", len(manifestLevels))
+
+	// load tables into their correct levels
+	for seq, path := range sstBySeq {
+		sst, err := sstable.Open(path, blockCache)
+		if err != nil {
+			slog.Warn("skipping corrupt sstable", "file", path, "err", err)
+			continue
+		}
+		lvl, ok := manifestLevels[seq]
+		if !ok {
+			lvl = 0
+		}
+		if lvl < 0 || lvl >= MaxLevels {
+			lvl = 0
+		}
+		sst.SetLevel(lvl)
+		e.levels[lvl] = append(e.levels[lvl], sst)
+	}
+
+	records, err := w.Recover()
+	if err != nil {
+		w.Close()
+		cancel()
+		return nil, fmt.Errorf("wal recovery failed: %w", err)
+	}
+
+	now := time.Now().Unix()
+	// WAL recovery: replay into current memtable
+	recThreshold := opts.ValueThreshold
+	if recThreshold <= 0 {
+		recThreshold = defaultValueThreshold
+	}
+	for _, rec := range records {
+		if rec.ExpiresAt == 0 || now < rec.ExpiresAt {
+			if rec.Op == wal.OpPut {
+				if len(rec.Value) < recThreshold {
+					e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
+				} else {
+					vp := ValuePointer{Fid: atomic.LoadUint32(&e.currentWalFid), Offset: uint64(rec.ValueOffset), Size: uint32(len(rec.Value))}
+					e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vp), rec.ExpiresAt, rec.Version)
+				}
+			} else if rec.Op == wal.OpDelete {
+				e.activeMemTable().Delete(rec.Key)
+			}
+		}
+	}
+
+	for _, f := range files {
+		name := f.Name()
+		if strings.HasPrefix(name, "wal_flush_") && strings.HasSuffix(name, ".log") {
+			flushPath := filepath.Join(opts.DataDir, name)
+			base := strings.TrimSuffix(strings.TrimPrefix(name, "wal_flush_"), ".log")
+			flushSeq, _ := strconv.ParseUint(base, 10, 64)
+			fw, err := wal.Open(flushPath)
+			if err == nil {
+				flushRecs, rerr := fw.Recover()
+				if rerr == nil {
+					for _, rec := range flushRecs {
+						if rec.ExpiresAt == 0 || now < rec.ExpiresAt {
+							if rec.Op == wal.OpPut {
+								if len(rec.Value) < recThreshold {
+									e.activeMemTable().PutVersion(rec.Key, encodeInlineValue(rec.Value), rec.ExpiresAt, rec.Version)
+								} else {
+									vp := ValuePointer{Fid: uint32(flushSeq), Offset: uint64(rec.ValueOffset), Size: uint32(len(rec.Value))}
+									e.activeMemTable().PutVersion(rec.Key, encodeValuePointer(vp), rec.ExpiresAt, rec.Version)
+								}
+							} else if rec.Op == wal.OpDelete {
+								e.activeMemTable().Delete(rec.Key)
+							}
+						}
+					}
+				}
+				fw.Close()
+
+				roFile, oerr := os.OpenFile(flushPath, os.O_RDONLY, 0644)
+				if oerr == nil {
+					e.vlogMu.Lock()
+					e.oldVLogs[uint32(flushSeq)] = newVlogRef(roFile)
+					e.vlogMu.Unlock()
+				}
+			}
+		}
+	}
+
+	e.wg.Add(4)
+	go e.flushWorker()
+	go e.compactionWorker()
+	go e.maintenanceWorker()
+	go e.writer()
+
+	return e, nil
+}
+
+func (e *Engine) flushWorker() {
+	defer e.wg.Done()
+	for {
+		select {
+		case task, ok := <-e.flushChan:
+			if !ok {
+				return
+			}
+			e.executeFlush(task)
+		case <-e.ctx.Done():
+			for {
+				select {
+				case task := <-e.flushChan:
+					e.executeFlush(task)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (e *Engine) executeFlush(task flushTask) {
+	// Use AllVersions to preserve MVCC history for active transactions.
+	allVersions := task.memTable.AllVersions()
+	if len(allVersions) == 0 {
+		if task.oldWal != nil {
+			task.oldWal.Close()
+			_ = os.Remove(task.oldWalPath)
+		}
+		e.immMemTable.Store(nil)
+		return
+	}
+
+	sstName := filepath.Join(e.dataDir, fmt.Sprintf("%06d.sst", task.seq))
+	// Convert VersionEntry to memtable.Entry for SSTable creation.
+	entries := make([]memtable.Entry, len(allVersions))
+	for i, ve := range allVersions {
+		entries[i] = memtable.Entry{
+			Key:     ve.Key,
+			Value:   ve.Value,
+			Version: ve.Version,
+		}
+	}
+	sst, err := sstable.CreateAtLevel(sstName, entries, e.blockCache, 0)
+	if err != nil {
+			slog.Error("flush error", "seq", task.seq, "err", err)
+		return
+	}
+	syncDir(e.dataDir)
+
+	e.levelMu[0].Lock()
+	e.levels[0] = append(e.levels[0], sst)
+	e.levelMu[0].Unlock()
+	e.immMemTable.Store(nil)
+
+	// record in manifest
+	e.appendManifest('A', 0, task.seq, sst.MinKey(), sst.MaxKey())
+
+	if task.oldWal != nil {
+		task.oldWal.Close()
+		roFile, err := os.OpenFile(task.oldWalPath, os.O_RDONLY, 0644)
+		if err == nil {
+			e.vlogMu.Lock()
+			e.oldVLogs[uint32(task.seq)] = newVlogRef(roFile)
+			e.vlogMu.Unlock()
+		} else {
+			slog.Error("failed to open vlog for reading", "path", task.oldWalPath, "err", err)
+		}
+	}
+
+	e.metrics.incFlush()
+
+	select {
+	case e.compactChan <- struct{}{}:
+	default:
+	}
+}
+
+func (e *Engine) triggerFlushLocked() (*flushTask, error) {
+	old := e.activeMemTable()
+	e.immMemTable.Store(old)
+	e.memTable.Store(memtable.NewSkipList())
+
+	seq := atomic.AddUint64(&e.nextSeq, 1)
+	oldWal := e.wal
+	oldWalPath := filepath.Join(e.dataDir, fmt.Sprintf("wal_flush_%06d.log", seq))
+	activeWalPath := filepath.Join(e.dataDir, "wal.log")
+
+	_ = oldWal.Close()
+	if err := os.Rename(activeWalPath, oldWalPath); err != nil {
+		return nil, fmt.Errorf("rotate active wal: %w", err)
+	}
+
+	reopenedOldWal, _ := wal.Open(oldWalPath)
+	newWal, err := wal.Open(activeWalPath)
+	if err != nil {
+		return nil, fmt.Errorf("create new wal: %w", err)
+	}
+	e.wal = newWal
+	atomic.StoreUint32(&e.currentWalFid, uint32(seq+1))
+
+	task := &flushTask{
+		seq:        seq,
+		memTable:   old,
+		oldWal:     reopenedOldWal,
+		oldWalPath: oldWalPath,
+	}
+	return task, nil
+}
+
+func (e *Engine) Put(key, val string) error {
+	return e.PutEx(key, val, 0)
+}
+
+func (e *Engine) PutEx(key, val string, ttlSeconds int64) error {
+	var expiresAt int64
+	if ttlSeconds > 0 {
+		expiresAt = time.Now().Unix() + ttlSeconds
+	}
+
+	kBytes := []byte(key)
+	vBytes := []byte(val)
+
+	req := &writeReq{
+		op:        wal.OpPut,
+		key:       kBytes,
+		val:       vBytes,
+		expiresAt: expiresAt,
+		errCh:     make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	res := <-req.errCh
+	if res.err != nil {
+		return fmt.Errorf("wal write: %w", res.err)
+	}
+
+	e.metrics.incPut()
+
+	if e.OnWrite != nil {
+		e.OnWrite(wal.OpPut, kBytes, vBytes, expiresAt)
+	}
+
+	return nil
+}
+
+func (e *Engine) Get(key string) (string, error) {
+	defer e.metrics.incGet()
+	return e.getByString([]byte(key))
+}
+
+func (e *Engine) getByString(kBytes []byte) (string, error) {
+	mt, imm := e.getSnapshot()
+
+	if val, found, deleted, _ := mt.Get(kBytes); found {
+		if deleted {
+			return "", ErrKeyNotFound
+		}
+		realVal, err := e.resolveValue(val)
+		return string(realVal), err
+	}
+
+	if imm != nil {
+		if val, found, deleted, _ := imm.Get(kBytes); found {
+			if deleted {
+				return "", ErrKeyNotFound
+			}
+			realVal, err := e.resolveValue(val)
+			return string(realVal), err
+		}
+	}
+
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			val, found, deleted, _, _, err := snapshot[i].Get(kBytes)
+			if err != nil {
+				continue
+			}
+			if found {
+				if deleted {
+					return "", ErrKeyNotFound
+				}
+				realVal, err := e.resolveValue(val)
+				return string(realVal), err
+			}
+		}
+	}
+
+	return "", ErrKeyNotFound
+}
+
+// GetByVersion returns the value for key whose version <= maxVersion.
+// Used by transactions to read a consistent snapshot.
+func (e *Engine) GetByVersion(key string, maxVersion uint64) (string, error) {
+	mt, imm := e.getSnapshot()
+	kBytes := []byte(key)
+
+	if val, found, deleted, _ := mt.GetByVersion(kBytes, maxVersion); found {
+		if deleted {
+			return "", ErrKeyNotFound
+		}
+		realVal, err := e.resolveValue(val)
+		return string(realVal), err
+	}
+
+	if imm != nil {
+		if val, found, deleted, _ := imm.GetByVersion(kBytes, maxVersion); found {
+			if deleted {
+				return "", ErrKeyNotFound
+			}
+			realVal, err := e.resolveValue(val)
+			return string(realVal), err
+		}
+	}
+
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			val, found, deleted, _, _, err := snapshot[i].GetByVersion(kBytes, maxVersion)
+			if err != nil {
+				continue
+			}
+			if found {
+				if deleted {
+					return "", ErrKeyNotFound
+				}
+				realVal, err := e.resolveValue(val)
+				return string(realVal), err
+			}
+		}
+	}
+
+	return "", ErrKeyNotFound
+}
+
+// CurrentVersion returns the current version counter.
+func (e *Engine) CurrentVersion() uint64 {
+	return e.activeMemTable().CurrentVersion()
+}
+
+func (e *Engine) Oracle() *Oracle {
+	return e.oracle
+}
+
+func (e *Engine) BeginTx() uint64 {
+	return e.oracle.NewReadTs()
+}
+
+func (e *Engine) CommitTx(readTs uint64, readSet map[string]struct{}, writeKeys map[string]struct{}) (uint64, error) {
+	return e.oracle.CheckAndCommitKeys(readTs, readSet, writeKeys)
+}
+
+func (e *Engine) RollbackTx(readTs uint64) {
+	e.oracle.Done(readTs)
+}
+
+// GetVersion returns the value and version for a key.
+// Returns empty version if key is not found.
+func (e *Engine) GetVersion(key string) (string, uint64, error) {
+	mt, imm := e.getSnapshot()
+	kBytes := []byte(key)
+
+	val, found, deleted, _, ver := mt.GetWithVersion(kBytes)
+	if found {
+		if deleted {
+			return "", ver, ErrKeyNotFound
+		}
+		realVal, err := e.resolveValue(val)
+		return string(realVal), ver, err
+	}
+
+	if imm != nil {
+		val, found, deleted, _, ver := imm.GetWithVersion(kBytes)
+		if found {
+			if deleted {
+				return "", ver, ErrKeyNotFound
+			}
+			realVal, err := e.resolveValue(val)
+			return string(realVal), ver, err
+		}
+	}
+
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			val, found, deleted, _, _, err := snapshot[i].Get(kBytes)
+			if err != nil {
+				continue
+			}
+			if found {
+				if deleted {
+					return "", 0, ErrKeyNotFound
+				}
+				realVal, err := e.resolveValue(val)
+				return string(realVal), 0, err
+			}
+		}
+	}
+
+	return "", 0, ErrKeyNotFound
+}
+
+// memVersionIter adapts memtable.SkipListVersionIterator to iterator.VersionIterator.
+type memVersionIter struct {
+	inner *memtable.SkipListVersionIterator
+}
+
+func (it *memVersionIter) Next() bool              { return it.inner.Next() }
+func (it *memVersionIter) Valid() bool              { return it.inner.Valid() }
+func (it *memVersionIter) Close() error             { return it.inner.Close() }
+func (it *memVersionIter) Entry() iterator.VersionEntry {
+	e := it.inner.Entry()
+	return iterator.VersionEntry{Key: e.Key, Value: e.Value, Version: e.Version}
+}
+
+// NewVersionIterator returns an iterator over all key-version pairs.
+func (e *Engine) NewVersionIterator() iterator.VersionIterator {
+	mt := e.activeMemTable()
+	return &memVersionIter{inner: mt.NewVersionIterator()}
+}
+
+// NewVersionIteratorAt returns an iterator over key-version pairs as of a specific version.
+func (e *Engine) NewVersionIteratorAt(maxVersion uint64) iterator.VersionIterator {
+	mt := e.activeMemTable()
+	return &memVersionIter{inner: mt.NewVersionIteratorAt(maxVersion)}
+}
+
+func (e *Engine) Delete(key string) (bool, error) {
+	kBytes := []byte(key)
+
+	req := &writeReq{
+		op:    wal.OpDelete,
+		key:   kBytes,
+		errCh: make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	res := <-req.errCh
+	if res.err != nil {
+		return false, res.err
+	}
+
+	e.metrics.incDel()
+
+	if e.OnWrite != nil {
+		e.OnWrite(wal.OpDelete, kBytes, nil, 0)
+	}
+
+	return true, nil
+}
+
+func (e *Engine) getWithoutLock(kBytes []byte) ([]byte, error) {
+	mt, imm := e.getSnapshot()
+
+	if val, found, deleted, _ := mt.Get(kBytes); found {
+		if deleted {
+			return nil, ErrKeyNotFound
+		}
+		return e.resolveValue(val)
+	}
+	if imm != nil {
+		if val, found, deleted, _ := imm.Get(kBytes); found {
+			if deleted {
+				return nil, ErrKeyNotFound
+			}
+			return e.resolveValue(val)
+		}
+	}
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			val, found, deleted, _, _, err := snapshot[i].Get(kBytes)
+			if err == nil && found {
+				if deleted {
+					return nil, ErrKeyNotFound
+				}
+				return e.resolveValue(val)
+			}
+		}
+	}
+	return nil, ErrKeyNotFound
+}
+
+func (e *Engine) getByKey(kBytes []byte) ([]byte, error) {
+	return e.getWithoutLock(kBytes)
+}
+
+// submitBatch sends a group of write operations through the writer goroutine
+// and blocks until they all complete.
+func (e *Engine) submitBatch(entries []server.BatchWriteEntry) error {
+	req := &writeReq{
+		batch: entries,
+		errCh: make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	res := <-req.errCh
+	return res.err
+}
+
+
+
+func (e *Engine) getByPrefix(prefix []byte) map[string][]byte {
+	result := make(map[string][]byte)
+	merged, iters := e.buildMergedIterator(prefix)
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	now := time.Now().Unix()
+	for merged.Valid() {
+		k := merged.Key()
+		if !bytes.HasPrefix(k, prefix) {
+			break
+		}
+		if !merged.Deleted() && (merged.ExpiresAt() == 0 || now < merged.ExpiresAt()) {
+			val, err := e.resolveValue(merged.Value())
+			if err == nil {
+				result[string(k)] = val
+			}
+		}
+		merged.Next()
+	}
+	return result
+}
+
+func (e *Engine) TTL(key string) (int64, error) {
+	mt, imm := e.getSnapshot()
+	kBytes := []byte(key)
+	calcRemaining := func(exp int64) int64 {
+		if exp == 0 {
+			return -1
+		}
+		rem := exp - time.Now().Unix()
+		if rem <= 0 {
+			return -2
+		}
+		return rem
+	}
+
+	if _, found, deleted, exp := mt.Get(kBytes); found {
+		if deleted {
+			return -2, nil
+		}
+		return calcRemaining(exp), nil
+	}
+
+	if imm != nil {
+		if _, found, deleted, exp := imm.Get(kBytes); found {
+			if deleted {
+				return -2, nil
+			}
+			return calcRemaining(exp), nil
+		}
+	}
+
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			_, found, deleted, exp, _, _ := snapshot[i].Get(kBytes)
+			if found {
+				if deleted {
+					return -2, nil
+				}
+				return calcRemaining(exp), nil
+			}
+		}
+	}
+
+	return -2, nil
+}
+
+func (e *Engine) Expire(key string, seconds int64) (bool, error) {
+	val, err := e.Get(key)
+	if err != nil {
+		return false, nil
+	}
+	return true, e.PutEx(key, val, seconds)
+}
+
+func (e *Engine) compactionWorker() {
+	defer e.wg.Done()
+	for {
+		select {
+		case <-e.compactChan:
+			if err := e.Compact(); err != nil {
+				slog.Error("compaction error", "err", err)
+			}
+		case <-e.ctx.Done():
+			return
+		}
+	}
+}
+
+func (e *Engine) maintenanceWorker() {
+	defer e.wg.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	gcTicker := time.NewTicker(5 * time.Minute)
+	defer gcTicker.Stop()
+	manifestTicks := 0
+
+	for {
+		select {
+		case <-ticker.C:
+			e.levelMu[0].RLock()
+			l0Count := len(e.levels[0])
+			e.levelMu[0].RUnlock()
+			if l0Count >= e.opts.CompactionThreshold {
+				select {
+				case e.compactChan <- struct{}{}:
+				default:
+				}
+			}
+			manifestTicks++
+			if manifestTicks >= 60 {
+				manifestTicks = 0
+				_ = e.compactManifest()
+			}
+			if e.opts.MaxDiskBytes > 0 {
+				e.evictIfNeeded()
+			}
+	case <-gcTicker.C:
+		e.discardMu.Lock()
+		var bestFid uint32
+		var maxDiscard int64
+		for fid, discBytes := range e.discardStats {
+			if discBytes > maxDiscard {
+				maxDiscard = discBytes
+				bestFid = fid
+			}
+		}
+		e.discardMu.Unlock()
+
+		if maxDiscard > 16*1024*1024 {
+			go func(fid uint32, disc int64) {
+				slog.Info("starting vlog GC via discard stats", "fid", fid, "discarded_bytes", disc)
+				if err := e.RunValueLogGC(fid); err != nil {
+					slog.Error("vlog GC failed", "fid", fid, "err", err)
+				}
+			}(bestFid, maxDiscard)
+		}
+		case <-e.ctx.Done():
+			return
+		}
+	}
+}
+
+// discardSSTablePointers scans all entries in an SSTable and tracks their
+// ValuePointers in discardStats so VLog GC can reclaim the space.
+func (e *Engine) discardSSTablePointers(sst *sstable.SSTable) {
+	entries, err := sst.ReadAll()
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		e.addDiscard(entry.Value)
+	}
+}
+
+func (e *Engine) totalDiskUsage() int64 {
+	var total int64
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		tables := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(tables, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for _, s := range tables {
+			fi, err := os.Stat(s.Filename())
+			if err == nil {
+				total += fi.Size()
+			}
+		}
+	}
+	walPath := filepath.Join(e.dataDir, "wal.log")
+	if fi, err := os.Stat(walPath); err == nil {
+		total += fi.Size()
+	}
+	return total
+}
+
+// evictIfNeeded drops the oldest SSTable from the lowest non-empty level
+// when total disk usage exceeds MaxDiskBytes. This is a simple LRU-style
+// eviction for LSM trees — older levels contain older data.
+func (e *Engine) evictIfNeeded() {
+	usage := e.totalDiskUsage()
+	if usage <= e.opts.MaxDiskBytes {
+		return
+	}
+
+	for lvl := MaxLevels - 1; lvl >= 0; lvl-- {
+		e.levelMu[lvl].Lock()
+		if len(e.levels[lvl]) == 0 {
+			e.levelMu[lvl].Unlock()
+			continue
+		}
+
+		victim := e.levels[lvl][0]
+		e.levels[lvl] = e.levels[lvl][1:]
+		e.levelMu[lvl].Unlock()
+
+	e.discardSSTablePointers(victim)
+	victim.MarkRemove()
+	e.appendManifest('D', lvl, sstSeqNum(victim), victim.MinKey(), victim.MaxKey())
+
+		slog.Info("evicted sst", "level", lvl, "file", filepath.Base(victim.Filename()), "disk_usage", e.totalDiskUsage())
+		return
+	}
+}
+
+func (e *Engine) totalLevelSize(lvl int) int64 {
+	var total int64
+	e.levelMu[lvl].RLock()
+	tables := make([]*sstable.SSTable, len(e.levels[lvl]))
+	copy(tables, e.levels[lvl])
+	e.levelMu[lvl].RUnlock()
+	for _, s := range tables {
+		fi, err := os.Stat(s.Filename())
+		if err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
+func (e *Engine) Compact() error {
+	needL0 := len(e.levels[0]) >= e.opts.CompactionThreshold
+	if needL0 {
+		if err := e.compactLevel0(); err != nil {
+			return err
+		}
+	}
+	return e.compactLevels()
+}
+
+func (e *Engine) compactLevel0() error {
+	e.levelMu[0].Lock()
+	if len(e.levels[0]) == 0 {
+		e.levelMu[0].Unlock()
+		return nil
+	}
+
+	toCompactL0 := make([]*sstable.SSTable, len(e.levels[0]))
+	copy(toCompactL0, e.levels[0])
+	e.levelMu[0].Unlock()
+
+	defer func() {
+		e.memTableMu.Lock()
+		e.l0Cond.Broadcast()
+		e.memTableMu.Unlock()
+	}()
+
+	baseLevel := e.findBaseLevel()
+
+	// find overlapping tables in baseLevel
+	e.levelMu[baseLevel].Lock()
+	var overlapsBase []*sstable.SSTable
+	var remainingBase []*sstable.SSTable
+	for _, t := range e.levels[baseLevel] {
+		overlaps := false
+		for _, l0Tbl := range toCompactL0 {
+			if rangesOverlap(l0Tbl, t) {
+				overlaps = true
+				break
+			}
+		}
+		if overlaps {
+			overlapsBase = append(overlapsBase, t)
+		} else {
+			remainingBase = append(remainingBase, t)
+		}
+	}
+	e.levels[baseLevel] = remainingBase
+	e.levelMu[baseLevel].Unlock()
+
+	all := append(toCompactL0, overlapsBase...)
+
+	var iters []iterator.Iterator
+	var priorities []int
+	total := len(all)
+	for i := total - 1; i >= 0; i-- {
+		it := all[i].NewIterator()
+		it.Seek([]byte(""))
+		iters = append(iters, it)
+		priorities = append(priorities, total-1-i)
+	}
+
+	merged := iterator.NewMergedIterator(iters, priorities)
+	consolidated := e.drainMergedIterator(merged, iters, baseLevel)
+
+	if len(consolidated) == 0 {	for _, s := range all {
+		e.discardSSTablePointers(s)
+		s.MarkRemove()
+	}
+
+	return nil
+}
+
+	newTables := e.writeSSTablesAtLevel(consolidated, baseLevel)
+
+	// Now that compaction is done, remove old tables and add new ones atomically.
+	e.levelMu[0].Lock()
+	e.levels[0] = nil
+	e.levelMu[0].Unlock()
+
+	e.levelMu[baseLevel].Lock()
+	e.levels[baseLevel] = append(e.levels[baseLevel], newTables...)
+	sort.Slice(e.levels[baseLevel], func(i, j int) bool {
+		return bytes.Compare(e.levels[baseLevel][i].MinKey(), e.levels[baseLevel][j].MinKey()) < 0
+	})
+	e.levelMu[baseLevel].Unlock()
+
+	// log deletions and additions
+	for _, s := range overlapsBase {
+		e.appendManifest('D', baseLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
+	}
+	for _, s := range toCompactL0 {
+		e.appendManifest('D', 0, sstSeqNum(s), s.MinKey(), s.MaxKey())
+	}
+	for _, s := range newTables {
+		e.appendManifest('A', baseLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
+	}
+
+	for _, s := range all {
+		e.discardSSTablePointers(s)
+		s.MarkRemove()
+	}
+
+	return nil
+}
+
+func (e *Engine) compactLevel(fromLevel int) error {
+	if fromLevel >= MaxLevels-1 {
+		return nil
+	}
+
+	toLevel := fromLevel + 1
+
+	// grab source tables
+	e.levelMu[fromLevel].Lock()
+	if len(e.levels[fromLevel]) == 0 {
+		e.levelMu[fromLevel].Unlock()
+		return nil
+	}
+	pick := e.levels[fromLevel][0]
+	e.levelMu[fromLevel].Unlock()
+
+	// find overlapping tables in target level
+	var overlaps []*sstable.SSTable
+	var remaining []*sstable.SSTable
+	e.levelMu[toLevel].Lock()
+	for _, t := range e.levels[toLevel] {
+		if rangesOverlap(pick, t) {
+			overlaps = append(overlaps, t)
+		} else {
+			remaining = append(remaining, t)
+		}
+	}
+	e.levels[toLevel] = remaining
+	e.levelMu[toLevel].Unlock()
+
+	all := append([]*sstable.SSTable{pick}, overlaps...)
+
+	// parallel sub-compaction: split key range and merge in parallel
+	var iters []iterator.Iterator
+	var priorities []int
+	for i := len(all) - 1; i >= 0; i-- {
+		it := all[i].NewIterator()
+		it.Seek([]byte(""))
+		iters = append(iters, it)
+		priorities = append(priorities, len(all)-1-i)
+	}
+	merged := iterator.NewMergedIterator(iters, priorities)
+	consolidated := e.drainMergedIterator(merged, iters, toLevel)
+	if len(consolidated) == 0 {	for _, s := range all {
+		e.discardSSTablePointers(s)
+		s.MarkRemove()
+	}
+
+	return nil
+}
+
+	// split consolidated entries into subcompactionSplits chunks and write in parallel
+	eng := e
+	n := len(consolidated)
+	numSplits := subcompactionSplits
+	if numSplits > n {
+		numSplits = n
+	}
+	chunkSize := (n + numSplits - 1) / numSplits
+
+	type splitResult struct {
+		tables []*sstable.SSTable
+	}
+	results := make([]splitResult, numSplits)
+	syncCh := make(chan int, numSplits)
+
+	spawned := 0
+	for i := 0; i < numSplits; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		if start >= n {
+			break
+		}
+		go func(idx, s, ed int) {
+			results[idx].tables = eng.writeSSTablesAtLevel(consolidated[s:ed], toLevel)
+			syncCh <- idx
+		}(i, start, end)
+		spawned++
+	}
+
+	for i := 0; i < spawned; i++ {
+		<-syncCh
+	}
+
+	// merge all results and insert into target level
+	var newTables []*sstable.SSTable
+	for _, r := range results {
+		newTables = append(newTables, r.tables...)
+	}
+
+	e.levelMu[toLevel].Lock()
+	e.levels[toLevel] = append(newTables, e.levels[toLevel]...)
+	sort.Slice(e.levels[toLevel], func(i, j int) bool {
+		return bytes.Compare(e.levels[toLevel][i].MinKey(), e.levels[toLevel][j].MinKey()) < 0
+	})
+	e.levelMu[toLevel].Unlock()
+
+	for _, s := range all {
+		e.discardSSTablePointers(s)
+		s.MarkRemove()
+		e.appendManifest('D', s.Level(), sstSeqNum(s), s.MinKey(), s.MaxKey())
+	}
+	for _, s := range newTables {
+		e.appendManifest('A', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
+	}
+
+	return nil
+}
+
+func (e *Engine) compactLevels() error {
+	limits, baseLevel := e.calcLevelLimits()
+	for lvl := baseLevel; lvl < MaxLevels-1; lvl++ {
+		size := e.totalLevelSize(lvl)
+		if limits[lvl] > 0 && size > limits[lvl] {
+			return e.compactLevel(lvl)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) drainMergedIterator(merged *iterator.MergedIterator, iters []iterator.Iterator, targetLevel int) []memtable.Entry {
+	now := time.Now().Unix()
+	minReadTs := e.oracle.MinReadTs()
+	hasActiveTxns := minReadTs < atomic.LoadUint64(&e.oracle.nextTs)
+	isBottomLevel := targetLevel == MaxLevels-1
+	gcTs := atomic.LoadUint64(&e.gcDiscardTs)
+	var consolidated []memtable.Entry
+
+	for merged.Valid() {
+
+		if merged.Deleted() || (merged.ExpiresAt() > 0 && now >= merged.ExpiresAt()) {
+			canPurge := isBottomLevel && !hasActiveTxns && gcTs == 0
+			if canPurge {
+				e.addDiscard(merged.Value())
+			} else {
+				k := make([]byte, len(merged.Key()))
+				copy(k, merged.Key())
+				v := make([]byte, len(merged.Value()))
+				copy(v, merged.Value())
+				consolidated = append(consolidated, memtable.Entry{
+					Key:       k,
+					Value:     v,
+					Deleted:   true,
+					ExpiresAt: merged.ExpiresAt(),
+				})
+			}
+		} else {
+			k := make([]byte, len(merged.Key()))
+			copy(k, merged.Key())
+			v := make([]byte, len(merged.Value()))
+			copy(v, merged.Value())
+			consolidated = append(consolidated, memtable.Entry{
+				Key:       k,
+				Value:     v,
+				ExpiresAt: merged.ExpiresAt(),
+			})
+		}
+		merged.Next()
+	}
+
+	// Prune versions older than MinReadTs for non-active keys.
+	// The MergedIterator already deduplicates by key (keeping highest priority),
+	// so if the version is needed by an active transaction it will be preserved
+	// because hasActiveTxns is true. This is a safety net for edge cases.
+
+	for _, it := range iters {
+		_ = it.Close()
+	}
+	return consolidated
+}
+
+// writes consolidated entries as new sstables at the given level,
+// splitting into roughly 8mb chunks
+func (e *Engine) writeSSTablesAtLevel(entries []memtable.Entry, level int) []*sstable.SSTable {
+	const chunkSize = 8 * 1024 * 1024 // ~8mb per table
+	var tables []*sstable.SSTable
+
+	for len(entries) > 0 {
+		// rough size estimate
+		chunk := 0
+		end := 0
+		for i, ent := range entries {
+			// ~17 bytes for header + 16 for index entry approximation
+			chunk += len(ent.Key) + len(ent.Value) + 33
+			if i > 0 && chunk >= chunkSize {
+				end = i
+				break
+			}
+			end = i + 1
+		}
+		if end == 0 {
+			end = 1
+		}
+
+		batch := entries[:end]
+		entries = entries[end:]
+
+		seq := atomic.AddUint64(&e.nextSeq, 1)
+		sstName := filepath.Join(e.dataDir, fmt.Sprintf("%06d.sst", seq))
+		sst, err := sstable.CreateAtLevel(sstName, batch, e.blockCache, level)
+		if err != nil {
+				slog.Error("error creating sstable", "level", level, "err", err)
+			continue
+		}
+		syncDir(e.dataDir)
+		tables = append(tables, sst)
+	}
+
+	return tables
+}
+
+func rangesOverlap(a, b *sstable.SSTable) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return bytes.Compare(a.MinKey(), b.MaxKey()) <= 0 &&
+		bytes.Compare(b.MinKey(), a.MaxKey()) <= 0
+}
+
+func encodeManifestRecord(action byte, level int, seqNum uint64, minKey, maxKey []byte) []byte {
+	var hdr [18]byte
+	hdr[0] = action
+	hdr[1] = byte(level)
+	binary.BigEndian.PutUint64(hdr[2:10], seqNum)
+	binary.BigEndian.PutUint32(hdr[10:14], uint32(len(minKey)))
+	binary.BigEndian.PutUint32(hdr[14:18], uint32(len(maxKey)))
+	var buf bytes.Buffer
+	buf.Write(hdr[:])
+	buf.Write(minKey)
+	buf.Write(maxKey)
+	return buf.Bytes()
+}
+
+func sstSeqNum(sst *sstable.SSTable) uint64 {
+	base := strings.TrimSuffix(filepath.Base(sst.Filename()), ".sst")
+	s, _ := strconv.ParseUint(base, 10, 64)
+	return s
+}
+
+func (e *Engine) appendManifest(action byte, level int, seqNum uint64, minKey, maxKey []byte) {
+	e.manifestMu.Lock()
+	defer e.manifestMu.Unlock()
+	if e.manifest == nil {
+		return
+	}
+
+	data := encodeManifestRecord(action, level, seqNum, minKey, maxKey)
+	crc := crc32.ChecksumIEEE(data)
+
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	e.manifest.Write(lenBuf[:])
+	var crcBuf [4]byte
+	binary.BigEndian.PutUint32(crcBuf[:], crc)
+	e.manifest.Write(crcBuf[:])
+	e.manifest.Write(data)
+	e.manifest.Sync()
+}
+
+func (e *Engine) readManifest(mf *os.File) map[uint64]int {
+	if mf == nil {
+		return nil
+	}
+
+	if _, err := mf.Seek(0, io.SeekStart); err != nil {
+		return nil
+	}
+
+	levels := make(map[uint64]int)
+	var lastValidOffset int64
+
+	var lenBuf [4]byte
+	var crcBuf [4]byte
+	var hdr [18]byte
+	for {
+		if _, err := io.ReadFull(mf, lenBuf[:]); err != nil {
+			break
+		}
+		dataLen := binary.BigEndian.Uint32(lenBuf[:])
+		if dataLen > 10*1024*1024 {
+			break
+		}
+		if _, err := io.ReadFull(mf, crcBuf[:]); err != nil {
+			break
+		}
+		expectedCRC := binary.BigEndian.Uint32(crcBuf[:])
+		data := make([]byte, dataLen)
+		if _, err := io.ReadFull(mf, data); err != nil {
+			break
+		}
+		if crc32.ChecksumIEEE(data) != expectedCRC {
+			break
+		}
+		recordEnd := 8 + int64(dataLen)
+		lastValidOffset = recordEnd
+
+		if len(data) < 18 {
+			continue
+		}
+		copy(hdr[:], data[:18])
+		action := hdr[0]
+		level := int(hdr[1])
+		seqNum := binary.BigEndian.Uint64(hdr[2:10])
+
+		switch action {
+		case 'A':
+			levels[seqNum] = level
+		case 'D':
+			delete(levels, seqNum)
+		}
+	}
+
+	if lastValidOffset > 0 {
+		mf.Truncate(lastValidOffset)
+		mf.Seek(0, io.SeekEnd)
+	} else {
+		mf.Seek(0, io.SeekEnd)
+	}
+
+	return levels
+}
+
+// builds a merged iterator across all levels + memtables
+func (e *Engine) buildMergedIterator(seekKey []byte) (*iterator.MergedIterator, []iterator.Iterator) {
+	var iters []iterator.Iterator
+	var priorities []int
+
+	mt, imm := e.getSnapshot()
+
+	memIt := mt.NewIterator()
+	memIt.Seek(seekKey)
+	iters = append(iters, memIt)
+	priorities = append(priorities, 0)
+
+	if imm != nil {
+		immIt := imm.NewIterator()
+		immIt.Seek(seekKey)
+		iters = append(iters, immIt)
+		priorities = append(priorities, 1)
+	}
+
+	prio := 2
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			it := snapshot[i].NewIterator()
+			it.Seek(seekKey)
+			iters = append(iters, it)
+			priorities = append(priorities, prio)
+			prio++
+		}
+	}
+
+	return iterator.NewMergedIteratorWithDiscard(iters, priorities, e.addDiscard), iters
+}
+
+func (e *Engine) ScanKeys(pattern string) ([]string, error) {
+	merged, iters := e.buildMergedIterator([]byte(""))
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	var keys []string
+	var prevKey string
+	now := time.Now().Unix()
+
+	for merged.Valid() {
+		k := string(merged.Key())
+		deleted := merged.Deleted()
+		expAt := merged.ExpiresAt()
+
+		if k == prevKey {
+			merged.Next()
+			continue
+		}
+		prevKey = k
+
+		if !deleted && (expAt == 0 || now < expAt) {
+			if matched, _ := path.Match(pattern, k); matched || pattern == "*" {
+				keys = append(keys, k)
+			}
+		}
+		merged.Next()
+	}
+
+	return keys, nil
+}
+
+
+
+func hashFieldKey(hash, field string) []byte {
+	return []byte("h\x00" + hash + "\x00" + field)
+}
+
+func (e *Engine) HSet(hash, field, val string) (bool, error) {
+	kBytes := hashFieldKey(hash, field)
+	_, err := e.getByKey(kBytes)
+	isNew := err != nil
+
+	if err := e.submitBatch([]server.BatchWriteEntry{{
+		Key:   string(kBytes),
+		Value: val,
+	}}); err != nil {
+		return false, err
+	}
+
+	return isNew, nil
+}
+
+func (e *Engine) HGet(hash, field string) (string, error) {
+	val, err := e.getByKey(hashFieldKey(hash, field))
+	if err != nil {
+		return "", ErrKeyNotFound
+	}
+	return string(val), nil
+}
+
+func (e *Engine) HDel(hash, field string) (bool, error) {
+	kBytes := hashFieldKey(hash, field)
+	if _, err := e.getByKey(kBytes); err != nil {
+		return false, nil
+	}
+	if err := e.submitBatch([]server.BatchWriteEntry{{
+		Key:     string(kBytes),
+		Deleted: true,
+	}}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (e *Engine) HGetAll(hash string) (map[string]string, error) {
+	prefix := []byte("h\x00" + hash + "\x00")
+	pairs := e.getByPrefix(prefix)
+
+	result := make(map[string]string, len(pairs))
+	for k, v := range pairs {
+		field := k[len(prefix):]
+		result[field] = string(v)
+	}
+	return result, nil
+}
+
+func (e *Engine) HLen(hash string) (int64, error) {
+	prefix := []byte("h\x00" + hash + "\x00")
+	pairs := e.getByPrefix(prefix)
+	return int64(len(pairs)), nil
+}
+
+func (e *Engine) HKeys(hash string) ([]string, error) {
+	prefix := []byte("h\x00" + hash + "\x00")
+	pairs := e.getByPrefix(prefix)
+
+	keys := make([]string, 0, len(pairs))
+	for k := range pairs {
+		keys = append(keys, k[len(prefix):])
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+func (e *Engine) Incr(key string) (int64, error) {
+	return e.IncrBy(key, 1)
+}
+
+func (e *Engine) Decr(key string) (int64, error) {
+	return e.IncrBy(key, -1)
+}
+
+func (e *Engine) IncrBy(key string, delta int64) (int64, error) {
+	kBytes := []byte(key)
+
+	req := &writeReq{
+		op:    opIncr,
+		key:   kBytes,
+		delta: delta,
+		errCh: make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	res := <-req.errCh
+	if res.err != nil {
+		return 0, res.err
+	}
+
+	e.metrics.incPut()
+
+	if e.OnWrite != nil {
+		newBytes := []byte(strconv.FormatInt(res.val, 10))
+		e.OnWrite(wal.OpPut, kBytes, newBytes, 0)
+	}
+
+	return res.val, nil
+}
+
+func (e *Engine) MGet(keys []string) ([]string, error) {
+	res := make([]string, len(keys))
+	for i, k := range keys {
+		val, err := e.Get(k)
+		if err == nil {
+			res[i] = val
+		}
+	}
+	return res, nil
+}
+
+func (e *Engine) MSet(kvs map[string]string) error {
+	for k, v := range kvs {
+		if err := e.Put(k, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) SnapshotEntries() []server.SnapshotEntry {
+	merged, iters := e.buildMergedIterator([]byte(""))
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	var entries []server.SnapshotEntry
+	var prevKey string
+	now := time.Now().Unix()
+
+	for merged.Valid() {
+		kStr := string(merged.Key())
+		if kStr == prevKey {
+			merged.Next()
+			continue
+		}
+		prevKey = kStr
+
+		expAt := merged.ExpiresAt()
+		if expAt > 0 && now >= expAt {
+			merged.Next()
+			continue
+		}
+
+		k := make([]byte, len(merged.Key()))
+		copy(k, merged.Key())
+
+		var v []byte
+		if !merged.Deleted() {
+			v, _ = e.resolveValue(merged.Value())
+		}
+
+		entries = append(entries, server.SnapshotEntry{
+			Key:       k,
+			Value:     v,
+			Deleted:   merged.Deleted(),
+			ExpiresAt: expAt,
+		})
+		merged.Next()
+	}
+
+	return entries
+}
+
+// StreamSnapshot iterates over all live entries and calls fn for each one.
+// Unlike SnapshotEntries, this does not allocate a giant slice in memory —
+// entries are streamed one at a time via the callback, keeping memory usage
+// constant regardless of dataset size.
+func (e *Engine) StreamSnapshot(fn func(op byte, key, val []byte, expiresAt int64) error) (int, error) {
+	merged, iters := e.buildMergedIterator([]byte(""))
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	var prevKey string
+	now := time.Now().Unix()
+	count := 0
+
+	for merged.Valid() {
+		kStr := string(merged.Key())
+		if kStr == prevKey {
+			merged.Next()
+			continue
+		}
+		prevKey = kStr
+
+		expAt := merged.ExpiresAt()
+		if expAt > 0 && now >= expAt {
+			merged.Next()
+			continue
+		}
+
+		k := make([]byte, len(merged.Key()))
+		copy(k, merged.Key())
+
+		var v []byte
+		if !merged.Deleted() {
+			v, _ = e.resolveValue(merged.Value())
+		}
+
+		var op byte
+		if merged.Deleted() {
+			op = wal.OpDelete
+		} else {
+			op = wal.OpPut
+		}
+
+		if err := fn(op, k, v, expAt); err != nil {
+			return count, err
+		}
+		count++
+		merged.Next()
+	}
+
+	return count, nil
+}
+
+const opClear byte = 130
+
+func (e *Engine) Clear() error {
+	// Send through the write channel so the writer goroutine handles
+	// the WAL swap atomically, avoiding a data race.
+	req := &writeReq{
+		op:   opClear,
+		errCh: make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	res := <-req.errCh
+	return res.err
+}
+
+// clearInternal performs the actual clear. Called by the writer goroutine.
+func (e *Engine) clearInternal() error {
+	e.memTableMu.Lock()
+	defer e.memTableMu.Unlock()
+
+	e.memTable.Store(memtable.NewSkipList())
+	e.immMemTable.Store(nil)
+
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].Lock()
+		for _, s := range e.levels[lvl] {
+			s.MarkRemove()
+		}
+		e.levels[lvl] = nil
+			e.levelMu[lvl].Unlock()
+	}
+
+	_ = e.wal.Close()
+	walPath := filepath.Join(e.dataDir, "wal.log")
+	_ = os.Remove(walPath)
+	newWal, err := wal.Open(walPath)
+	if err != nil {
+		return err
+	}
+	e.wal = newWal
+
+	return nil
+}
+
+// BatchApply applies multiple writes atomically through the writer goroutine.
+func (e *Engine) BatchApply(entries []server.BatchWriteEntry) error {
+	req := &writeReq{
+		batch: entries,
+		errCh: make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	res := <-req.errCh
+	return res.err
+}
+
+// BatchApplyWithVersion applies a batch of writes with an explicit commit version.
+func (e *Engine) BatchApplyWithVersion(entries []server.BatchWriteEntry, version uint64) error {
+	req := &writeReq{
+		batch: entries,
+		seq:   version,
+		errCh: make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	res := <-req.errCh
+	return res.err
+}
+
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+func (e *Engine) compactManifest() error {
+	type sstInfo struct {
+		seq    uint64
+		level  int
+		minKey []byte
+		maxKey []byte
+	}
+	var current []sstInfo
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		tables := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(tables, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for _, sst := range tables {
+			base := filepath.Base(sst.Filename())
+			base = strings.TrimSuffix(base, ".sst")
+			seq, err := strconv.ParseUint(base, 10, 64)
+			if err != nil {
+				continue
+			}
+			current = append(current, sstInfo{
+				seq:    seq,
+				level:  lvl,
+				minKey: sst.MinKey(),
+				maxKey: sst.MaxKey(),
+			})
+		}
+	}
+
+	e.manifestMu.Lock()
+	defer e.manifestMu.Unlock()
+
+	if e.manifest == nil {
+		return nil
+	}
+
+	if _, err := e.manifest.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := e.manifest.Truncate(0); err != nil {
+		return err
+	}
+
+	for _, info := range current {
+		data := encodeManifestRecord('A', info.level, info.seq, info.minKey, info.maxKey)
+		crc := crc32.ChecksumIEEE(data)
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+		e.manifest.Write(lenBuf[:])
+		var crcBuf [4]byte
+		binary.BigEndian.PutUint32(crcBuf[:], crc)
+		e.manifest.Write(crcBuf[:])
+		e.manifest.Write(data)
+	}
+	e.manifest.Sync()
+
+	return nil
+}
+
+func (e *Engine) RunValueLogGC(targetFid uint32) error {
+	vlogPath := filepath.Join(e.dataDir, fmt.Sprintf("wal_flush_%06d.log", targetFid))
+	tempWal, err := wal.OpenWithOptions(vlogPath, false)
+	if err != nil {
+		return err
+	}
+	defer tempWal.Close()
+
+	records, err := tempWal.Recover()
+	if err != nil {
+		return fmt.Errorf("failed to read vlog %d: %w", targetFid, err)
+	}
+
+	e.gcDiscardTs = atomic.LoadUint64(&e.oracle.nextTs)
+
+	for _, rec := range records {
+		if rec.Op == wal.OpDelete || len(rec.Value) == 0 {
+			continue
+		}
+
+		req := &writeReq{
+			op:   opGCRewrite,
+			key:  rec.Key,
+			val:  rec.Value,
+			expiresAt: rec.ExpiresAt,
+			expectedVp: ValuePointer{
+				Fid:    targetFid,
+				Offset: uint64(rec.ValueOffset),
+				Size:   uint32(len(rec.Value)),
+			},
+			errCh: make(chan incrResult, 1),
+		}
+		e.writeReq <- req
+		<-req.errCh
+	}
+
+	atomic.StoreUint64(&e.gcDiscardTs, 0)
+
+	e.discardMu.Lock()
+	delete(e.discardStats, targetFid)
+	e.discardMu.Unlock()
+
+	// Wait until no active MVCC readers can still reference this vlog.
+	for e.oracle.MinReadTs() < atomic.LoadUint64(&e.gcDiscardTs) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	e.vlogMu.Lock()
+	if vref, ok := e.oldVLogs[targetFid]; ok {
+		delete(e.oldVLogs, targetFid)
+		// Wait for all readers to finish before closing.
+		vref.DecrRef() // remove our reference
+		for atomic.LoadInt32(&vref.refs) > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	e.vlogMu.Unlock()
+
+	// Actually remove the vlog file from disk.
+	_ = os.Remove(vlogPath)
+
+	return nil
+}
+
+// ==========================================
+// LISTS (composite key encoding)
+// ==========================================
+//
+// Keys:
+//   l\x00<listKey>\x00meta  -> binary [head(8)][tail(8)]
+//   l\x00<listKey>\x00<index> -> element value
+//
+// head points to the first element index (inclusive)
+// tail points to one past the last element index (exclusive)
+// length = tail - head
+
+const listMetaSuffix = "\x00meta"
+
+func listElemKey(key string, index int64) []byte {
+	// Bias index by 2^62 to ensure all values are positive and sort correctly.
+	biased := index + (1 << 62)
+	return []byte("l\x00" + key + "\x00" + fmt.Sprintf("%016d", biased))
+}
+
+func listMetaKey(key string) []byte {
+	return []byte("l\x00" + key + listMetaSuffix)
+}
+
+func (e *Engine) listLen(key string) int64 {
+	metaK := listMetaKey(key)
+	val, err := e.getWithoutLock(metaK)
+	if err != nil || len(val) < 16 {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(val[8:16])) - int64(binary.BigEndian.Uint64(val[0:8]))
+}
+
+func (e *Engine) listMeta(key string) (head, tail int64) {
+	metaK := listMetaKey(key)
+	val, err := e.getWithoutLock(metaK)
+	if err != nil || len(val) < 16 {
+		return 0, 0
+	}
+	return int64(binary.BigEndian.Uint64(val[0:8])), int64(binary.BigEndian.Uint64(val[8:16]))
+}
+
+func (e *Engine) LPush(key string, values []string) (int64, error) {
+	head, tail := e.listMeta(key)
+	var entries []server.BatchWriteEntry
+	for _, v := range values {
+		head--
+		entries = append(entries, server.BatchWriteEntry{Key: string(listElemKey(key, head)), Value: v})
+	}
+	metaK := listMetaKey(key)
+	metaBuf := make([]byte, 16)
+	binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head))
+	binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail))
+	entries = append(entries, server.BatchWriteEntry{Key: string(metaK), Value: string(metaBuf)})
+	if err := e.submitBatch(entries); err != nil {
+		return 0, err
+	}
+	return tail - head, nil
+}
+
+func (e *Engine) RPush(key string, values []string) (int64, error) {
+	head, tail := e.listMeta(key)
+	var entries []server.BatchWriteEntry
+	for _, v := range values {
+		entries = append(entries, server.BatchWriteEntry{Key: string(listElemKey(key, tail)), Value: v})
+		tail++
+	}
+	metaK := listMetaKey(key)
+	metaBuf := make([]byte, 16)
+	binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head))
+	binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail))
+	entries = append(entries, server.BatchWriteEntry{Key: string(metaK), Value: string(metaBuf)})
+	if err := e.submitBatch(entries); err != nil {
+		return 0, err
+	}
+	return tail - head, nil
+}
+
+func (e *Engine) LPop(key string) (string, error) {
+	head, tail := e.listMeta(key)
+	if head >= tail {
+		return "", ErrKeyNotFound
+	}
+	kBytes := listElemKey(key, head)
+	val, err := e.getByKey(kBytes)
+	if err != nil {
+		return "", err
+	}
+	metaK := listMetaKey(key)
+	metaBuf := make([]byte, 16)
+	binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head+1))
+	binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail))
+	if err := e.submitBatch([]server.BatchWriteEntry{
+		{Key: string(kBytes), Deleted: true},
+		{Key: string(metaK), Value: string(metaBuf)},
+	}); err != nil {
+		return "", err
+	}
+	return string(val), nil
+}
+
+func (e *Engine) RPop(key string) (string, error) {
+	head, tail := e.listMeta(key)
+	if head >= tail {
+		return "", ErrKeyNotFound
+	}
+	lastIdx := tail - 1
+	kBytes := listElemKey(key, lastIdx)
+	val, err := e.getByKey(kBytes)
+	if err != nil {
+		return "", err
+	}
+	metaK := listMetaKey(key)
+	metaBuf := make([]byte, 16)
+	binary.BigEndian.PutUint64(metaBuf[0:8], uint64(head))
+	binary.BigEndian.PutUint64(metaBuf[8:16], uint64(tail-1))
+	if err := e.submitBatch([]server.BatchWriteEntry{
+		{Key: string(kBytes), Deleted: true},
+		{Key: string(metaK), Value: string(metaBuf)},
+	}); err != nil {
+		return "", err
+	}
+	return string(val), nil
+}
+
+func (e *Engine) LLen(key string) (int64, error) {
+	return e.listLen(key), nil
+}
+
+func (e *Engine) LRange(key string, start, stop int64) ([]string, error) {
+
+	head, tail := e.listMeta(key)
+	n := tail - head
+	if n == 0 {
+		return []string{}, nil
+	}
+
+	// normalize negative indices
+	if start < 0 {
+		start = n + start
+	}
+	if stop < 0 {
+		stop = n + stop
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start >= n {
+		return []string{}, nil
+	}
+	if stop >= n {
+		stop = n - 1
+	}
+	if start > stop {
+		return []string{}, nil
+	}
+
+	// read individual elements by index
+	result := make([]string, 0, stop-start+1)
+	for i := start; i <= stop; i++ {
+		kBytes := listElemKey(key, head+i)
+		val, err := e.getByKey(kBytes)
+		if err != nil {
+			continue
+		}
+		result = append(result, string(val))
+	}
+	return result, nil
+}
+
+// ==========================================
+// SETS (composite key encoding)
+// ==========================================
+//
+// Each member is stored as a separate key: t\x00<setKey>\x00<member> -> ""
+//
+func setMemberKey(key, member string) []byte {
+	return []byte("t\x00" + key + "\x00" + member)
+}
+
+func (e *Engine) SAdd(key string, members []string) (int64, error) {
+	prefix := []byte("t\x00" + key + "\x00")
+	existing := e.getByPrefix(prefix)
+
+	var entries []server.BatchWriteEntry
+	var added int64
+	for _, m := range members {
+		if _, exists := existing["t\x00"+key+"\x00"+m]; !exists {
+			entries = append(entries, server.BatchWriteEntry{Key: string(setMemberKey(key, m)), Value: ""})
+			added++
+		}
+	}
+	if len(entries) > 0 {
+		if err := e.submitBatch(entries); err != nil {
+			return 0, err
+		}
+	}
+	return added, nil
+}
+
+func (e *Engine) SMembers(key string) ([]string, error) {
+
+	prefix := []byte("t\x00" + key + "\x00")
+	existing := e.getByPrefix(prefix)
+
+	members := make([]string, 0, len(existing))
+	for k := range existing {
+		// strip the prefix "t\x00<key>\x00" to get the member name
+		member := k[len(prefix):]
+		members = append(members, member)
+	}
+	sort.Strings(members)
+	return members, nil
+}
+
+func (e *Engine) SIsMember(key, member string) (bool, error) {
+
+	_, err := e.getByKey(setMemberKey(key, member))
+	if err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (e *Engine) SRem(key string, members []string) (int64, error) {
+	var entries []server.BatchWriteEntry
+	var removed int64
+	for _, m := range members {
+		kBytes := setMemberKey(key, m)
+		if _, err := e.getByKey(kBytes); err == nil {
+			entries = append(entries, server.BatchWriteEntry{Key: string(kBytes), Deleted: true})
+			removed++
+		}
+	}
+	if len(entries) > 0 {
+		if err := e.submitBatch(entries); err != nil {
+			return 0, err
+		}
+	}
+	return removed, nil
+}
+
+func (e *Engine) SCard(key string) (int64, error) {
+
+	prefix := []byte("t\x00" + key + "\x00")
+	existing := e.getByPrefix(prefix)
+	return int64(len(existing)), nil
+}
+
+// ==========================================
+// SORTED SETS (ZSET)
+// ==========================================
+
+func (e *Engine) ZAdd(key string, score float64, member string) (bool, error) {
+	// check if member already exists with a different score
+	oldVal, err := e.getByKey(zValKey(key, member))
+	var oldScore float64
+	isNew := err != nil
+	if err == nil && len(oldVal) > 0 {
+		oldScore = decodeScore(oldVal)
+	}
+
+	var entries []server.BatchWriteEntry
+
+	// remove old score index if score changed
+	if !isNew && oldScore != score {
+		entries = append(entries, server.BatchWriteEntry{
+			Key:     string(zScoreKey(key, oldScore, member)),
+			Deleted: true,
+		})
+	}
+
+	// write value key and new score index
+	entries = append(entries,
+		server.BatchWriteEntry{Key: string(zValKey(key, member)), Value: string(encodeScore(score))},
+		server.BatchWriteEntry{Key: string(zScoreKey(key, score, member)), Value: ""},
+	)
+
+	if err := e.submitBatch(entries); err != nil {
+		return false, err
+	}
+	return isNew, nil
+}
+
+func (e *Engine) ZScore(key, member string) (float64, bool, error) {
+	val, err := e.getByKey(zValKey(key, member))
+	if err != nil {
+		return 0, false, err
+	}
+	if len(val) != 8 {
+		return 0, false, nil
+	}
+	return decodeScore(val), true, nil
+}
+
+func (e *Engine) ZRangeByScore(key string, min, max float64) ([]string, error) {
+	seekPrefix := zScorePrefix(key)
+	merged, iters := e.buildMergedIterator(seekPrefix)
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	var members []string
+	for merged.Valid() {
+		k := merged.Key()
+		if !bytes.HasPrefix(k, seekPrefix) || merged.Deleted() {
+			break
+		}
+		rawScore := k[len(seekPrefix) : len(seekPrefix)+8]
+		score := decodeScore(rawScore)
+		if score > max {
+			break
+		}
+		if score >= min {
+			member := string(k[len(seekPrefix)+9:]) // skip \x00 separator
+			members = append(members, member)
+		}
+		merged.Next()
+	}
+	return members, nil
+}
+
+func (e *Engine) ZRem(key string, members ...string) (int64, error) {
+	var entries []server.BatchWriteEntry
+	var removed int64
+	for _, m := range members {
+		val, err := e.getByKey(zValKey(key, m))
+		if err != nil {
+			continue
+		}
+		if len(val) == 8 {
+			score := decodeScore(val)
+			entries = append(entries, server.BatchWriteEntry{
+				Key:     string(zScoreKey(key, score, m)),
+				Deleted: true,
+			})
+		}
+		entries = append(entries, server.BatchWriteEntry{
+			Key:     string(zValKey(key, m)),
+			Deleted: true,
+		})
+		removed++
+	}
+	if len(entries) > 0 {
+		if err := e.submitBatch(entries); err != nil {
+			return 0, err
+		}
+	}
+	return removed, nil
+}
+
+// ==========================================
+// BITMAPS
+// ==========================================
+
+func (e *Engine) SetBit(key string, offset int64, val int) (int, error) {
+	old, err := e.Get(key)
+	if err != nil && err != ErrKeyNotFound {
+		return 0, err
+	}
+	data := []byte(old)
+	byteIdx := offset / 8
+	bitIdx := 7 - (offset % 8)
+
+	var oldBit int
+	if int(byteIdx) < len(data) {
+		oldBit = int((data[byteIdx] >> bitIdx) & 1)
+	}
+
+	// expand if needed
+	if int(byteIdx) >= len(data) {
+		newData := make([]byte, byteIdx+1)
+		copy(newData, data)
+		data = newData
+	}
+
+	if val != 0 {
+		data[byteIdx] |= 1 << bitIdx
+	} else {
+		data[byteIdx] &^= 1 << bitIdx
+	}
+
+	if err := e.Put(key, string(data)); err != nil {
+		return 0, err
+	}
+	return oldBit, nil
+}
+
+func (e *Engine) GetBit(key string, offset int64) (int, error) {
+	old, err := e.Get(key)
+	if err != nil {
+		return 0, err
+	}
+	data := []byte(old)
+	byteIdx := offset / 8
+	bitIdx := 7 - (offset % 8)
+
+	if int(byteIdx) >= len(data) {
+		return 0, nil
+	}
+	return int((data[byteIdx] >> bitIdx) & 1), nil
+}
+
+func (e *Engine) BitCount(key string) (int64, error) {
+	old, err := e.Get(key)
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	for _, b := range []byte(old) {
+		count += int64(bits.OnesCount8(b))
+	}
+	return count, nil
+}
+
+func (e *Engine) Close() error {
+	e.cancel()
+	e.memTableMu.Lock()
+	e.l0Cond.Broadcast()
+	e.memTableMu.Unlock()
+
+	close(e.writeReq)
+	e.wg.Wait()
+
+	var firstErr error
+	if e.wal != nil {
+		if err := e.wal.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].Lock()
+		for _, s := range e.levels[lvl] {
+			if err := s.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		e.levelMu[lvl].Unlock()
+	}
+	if e.manifest != nil {
+		_ = e.manifest.Close()
+	}
+	e.vlogMu.Lock()
+	for fid, vref := range e.oldVLogs {
+		delete(e.oldVLogs, fid)
+		vref.DecrRef()
+	}
+	e.vlogMu.Unlock()
+	e.saveDiscardStats()
+	if e.lock != nil {
+		_ = e.lock.release()
+	}
+	return firstErr
+}
