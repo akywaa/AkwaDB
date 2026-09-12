@@ -64,24 +64,26 @@ func (w *WaterMark) MinReadTs(defaultTs uint64) uint64 {
 }
 
 type Oracle struct {
-	mu        sync.Mutex
-	commitMu  sync.Mutex
-	nextTs    uint64
-	appliedTs uint64
-	awaiting  map[uint64]struct{}
-	history   []committedTxn
-	watermark *WaterMark
-	readMu    sync.Mutex
-	readSeqs  map[uint64]int
+	mu           sync.Mutex
+	commitMu     sync.Mutex
+	nextTs       uint64
+	appliedTs    uint64
+	awaiting     map[uint64]struct{}
+	history      []committedTxn
+	historyIndex map[uint64][]uint64
+	watermark    *WaterMark
+	readMu       sync.Mutex
+	readSeqs     map[uint64]int
 }
 
 func newOracle() *Oracle {
 	return &Oracle{
-		nextTs:    1,
-		appliedTs: 1,
-		awaiting:  make(map[uint64]struct{}),
-		watermark: newWaterMark(),
-		readSeqs:  make(map[uint64]int),
+		nextTs:       1,
+		appliedTs:    1,
+		awaiting:     make(map[uint64]struct{}),
+		historyIndex: make(map[uint64][]uint64),
+		watermark:    newWaterMark(),
+		readSeqs:     make(map[uint64]int),
 	}
 }
 
@@ -129,7 +131,6 @@ func (o *Oracle) MarkApplied(ts uint64) {
 		return
 	}
 	delete(o.awaiting, ts)
-	delete(o.readSeqs, ts)
 	o.advanceAppliedLocked()
 }
 
@@ -170,9 +171,6 @@ func (o *Oracle) Done(readTs uint64) {
 	appliedTs := o.appliedTs
 	o.mu.Unlock()
 	o.watermark.Done(readTs, appliedTs)
-	o.mu.Lock()
-	delete(o.readSeqs, readTs)
-	o.mu.Unlock()
 }
 
 func (o *Oracle) MinReadTs() uint64 {
@@ -235,19 +233,14 @@ func (o *Oracle) checkAndCommitInternal(readTs uint64, readFps map[uint64]struct
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	for _, committed := range o.history {
-		if committed.commitTs <= readTs {
-			continue
+	for fp := range readFps {
+		if o.latestWriteLocked(fp) > readTs {
+			return 0, ErrTxnConflict
 		}
-		for fp := range readFps {
-			if _, conflict := committed.writes[fp]; conflict {
-				return 0, ErrTxnConflict
-			}
-		}
-		for fp := range writeFps {
-			if _, conflict := committed.writes[fp]; conflict {
-				return 0, ErrTxnConflict
-			}
+	}
+	for fp := range writeFps {
+		if o.latestWriteLocked(fp) > readTs {
+			return 0, ErrTxnConflict
 		}
 	}
 
@@ -257,10 +250,42 @@ func (o *Oracle) checkAndCommitInternal(readTs uint64, readFps map[uint64]struct
 		commitTs: commitTs,
 		writes:   writeFps,
 	})
+	o.indexWritesLocked(commitTs, writeFps)
 
 	o.trimHistoryLocked(o.watermark.MinReadTs(o.appliedTs))
 
 	return commitTs, nil
+}
+
+func (o *Oracle) indexWritesLocked(commitTs uint64, writeFps map[uint64]struct{}) {
+	for fp := range writeFps {
+		o.historyIndex[fp] = append(o.historyIndex[fp], commitTs)
+	}
+}
+
+func (o *Oracle) latestWriteLocked(fp uint64) uint64 {
+	var max uint64
+	for _, ts := range o.historyIndex[fp] {
+		if ts > max {
+			max = ts
+		}
+	}
+	return max
+}
+
+func (o *Oracle) removeWriteVersionLocked(fp, commitTs uint64) {
+	list := o.historyIndex[fp]
+	for i, ts := range list {
+		if ts == commitTs {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(o.historyIndex, fp)
+		return
+	}
+	o.historyIndex[fp] = list
 }
 
 // trimHistoryLocked drops committed transactions every active reader has moved
@@ -277,9 +302,43 @@ func (o *Oracle) trimHistoryLocked(minActiveTs uint64) {
 		return
 	}
 	for j := 0; j < i; j++ {
+		txn := o.history[j]
+		for fp := range txn.writes {
+			o.removeWriteVersionLocked(fp, txn.commitTs)
+		}
 		o.history[j] = committedTxn{}
 	}
 	o.history = o.history[i:]
+}
+
+func (o *Oracle) AbortCommit(commitTs uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	delete(o.awaiting, commitTs)
+
+	found := -1
+	for i := range o.history {
+		if o.history[i].commitTs == commitTs {
+			found = i
+			break
+		}
+	}
+	if found < 0 {
+		o.advanceAppliedLocked()
+		return
+	}
+
+	affected := o.history[found].writes
+	copy(o.history[found:], o.history[found+1:])
+	o.history[len(o.history)-1] = committedTxn{}
+	o.history = o.history[:len(o.history)-1]
+
+	for fp := range affected {
+		o.removeWriteVersionLocked(fp, commitTs)
+	}
+
+	o.advanceAppliedLocked()
 }
 
 // RecordCommitted registers the writes of a transaction committed with an
@@ -295,6 +354,7 @@ func (o *Oracle) RecordCommitted(commitTs uint64, writes map[string]txEntry) {
 	}
 	o.mu.Lock()
 	o.history = append(o.history, committedTxn{commitTs: commitTs, writes: writeFps})
+	o.indexWritesLocked(commitTs, writeFps)
 	o.trimHistoryLocked(o.watermark.MinReadTs(o.appliedTs))
 	o.mu.Unlock()
 }

@@ -49,9 +49,12 @@ func (m *memoryDB) Delete(key string) (bool, error) {
 }
 func (m *memoryDB) TTL(_ string) (int64, error)                  { return -1, nil }
 func (m *memoryDB) Expire(_ string, _ int64) (bool, error)       { return true, nil }
+func (m *memoryDB) ExpireKey(_ string, _ int64) (bool, error)    { return true, nil }
 func (m *memoryDB) ScanKeys(_ string) ([]string, error)          { return nil, nil }
 func (m *memoryDB) ScanAllKeys(_ string) ([]string, error)       { return nil, nil }
+func (m *memoryDB) ScanPage(_, _ string, _ int) ([]string, string, error) { return nil, "0", nil }
 func (m *memoryDB) DeleteCollection(_ string) (int64, error)     { return 0, nil }
+func (m *memoryDB) CollectionKeys(_ string) ([]string, error)    { return nil, nil }
 func (m *memoryDB) GetDel(key string) (string, error) {
 	v, err := m.Get(key)
 	if err != nil {
@@ -62,6 +65,7 @@ func (m *memoryDB) GetDel(key string) (string, error) {
 }
 func (m *memoryDB) SInter(_ []string) ([]string, error) { return nil, nil }
 func (m *memoryDB) HSet(_, _, _ string) (bool, error)            { return true, nil }
+func (m *memoryDB) HSetMulti(_ string, _ []string) (int64, error) { return 0, nil }
 func (m *memoryDB) HGet(_, _ string) (string, error)             { return "", nil }
 func (m *memoryDB) HDel(_, _ string) (bool, error)               { return true, nil }
 func (m *memoryDB) HGetAll(_ string) (map[string]string, error)  { return nil, nil }
@@ -121,6 +125,7 @@ func (m *memoryDB) SIsMember(_, _ string) (bool, error)         { return false, 
 func (m *memoryDB) SRem(_ string, _ []string) (int64, error)    { return 0, nil }
 func (m *memoryDB) SCard(_ string) (int64, error)               { return 0, nil }
 func (m *memoryDB) ZAdd(_ string, _ float64, _ string) (bool, error) { return true, nil }
+func (m *memoryDB) ZAddMulti(_ string, _ []server.ZSetMember) (int64, error) { return 0, nil }
 func (m *memoryDB) ZScore(_, _ string) (float64, bool, error)   { return 0, false, nil }
 func (m *memoryDB) ZRangeByScore(_ string, _, _ float64) ([]string, error) {
 	return nil, nil
@@ -129,6 +134,9 @@ func (m *memoryDB) ZRem(_ string, _ ...string) (int64, error)  { return 0, nil }
 func (m *memoryDB) SetBit(_ string, _ int64, _ int) (int, error) { return 0, nil }
 func (m *memoryDB) GetBit(_ string, _ int64) (int, error)      { return 0, nil }
 func (m *memoryDB) BitCount(_ string) (int64, error)           { return 0, nil }
+func (m *memoryDB) BitCountRange(_ string, _, _ int64, _ bool) (int64, error) {
+	return 0, nil
+}
 func (m *memoryDB) DeleteBitmap(_ string) error                { return nil }
 
 func freePort(t *testing.T) string {

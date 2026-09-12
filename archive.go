@@ -117,12 +117,14 @@ func (e *Engine) processArchive(item archiveItem) {
 	e.archiveMu.Lock()
 	a := e.archiver
 	e.archiveMu.Unlock()
+	var archiveErr error
 	if a != nil {
-		if err := a.ArchiveSegment(item.path); err != nil {
-			slog.Error("archive segment failed", "path", item.path, "err", err)
+		archiveErr = a.ArchiveSegment(item.path)
+		if archiveErr != nil {
+			slog.Error("archive segment failed", "path", item.path, "err", archiveErr)
 		}
 	}
-	if item.removeSource {
+	if item.removeSource && (a == nil || archiveErr == nil) {
 		_ = os.Remove(item.path)
 	}
 }

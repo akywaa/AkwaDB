@@ -169,7 +169,11 @@ func (tx *Tx) commit() error {
 	errCh := tx.db.enqueueBatchWithVersion(tx.batchEntries(), commitTs)
 	tx.db.oracle.CommitUnlock()
 
-	return (<-errCh).err
+	res := <-errCh
+	if res.err != nil {
+		tx.db.oracle.AbortCommit(commitTs)
+	}
+	return res.err
 }
 
 func (tx *Tx) CommitAt(commitTs uint64) error {
@@ -191,8 +195,12 @@ func (tx *Tx) CommitAt(commitTs uint64) error {
 	tx.db.oracle.CommitLock()
 	tx.db.oracle.Bump(commitTs)
 	tx.db.oracle.RecordCommitted(commitTs, tx.writes)
-	err := tx.db.BatchApplyWithVersion(tx.batchEntries(), commitTs)
 	tx.db.oracle.CommitUnlock()
+
+	err := tx.db.BatchApplyWithVersion(tx.batchEntries(), commitTs)
+	if err != nil {
+		tx.db.oracle.AbortCommit(commitTs)
+	}
 	tx.writes = nil
 	return err
 }

@@ -130,6 +130,8 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 		return err
 	}
 
+	_, statErr := os.Stat(backupDir)
+	createdDir := os.IsNotExist(statErr)
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
 		return err
 	}
@@ -211,6 +213,9 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 	e.walMu.RUnlock()
 	e.metaMu.Unlock()
 
+	if copyErr != nil && createdDir {
+		_ = os.RemoveAll(backupDir)
+	}
 	return copyErr
 }
 

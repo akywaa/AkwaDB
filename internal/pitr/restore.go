@@ -140,7 +140,7 @@ func writeWAL(path string, records []wal.Record, reg *crypto.KeyRegistry) error 
 		return err
 	}
 	for _, rec := range records {
-		if _, err := w.WriteVersion(rec.Op, rec.Key, rec.Value, rec.ExpiresAt, rec.Version); err != nil {
+		if _, err := w.WriteVersionWithTimestamp(rec.Op, rec.Key, rec.Value, rec.ExpiresAt, rec.Version, rec.Timestamp); err != nil {
 			w.Close()
 			return err
 		}
@@ -193,9 +193,6 @@ func restoreVlogSegments(archiveDir, vlogDir string) error {
 			continue
 		}
 		dst := filepath.Join(vlogDir, strings.TrimSuffix(name, ".gz"))
-		if _, serr := os.Stat(dst); serr == nil {
-			continue
-		}
 		if err := gunzipFile(filepath.Join(archiveDir, name), dst); err != nil {
 			return fmt.Errorf("restore %s: %w", name, err)
 		}

@@ -20,9 +20,10 @@ type Config struct {
 	EncryptionKey     string `mapstructure:"encryption_key"`
 	EncryptionKeyPath string `mapstructure:"encryption_key_path"`
 
-	RaftID        string `mapstructure:"raft_id"`
-	RaftAddr      string `mapstructure:"raft_addr"`
-	RaftBootstrap bool   `mapstructure:"raft_bootstrap"`
+	RaftID        string            `mapstructure:"raft_id"`
+	RaftAddr      string            `mapstructure:"raft_addr"`
+	RaftBootstrap bool              `mapstructure:"raft_bootstrap"`
+	RaftPeers     map[string]string `mapstructure:"raft_peers"`
 
 	TLSCertFile string `mapstructure:"tls_cert_file"`
 	TLSKeyFile  string `mapstructure:"tls_key_file"`

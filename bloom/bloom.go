@@ -73,9 +73,7 @@ func (f *Filter) Add(key []byte) {
 	h := xxhash.Sum64(key)
 	h1 := uint32(h)
 	h2 := uint32(h >> 32)
-	if h2 == 0 {
-		h2 = 0xdeadbeef // prevent zero stride degenerating all probes to h1
-	}
+	h2 |= 1
 
 	for i := uint32(0); i < uint32(f.k); i++ {
 		idx := (h1 + i*h2) % f.bits
@@ -93,9 +91,7 @@ func (f *Filter) MayContain(key []byte) bool {
 	h := xxhash.Sum64(key)
 	h1 := uint32(h)
 	h2 := uint32(h >> 32)
-	if h2 == 0 {
-		h2 = 0xdeadbeef
-	}
+	h2 |= 1
 
 	for i := uint32(0); i < uint32(f.k); i++ {
 		idx := (h1 + i*h2) % f.bits

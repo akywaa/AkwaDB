@@ -43,6 +43,11 @@ type BatchWriteEntry struct {
 	Deleted   bool
 }
 
+type ZSetMember struct {
+	Score  float64
+	Member string
+}
+
 // WriteOptions tunes the durability of a single write.
 type WriteOptions struct {
 	Sync    bool
@@ -58,10 +63,14 @@ type DB interface {
 	GetDel(key string) (string, error)
 	TTL(key string) (int64, error)
 	Expire(key string, seconds int64) (bool, error)
+	ExpireKey(key string, seconds int64) (bool, error)
 	ScanKeys(pattern string) ([]string, error)
 	ScanAllKeys(pattern string) ([]string, error)
+	ScanPage(pattern string, cursor string, count int) ([]string, string, error)
 	DeleteCollection(key string) (int64, error)
+	CollectionKeys(key string) ([]string, error)
 	HSet(hash, field, val string) (bool, error)
+	HSetMulti(hash string, fields []string) (int64, error)
 	HGet(hash, field string) (string, error)
 	HDel(hash, field string) (bool, error)
 	HGetAll(hash string) (map[string]string, error)
@@ -103,6 +112,7 @@ type DB interface {
 
 	// Sorted Sets
 	ZAdd(key string, score float64, member string) (bool, error)
+	ZAddMulti(key string, members []ZSetMember) (int64, error)
 	ZScore(key, member string) (float64, bool, error)
 	ZRangeByScore(key string, min, max float64) ([]string, error)
 	ZRem(key string, members ...string) (int64, error)
@@ -111,6 +121,7 @@ type DB interface {
 	SetBit(key string, offset int64, val int) (int, error)
 	GetBit(key string, offset int64) (int, error)
 	BitCount(key string) (int64, error)
+	BitCountRange(key string, start, end int64, bitMode bool) (int64, error)
 	DeleteBitmap(key string) error
 }
 
@@ -193,6 +204,7 @@ type client struct {
 	txWrites   map[string]txWriteEntry  // buffered writes during transaction
 	txReadSet  map[string]struct{}       // SSI readSet: keys read during txn
 	txDeletes  []string
+	txAbort    bool
 	authed     bool                     // true if client passed AUTH
 	execReadTs uint64                   // readTs during EXEC replay for snapshot reads
 }
@@ -217,6 +229,7 @@ func (cl *client) startPubSubPump() {
 			defer close(done)
 			for msg := range ch {
 				if _, err := cl.writer.Write(msg); err != nil {
+					_ = cl.conn.Close()
 					return
 				}
 				if len(ch) == 0 {
@@ -452,7 +465,7 @@ func ExecuteReplicatedCommand(db DB, op string, args []string) interface{} {
 		if err != nil {
 			return errors.New("ERR value is not an integer or out of range")
 		}
-		ok, _ := db.Expire(strKey(args[0]), sec)
+		ok, _ := db.ExpireKey(args[0], sec)
 		return ok
 	case "INCRBY":
 		if len(args) < 2 {
@@ -483,17 +496,11 @@ func ExecuteReplicatedCommand(db DB, op string, args []string) interface{} {
 		if len(args) < 3 || (len(args)-1)%2 != 0 {
 			return errors.New("ERR wrong number of arguments for 'hset' command")
 		}
-		var created int64
-		for i := 1; i < len(args); i += 2 {
-			isNew, err := db.HSet(args[0], args[i], args[i+1])
-			if err != nil {
-				return err
-			}
-			if isNew {
-				created++
-			}
+		n, err := db.HSetMulti(args[0], args[1:])
+		if err != nil {
+			return err
 		}
-		return created
+		return n
 	case "HDEL":
 		if len(args) < 2 {
 			return errors.New("ERR wrong number of arguments for 'hdel' command")
@@ -561,21 +568,19 @@ func ExecuteReplicatedCommand(db DB, op string, args []string) interface{} {
 		if len(args) < 3 || (len(args)-1)%2 != 0 {
 			return errors.New("ERR wrong number of arguments for 'zadd' command")
 		}
-		var added int64
+		members := make([]ZSetMember, 0, (len(args)-1)/2)
 		for i := 1; i < len(args); i += 2 {
 			score, err := strconv.ParseFloat(args[i], 64)
 			if err != nil || math.IsNaN(score) {
 				return errors.New("ERR score is not a valid float")
 			}
-			isNew, err := db.ZAdd(args[0], score, args[i+1])
-			if err != nil {
-				return err
-			}
-			if isNew {
-				added++
-			}
+			members = append(members, ZSetMember{Score: score, Member: args[i+1]})
 		}
-		return added
+		n, err := db.ZAddMulti(args[0], members)
+		if err != nil {
+			return err
+		}
+		return n
 	case "ZREM":
 		if len(args) < 2 {
 			return errors.New("ERR wrong number of arguments for 'zrem' command")
@@ -730,6 +735,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		if cl.inTx && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI" && cmd != "QUIT" {
 			if txUnsupportedCommands[cmd] {
+				cl.txAbort = true
 				s.writeError(cl, fmt.Sprintf("ERR command '%s' is not supported inside MULTI", strings.ToLower(cmd)))
 				_ = cl.writer.Flush()
 				continue
@@ -802,9 +808,7 @@ func (s *Server) handleSubscribeLoop(cl *client, r *bufio.Reader, initialChannel
 				}
 			}
 		case "PING":
-			s.writeArrayHeader(cl, 2)
-			s.writeBulkString(cl, "pong")
-			s.writeBulkString(cl, "")
+			cl.writer.WriteString("*2\r\n$4\r\npong\r\n$0\r\n\r\n")
 		case "QUIT":
 			s.writeSimpleString(cl, "OK")
 			_ = cl.writer.Flush()
@@ -916,6 +920,7 @@ func (s *Server) cmdMulti(srv *Server, cl *client, args []string) error {
 	cl.txWrites = make(map[string]txWriteEntry)
 	cl.txReadSet = make(map[string]struct{})
 	cl.txDeletes = nil
+	cl.txAbort = false
 	srv.writeSimpleString(cl, "OK")
 	return nil
 }
@@ -930,6 +935,7 @@ func (s *Server) cmdDiscard(srv *Server, cl *client, args []string) error {
 	cl.txWrites = nil
 	cl.txReadSet = nil
 	cl.txDeletes = nil
+	cl.txAbort = false
 	srv.db.RollbackTx(cl.txReadTs)
 	cl.txReadTs = 0
 	srv.writeSimpleString(cl, "OK")
@@ -939,6 +945,18 @@ func (s *Server) cmdDiscard(srv *Server, cl *client, args []string) error {
 func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 	if !cl.inTx {
 		srv.writeError(cl, "ERR EXEC without MULTI")
+		return nil
+	}
+	if cl.txAbort {
+		cl.inTx = false
+		cl.txAbort = false
+		cl.txQueue = nil
+		cl.txWrites = nil
+		cl.txReadSet = nil
+		cl.txDeletes = nil
+		srv.db.RollbackTx(cl.txReadTs)
+		cl.txReadTs = 0
+		srv.writeError(cl, "EXECABORT Transaction discarded because of previous errors.")
 		return nil
 	}
 	cl.inTx = false
@@ -1001,6 +1019,10 @@ func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 			Deleted:   tw.deleted,
 		})
 	}
+	for _, ck := range txDeletes {
+		entries = append(entries, BatchWriteEntry{Key: ck, Deleted: true})
+	}
+
 	var applyErr error
 	if srv.clusterNode != nil {
 		applyErr = srv.clusterNode.ApplyWriteVersion(entries, commitTs)
@@ -1008,14 +1030,11 @@ func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 		applyErr = srv.db.BatchApplyWithVersion(entries, commitTs)
 	}
 	if applyErr != nil {
+		if aborter, ok := srv.db.(interface{ AbortCommit(uint64) }); ok {
+			aborter.AbortCommit(commitTs)
+		}
 		srv.writeError(cl, fmt.Sprintf("ERR transaction commit failed: %s", applyErr.Error()))
 		return nil
-	}
-
-	if srv.clusterNode == nil {
-		for _, k := range txDeletes {
-			deleteKeyInDB(srv.db, k)
-		}
 	}
 
 	srv.writeArrayHeader(cl, len(queue))
@@ -1161,11 +1180,17 @@ func (s *Server) cmdDel(srv *Server, cl *client, args []string) error {
 			if cl.txReadSet != nil {
 				cl.txReadSet[sk] = struct{}{}
 			}
-			if keyExistsInDB(srv.db, k) {
+			if tw, ok := cl.txWrites[sk]; ok {
+				if !tw.deleted {
+					deleted++
+				}
+			} else if keyExistsInDB(srv.db, k) {
 				deleted++
 			}
 			cl.txWrites[sk] = txWriteEntry{deleted: true}
-			cl.txDeletes = append(cl.txDeletes, k)
+			if collKeys, cerr := srv.db.CollectionKeys(k); cerr == nil {
+				cl.txDeletes = append(cl.txDeletes, collKeys...)
+			}
 		}
 		srv.writeInt(cl, deleted)
 		return nil
@@ -1271,7 +1296,7 @@ func (s *Server) cmdExpire(srv *Server, cl *client, args []string) error {
 			srv.writeInt(cl, 0)
 		}
 	} else {
-		ok, _ := srv.db.Expire(strKey(args[0]), sec)
+		ok, _ := srv.db.ExpireKey(args[0], sec)
 		if ok {
 			srv.writeInt(cl, 1)
 		} else {
@@ -1470,11 +1495,7 @@ func (s *Server) cmdScan(srv *Server, cl *client, args []string) error {
 		srv.writeError(cl, "ERR wrong number of arguments for 'scan' command")
 		return nil
 	}
-	cursor, err := strconv.ParseUint(args[0], 10, 64)
-	if err != nil {
-		srv.writeError(cl, "ERR invalid cursor")
-		return nil
-	}
+	cursor := args[0]
 	pattern := "*"
 	count := 10
 	for i := 1; i < len(args); i += 2 {
@@ -1498,29 +1519,16 @@ func (s *Server) cmdScan(srv *Server, cl *client, args []string) error {
 		}
 	}
 
-	keys, err := srv.db.ScanAllKeys(pattern)
+	keys, next, err := srv.db.ScanPage(pattern, cursor, count)
 	if err != nil {
 		srv.writeError(cl, err.Error())
 		return nil
 	}
 
-	if cursor > uint64(len(keys)) {
-		cursor = uint64(len(keys))
-	}
-	start := int(cursor)
-	if count > len(keys)-start {
-		count = len(keys) - start
-	}
-	end := start + count
-	var next uint64
-	if end < len(keys) {
-		next = uint64(end)
-	}
-
 	srv.writeArrayHeader(cl, 2)
-	srv.writeBulkString(cl, strconv.FormatUint(next, 10))
-	srv.writeArrayHeader(cl, end-start)
-	for _, k := range keys[start:end] {
+	srv.writeBulkString(cl, next)
+	srv.writeArrayHeader(cl, len(keys))
+	for _, k := range keys {
 		srv.writeBulkString(cl, k)
 	}
 	return nil
@@ -1559,16 +1567,10 @@ func (s *Server) cmdHSet(srv *Server, cl *client, args []string) error {
 		return nil
 	}
 
-	var created int64
-	for i := 1; i < len(args); i += 2 {
-		isNew, err := srv.db.HSet(args[0], args[i], args[i+1])
-		if err != nil {
-			srv.writeError(cl, err.Error())
-			return nil
-		}
-		if isNew {
-			created++
-		}
+	created, err := srv.db.HSetMulti(args[0], args[1:])
+	if err != nil {
+		srv.writeError(cl, err.Error())
+		return nil
 	}
 	srv.writeInt(cl, created)
 	return nil
@@ -1933,21 +1935,19 @@ func (s *Server) cmdZAdd(srv *Server, cl *client, args []string) error {
 		}
 		return nil
 	}
-	var added int64
+	members := make([]ZSetMember, 0, (len(args)-1)/2)
 	for i := 1; i < len(args); i += 2 {
 		score, err := strconv.ParseFloat(args[i], 64)
 		if err != nil || math.IsNaN(score) {
 			srv.writeError(cl, "ERR score is not a valid float")
 			return nil
 		}
-		isNew, err := srv.db.ZAdd(args[0], score, args[i+1])
-		if err != nil {
-			srv.writeError(cl, err.Error())
-			return nil
-		}
-		if isNew {
-			added++
-		}
+		members = append(members, ZSetMember{Score: score, Member: args[i+1]})
+	}
+	added, err := srv.db.ZAddMulti(args[0], members)
+	if err != nil {
+		srv.writeError(cl, err.Error())
+		return nil
 	}
 	srv.writeInt(cl, added)
 	return nil
@@ -2074,17 +2074,45 @@ func (s *Server) cmdGetBit(srv *Server, cl *client, args []string) error {
 }
 
 func (s *Server) cmdBitCount(srv *Server, cl *client, args []string) error {
-	if len(args) != 1 {
+	switch len(args) {
+	case 1:
+		n, err := srv.db.BitCount(args[0])
+		if err != nil {
+			srv.writeError(cl, err.Error())
+			return nil
+		}
+		srv.writeInt(cl, n)
+		return nil
+	case 3, 4:
+		start, err1 := strconv.ParseInt(args[1], 10, 64)
+		end, err2 := strconv.ParseInt(args[2], 10, 64)
+		if err1 != nil || err2 != nil {
+			srv.writeError(cl, "ERR value is not an integer or out of range")
+			return nil
+		}
+		bitMode := false
+		if len(args) == 4 {
+			switch strings.ToUpper(args[3]) {
+			case "BIT":
+				bitMode = true
+			case "BYTE":
+				bitMode = false
+			default:
+				srv.writeError(cl, "ERR syntax error")
+				return nil
+			}
+		}
+		n, err := srv.db.BitCountRange(args[0], start, end, bitMode)
+		if err != nil {
+			srv.writeError(cl, err.Error())
+			return nil
+		}
+		srv.writeInt(cl, n)
+		return nil
+	default:
 		srv.writeError(cl, "ERR wrong number of arguments for 'bitcount' command")
 		return nil
 	}
-	n, err := srv.db.BitCount(args[0])
-	if err != nil {
-		srv.writeError(cl, err.Error())
-	} else {
-		srv.writeInt(cl, n)
-	}
-	return nil
 }
 
 func (s *Server) cmdAuth(srv *Server, cl *client, args []string) error {
@@ -2166,8 +2194,11 @@ func parseRESP(r *bufio.Reader) ([]string, error) {
 	}
 
 	count, err := strconv.Atoi(line[1:])
-	if err != nil || count < 0 || count > maxArrayLength {
+	if err != nil || count < -1 || count > maxArrayLength {
 		return nil, fmt.Errorf("ERR protocol error: invalid array length '%s'", line[1:])
+	}
+	if count == -1 {
+		return nil, nil
 	}
 
 	args := make([]string, 0, count)

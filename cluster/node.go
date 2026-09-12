@@ -24,6 +24,10 @@ type Node struct {
 	transport   *raft.NetworkTransport
 	logStore    *boltdb.BoltStore
 	stableStore *boltdb.BoltStore
+
+	clientAddr   string
+	peerClientMu sync.RWMutex
+	peerClient   map[string]string
 }
 
 func NewNode(nodeID, bindAddr, dataDir string, bootstrap bool, db server.DB) (*Node, error) {
@@ -95,14 +99,33 @@ func (n *Node) LeaderAddr() string {
 	return string(n.raftNode.Leader())
 }
 
+func (n *Node) SetClientAddr(addr string) {
+	n.clientAddr = addr
+}
+
+func (n *Node) SetPeerClientAddrs(peers map[string]string) {
+	n.peerClientMu.Lock()
+	n.peerClient = peers
+	n.peerClientMu.Unlock()
+}
+
 // leaderRedirect returns a Redis MOVED error so clients on a follower can
 // reconnect to the current leader instead of seeing a bare raft error.
 func (n *Node) leaderRedirect() error {
-	addr := n.LeaderAddr()
-	if addr == "" {
+	raftAddr := n.LeaderAddr()
+	if raftAddr == "" {
 		return errors.New("CLUSTERDOWN no leader elected")
 	}
-	return fmt.Errorf("MOVED 0 %s", addr)
+	n.peerClientMu.RLock()
+	clientAddr := n.peerClient[raftAddr]
+	n.peerClientMu.RUnlock()
+	if clientAddr == "" && n.clientAddr != "" && n.transport != nil && raftAddr == string(n.transport.LocalAddr()) {
+		clientAddr = n.clientAddr
+	}
+	if clientAddr == "" {
+		return fmt.Errorf("MOVED 0 %s", raftAddr)
+	}
+	return fmt.Errorf("MOVED 0 %s", clientAddr)
 }
 
 // nextWriteVersion returns a commit version strictly greater than anything

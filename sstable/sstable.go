@@ -37,10 +37,19 @@ const (
 	compressZSTD   byte = 2
 )
 
-var (
-	zstdEncoder, _ = zstd.NewWriter(nil)
-	zstdDecoder, _ = zstd.NewReader(nil)
-)
+var zstdEncoderPool = sync.Pool{
+	New: func() any {
+		enc, _ := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+		return enc
+	},
+}
+
+var zstdDecoderPool = sync.Pool{
+	New: func() any {
+		dec, _ := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		return dec
+	},
+}
 
 func compressionTypeForLevel(level int) byte {
 	if level >= 2 {
@@ -51,7 +60,10 @@ func compressionTypeForLevel(level int) byte {
 
 func compressBlock(data []byte, level int) ([]byte, byte) {
 	if compressionTypeForLevel(level) == compressZSTD {
-		return zstdEncoder.EncodeAll(data, nil), compressZSTD
+		enc := zstdEncoderPool.Get().(*zstd.Encoder)
+		out := enc.EncodeAll(data, nil)
+		zstdEncoderPool.Put(enc)
+		return out, compressZSTD
 	}
 	return s2.Encode(nil, data), compressSnappy
 }
@@ -637,7 +649,7 @@ func open(filename string, blockCache cache.Cache, reg *crypto.KeyRegistry) (*SS
 				filterBits = binary.BigEndian.Uint32(bitsBuf[:])
 				if l := minKeyOffset - (bloomStartOffset + 5); l > 0 {
 					filterOff = bloomStartOffset + 5
-					filterLen = int64(filterBits / 8)
+					filterLen = int64((filterBits + 7) / 8)
 					if filterLen <= 0 || filterLen > l {
 						filterLen = l
 					}
@@ -656,7 +668,7 @@ func open(filename string, blockCache cache.Cache, reg *crypto.KeyRegistry) (*SS
 			if _, err := mm.ReadAt(kByte[:], pOff); err == nil {
 				var bitsBuf [4]byte
 				if _, err := mm.ReadAt(bitsBuf[:], pOff+1); err == nil {
-					pl := int64(binary.BigEndian.Uint32(bitsBuf[:]) / 8)
+					pl := int64((binary.BigEndian.Uint32(bitsBuf[:]) + 7) / 8)
 					if pl > 0 && pOff+5+pl <= minKeyOffset {
 						prefixOff = pOff + 5
 						prefixLen = pl
@@ -723,19 +735,34 @@ func open(filename string, blockCache cache.Cache, reg *crypto.KeyRegistry) (*SS
 	return sst, nil
 }
 
-func (s *SSTable) readBlock(offset int64, size uint32) ([]byte, error) {
-	if s.mm != nil {
-		block := make([]byte, size)
-		if _, err := s.mm.ReadAt(block, offset); err != nil {
-			return nil, err
-		}
-		return block, nil
+var blockBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, TargetBlockSize*2)
+		return &b
+	},
+}
+
+func (s *SSTable) readBlock(offset int64, size uint32) (*[]byte, error) {
+	bp := blockBufPool.Get().(*[]byte)
+	block := *bp
+	if cap(block) < int(size) {
+		block = make([]byte, size)
 	}
-	block := make([]byte, size)
-	if _, err := s.file.ReadAt(block, offset); err != nil {
+	block = block[:size]
+
+	var err error
+	if s.mm != nil {
+		_, err = s.mm.ReadAt(block, offset)
+	} else {
+		_, err = s.file.ReadAt(block, offset)
+	}
+	if err != nil {
+		*bp = block[:0]
+		blockBufPool.Put(bp)
 		return nil, err
 	}
-	return block, nil
+	*bp = block
+	return bp, nil
 }
 
 func (s *SSTable) Get(key []byte) ([]byte, bool, bool, int64, uint64, error) {
@@ -870,7 +897,13 @@ func verifyBlockCRC(data []byte) ([]byte, bool) {
 
 // decodeBlock verifies the on-disk checksum, decrypts (when needed) and
 // decompresses a raw block read from disk.
-func (s *SSTable) decodeBlock(raw []byte) ([]byte, error) {
+func (s *SSTable) decodeBlock(bp *[]byte) ([]byte, error) {
+	raw := *bp
+	defer func() {
+		*bp = raw[:0]
+		blockBufPool.Put(bp)
+	}()
+
 	content, ok := verifyBlockCRC(raw)
 	if !ok {
 		return nil, ErrBlockCorrupted
@@ -890,11 +923,17 @@ func (s *SSTable) decodeBlock(raw []byte) ([]byte, error) {
 		}
 		content = decompressed
 	case compressZSTD:
-		decompressed, err := zstdDecoder.DecodeAll(content, nil)
+		dec := zstdDecoderPool.Get().(*zstd.Decoder)
+		decompressed, err := dec.DecodeAll(content, nil)
+		zstdDecoderPool.Put(dec)
 		if err != nil {
 			return nil, ErrBlockCorrupted
 		}
 		content = decompressed
+	default:
+		if !s.encrypted {
+			content = append([]byte(nil), content...)
+		}
 	}
 	return content, nil
 }
@@ -963,36 +1002,17 @@ func scanBlockForKey(blockContent []byte, targetKey []byte) ([]byte, bool, bool,
 }
 
 func scanBlockForKeyLinear(blockContent []byte, targetKey []byte) ([]byte, bool, bool, int64, uint64, error) {
-	reader := bytes.NewReader(blockContent)
-	var hdrBuf [recordHeaderSize]byte
-
 	var bestVal []byte
 	bestDeleted := false
 	bestExp := int64(0)
 	bestVersion := uint64(0)
 	found := false
 
-	for reader.Len() > 0 {
-		if _, err := io.ReadFull(reader, hdrBuf[:]); err != nil {
+	for off := 0; off < len(blockContent); {
+		hdr, k, v, nextOff, ok := readEntryAt(blockContent, off)
+		if !ok {
 			break
 		}
-
-		var hdr RecordHeader
-		hdr.Decode(hdrBuf[:])
-
-		k := make([]byte, hdr.KeyLen)
-		if _, err := io.ReadFull(reader, k); err != nil {
-			break
-		}
-
-		var v []byte
-		if !hdr.Deleted && hdr.ValLen > 0 {
-			v = make([]byte, hdr.ValLen)
-			if _, err := io.ReadFull(reader, v); err != nil {
-				break
-			}
-		}
-
 		if bytes.Equal(k, targetKey) {
 			if !found || hdr.Version > bestVersion {
 				bestVal = v
@@ -1002,6 +1022,7 @@ func scanBlockForKeyLinear(blockContent []byte, targetKey []byte) ([]byte, bool,
 				found = true
 			}
 		}
+		off = nextOff
 	}
 
 	if !found {
@@ -1026,10 +1047,18 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 		}
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
+		if off+recordHeaderSize+int(midHdr.KeyLen) > len(br.data) {
+			hi = mid - 1
+			continue
+		}
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) <= 0 {
+		cmp := bytes.Compare(curKey, targetKey)
+		if cmp < 0 {
 			restartIdx = mid
 			lo = mid + 1
+		} else if cmp == 0 {
+			restartIdx = mid
+			hi = mid - 1
 		} else {
 			hi = mid - 1
 		}
@@ -1088,35 +1117,17 @@ func scanBlockForKeyVersion(blockContent []byte, targetKey []byte, maxVersion ui
 }
 
 func scanBlockForKeyVersionLinear(blockContent []byte, targetKey []byte, maxVersion uint64) ([]byte, bool, bool, int64, uint64, error) {
-	reader := bytes.NewReader(blockContent)
-	var hdrBuf [recordHeaderSize]byte
 	var bestVal []byte
 	var bestDel bool
 	var bestExp int64
 	var bestVer uint64
 	var found bool
 
-	for reader.Len() > 0 {
-		if _, err := io.ReadFull(reader, hdrBuf[:]); err != nil {
+	for off := 0; off < len(blockContent); {
+		hdr, k, v, nextOff, ok := readEntryAt(blockContent, off)
+		if !ok {
 			break
 		}
-
-		var hdr RecordHeader
-		hdr.Decode(hdrBuf[:])
-
-		k := make([]byte, hdr.KeyLen)
-		if _, err := io.ReadFull(reader, k); err != nil {
-			break
-		}
-
-		var v []byte
-		if !hdr.Deleted && hdr.ValLen > 0 {
-			v = make([]byte, hdr.ValLen)
-			if _, err := io.ReadFull(reader, v); err != nil {
-				break
-			}
-		}
-
 		if bytes.Equal(k, targetKey) && hdr.Version <= maxVersion {
 			if !found || hdr.Version > bestVer {
 				bestVal = v
@@ -1126,6 +1137,7 @@ func scanBlockForKeyVersionLinear(blockContent []byte, targetKey []byte, maxVers
 				found = true
 			}
 		}
+		off = nextOff
 	}
 
 	if !found {
@@ -1150,10 +1162,18 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		}
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
+		if off+recordHeaderSize+int(midHdr.KeyLen) > len(br.data) {
+			hi = mid - 1
+			continue
+		}
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) <= 0 {
+		cmp := bytes.Compare(curKey, targetKey)
+		if cmp < 0 {
 			restartIdx = mid
 			lo = mid + 1
+		} else if cmp == 0 {
+			restartIdx = mid
+			hi = mid - 1
 		} else {
 			hi = mid - 1
 		}
@@ -1272,6 +1292,9 @@ func (s *SSTable) ReadAll() ([]memtable.Entry, error) {
 		blockContent, err := s.decodeBlock(raw)
 		if err != nil {
 			continue
+		}
+		if br := parseBlockRestarts(blockContent); br != nil {
+			blockContent = br.data
 		}
 
 		reader := bytes.NewReader(blockContent)

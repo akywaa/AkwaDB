@@ -83,8 +83,9 @@ func (e *Engine) Ingest(sstPaths []string) error {
 		s.Close()
 	}
 
-	moved := make([]*sstable.SSTable, 0, len(sstPaths))
-	for _, src := range sstPaths {
+	moved := make([]*sstable.SSTable, 0, len(staged))
+	for _, s := range staged {
+		src := s.Filename()
 		seq := atomic.AddUint64(&e.nextSeq, 1)
 		dst := filepath.Join(e.dataDir, fmt.Sprintf("%06d.sst", seq))
 		if err := os.Rename(src, dst); err != nil {
@@ -101,6 +102,7 @@ func (e *Engine) Ingest(sstPaths []string) error {
 	}
 	_ = fsutil.SyncDir(e.dataDir)
 
+	e.metaMu.Lock()
 	e.levelMu[targetLevel].Lock()
 	if targetLevel > 0 && e.levelOverlapsAnyLocked(targetLevel, moved) {
 		e.levelMu[targetLevel].Unlock()
@@ -121,6 +123,7 @@ func (e *Engine) Ingest(sstPaths []string) error {
 	for _, s := range moved {
 		e.appendManifest('A', targetLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
 	}
+	e.metaMu.Unlock()
 	return nil
 }
 

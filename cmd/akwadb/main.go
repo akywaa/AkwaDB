@@ -68,6 +68,9 @@ func main() {
 		if v.GetBool("raft_bootstrap") {
 			cfg.RaftBootstrap = true
 		}
+		if v.IsSet("raft_peers") {
+			cfg.RaftPeers = v.GetStringMapString("raft_peers")
+		}
 		if v.GetString("tls_cert_file") != "" {
 			cfg.TLSCertFile = v.GetString("tls_cert_file")
 		}
@@ -211,6 +214,8 @@ func main() {
 			os.Exit(1)
 		}
 		defer raftNode.Stop()
+		raftNode.SetClientAddr(cfg.ListenAddr)
+		raftNode.SetPeerClientAddrs(cfg.RaftPeers)
 		srv.SetClusterNode(raftNode)
 		slog.Info("raft enabled", "id", cfg.RaftID, "addr", cfg.RaftAddr, "bootstrap", cfg.RaftBootstrap)
 	}
@@ -241,6 +246,7 @@ func main() {
 		slog.Info("server started", "addr", cfg.ListenAddr, "data", cfg.DataDir, "memtable_mb", cfg.MemTableMB)
 		if err := srv.Start(); err != nil {
 			slog.Error("server stopped", "err", err)
+			cancel()
 		}
 	}()
 

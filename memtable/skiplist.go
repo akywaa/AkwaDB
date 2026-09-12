@@ -378,6 +378,9 @@ type Entry struct {
 }
 
 func (s *SkipList) All() []Entry {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	var entries []Entry
 	now := time.Now().Unix()
 
@@ -437,6 +440,9 @@ type SkipListVersionIterator struct {
 }
 
 func (s *SkipList) AllVersions() []VersionEntry {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	var entries []VersionEntry
 	curr := loadForward(s.head, 0)
 	for curr != nil {
@@ -460,6 +466,9 @@ func (s *SkipList) AllVersions() []VersionEntry {
 }
 
 func (s *SkipList) AllVersionsAt(maxVersion uint64) []VersionEntry {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	var entries []VersionEntry
 	curr := loadForward(s.head, 0)
 	for curr != nil {			if curr.version <= maxVersion {

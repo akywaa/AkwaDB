@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -371,6 +372,9 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 			if rc.conn != nil {
 				_ = rc.conn.Close()
 			}
+			s.replicasMu.Lock()
+			delete(s.replicas, rc.addr)
+			s.replicasMu.Unlock()
 			continue
 		}
 		rc.pendingMu.Unlock()
@@ -385,6 +389,9 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 			if rc.conn != nil {
 				_ = rc.conn.Close()
 			}
+			s.replicasMu.Lock()
+			delete(s.replicas, rc.addr)
+			s.replicasMu.Unlock()
 		}
 	}
 }
@@ -450,7 +457,7 @@ func (s *Server) cmdReplicaOf(srv *Server, cl *client, args []string) error {
 	}
 
 	// REPLICAOF NO ONE — stop replicating
-	if args[0] == "NO" && args[1] == "ONE" {
+	if strings.EqualFold(args[0], "NO") && strings.EqualFold(args[1], "ONE") {
 		srv.replMu.Lock()
 		if srv.replCancel != nil {
 			srv.replCancel()
@@ -528,6 +535,19 @@ func (s *Server) startReplication(ctx context.Context, addr string) {
 
 			reader := bufio.NewReaderSize(conn, 128*1024)
 			writer := bufio.NewWriterSize(conn, 32*1024)
+
+			if s.password != "" {
+				fmt.Fprintf(writer, "*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(s.password), s.password)
+				if err := writer.Flush(); err != nil {
+					slog.Error("repl AUTH send failed", "err", err)
+					return
+				}
+				authResp, err := reader.ReadString('\n')
+				if err != nil || !strings.HasPrefix(authResp, "+OK") {
+					slog.Error("repl auth failed", "resp", authResp, "err", err)
+					return
+				}
+			}
 
 			seqStr := strconv.FormatUint(lastSeq, 10)
 			fmt.Fprintf(writer, "*2\r\n$5\r\nPSYNC\r\n$%d\r\n%s\r\n", len(seqStr), seqStr)

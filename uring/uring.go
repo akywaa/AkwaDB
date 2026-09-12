@@ -2,7 +2,9 @@ package uring
 
 import (
 	"io"
+	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 type AsyncReader interface {
@@ -10,10 +12,15 @@ type AsyncReader interface {
 	Close() error
 }
 
-type concurrentReader struct{}
+type concurrentReader struct {
+	maxWorkers int
+}
 
-func NewAsyncReader(_ int) (AsyncReader, error) {
-	return &concurrentReader{}, nil
+func NewAsyncReader(maxWorkers int) (AsyncReader, error) {
+	if maxWorkers <= 0 {
+		maxWorkers = runtime.GOMAXPROCS(0)
+	}
+	return &concurrentReader{maxWorkers: maxWorkers}, nil
 }
 
 func (c *concurrentReader) ReadBlocks(r io.ReaderAt, offsets []int64, bufs [][]byte) error {
@@ -21,23 +28,34 @@ func (c *concurrentReader) ReadBlocks(r io.ReaderAt, offsets []int64, bufs [][]b
 		return nil
 	}
 
+	workers := c.maxWorkers
+	if workers > len(offsets) {
+		workers = len(offsets)
+	}
+
+	var next atomic.Int64
 	var wg sync.WaitGroup
 	var firstErr error
 	var errMu sync.Mutex
 
-	for i := range offsets {
-		wg.Add(1)
-		go func(idx int) {
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
 			defer wg.Done()
-			_, err := r.ReadAt(bufs[idx], offsets[idx])
-			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
+			for {
+				idx := int(next.Add(1)) - 1
+				if idx >= len(offsets) {
+					return
 				}
-				errMu.Unlock()
+				if _, err := r.ReadAt(bufs[idx], offsets[idx]); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+				}
 			}
-		}(i)
+		}()
 	}
 	wg.Wait()
 	return firstErr

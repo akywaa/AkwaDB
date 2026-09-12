@@ -78,7 +78,9 @@ type WAL struct {
 	key       []byte
 	fileHdr   int64 // size of the encrypted file header (0 when plaintext)
 
-	wg sync.WaitGroup // tracks the group commit goroutine
+	closed    bool
+	enqueueWG sync.WaitGroup
+	wg        sync.WaitGroup // tracks the group commit goroutine
 }
 
 func Open(path string) (*WAL, error) {
@@ -155,6 +157,9 @@ func OpenWithOptionsAndRegistry(path string, syncOnWrite bool, reg *crypto.KeyRe
 			w.baseIV = append([]byte(nil), hdr[16:32]...)
 			w.key = key
 			w.fileHdr = walEncHeaderSize
+		} else if reg != nil {
+			f.Close()
+			return nil, errors.New("wal: expected encrypted WAL header, found raw/corrupt data")
 		}
 		w.currentOffset.Store(stat.Size())
 	default:
@@ -177,7 +182,10 @@ func (w *WAL) Write(op byte, key, val []byte, expiresAt int64) (int64, error) {
 
 // WriteVersion appends a record with an explicit version (commitTs) to the WAL.
 func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version uint64) (int64, error) {
-	timestamp := time.Now().UnixNano()
+	return w.WriteVersionWithTimestamp(op, key, val, expiresAt, version, time.Now().UnixNano())
+}
+
+func (w *WAL) WriteVersionWithTimestamp(op byte, key, val []byte, expiresAt int64, version uint64, timestamp int64) (int64, error) {
 	if w.syncOnWrite {
 		task := writeTask{
 			op:        op,
@@ -190,12 +198,17 @@ func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version ui
 			errCh:     make(chan error, 1),
 		}
 		w.mu.Lock()
-		if w.writeQueue == nil {
+		if w.closed || w.writeQueue == nil {
 			w.mu.Unlock()
 			return 0, ErrWALClosed
 		}
-		w.writeQueue <- task
+		w.enqueueWG.Add(1)
+		q := w.writeQueue
 		w.mu.Unlock()
+
+		q <- task
+		w.enqueueWG.Done()
+
 		err := <-task.errCh
 		return <-task.offsetCh, err
 	}
@@ -532,18 +545,22 @@ func (w *WAL) SyncOnWrite() bool {
 
 func (w *WAL) Close() error {
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
+	}
 	if w.writer != nil {
 		_ = w.writer.Flush()
 	}
-	if w.writeQueue != nil {
-		close(w.writeQueue)
-		w.writeQueue = nil
-	}
+	w.closed = true
+	q := w.writeQueue
 	w.mu.Unlock()
 
-	// Wait for the group commit goroutine to drain the queue and exit before
-	// closing the file out from under it.
-	w.wg.Wait()
+	if q != nil {
+		w.enqueueWG.Wait()
+		close(q)
+		w.wg.Wait()
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()

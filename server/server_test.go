@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -128,6 +129,23 @@ func (m *memoryBackend) Expire(key string, seconds int64) (bool, error) {
 	return true, nil
 }
 
+func (m *memoryBackend) ExpireKey(key string, seconds int64) (bool, error) {
+	if ok, err := m.Expire("s\x00"+key, seconds); err != nil || ok {
+		return ok, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	exp := time.Now().Unix() + seconds
+	found := false
+	for k := range m.kv {
+		if isCollectionStorageKey(k, key) {
+			m.ttls[k] = exp
+			found = true
+		}
+	}
+	return found, nil
+}
+
 func (m *memoryBackend) ScanKeys(pattern string) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -201,6 +219,76 @@ func (m *memoryBackend) DeleteCollection(key string) (int64, error) {
 	return deleted, nil
 }
 
+func (m *memoryBackend) ScanPage(pattern, cursor string, count int) ([]string, string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if count <= 0 {
+		count = 10
+	}
+
+	var physical []string
+	now := time.Now().Unix()
+	for k := range m.kv {
+		if exp, ok := m.ttls[k]; ok && exp > 0 && now >= exp {
+			continue
+		}
+		physical = append(physical, k)
+	}
+	sort.Strings(physical)
+
+	var seek string
+	if cursor != "" && cursor != "0" {
+		b, err := hex.DecodeString(cursor)
+		if err != nil {
+			return nil, "0", err
+		}
+		seek = string(b)
+	}
+
+	seen := make(map[string]struct{})
+	var out []string
+	last := ""
+	scanned := 0
+	for _, k := range physical {
+		if seek != "" && k <= seek {
+			continue
+		}
+		scanned++
+		last = k
+		if name := storageLogicalKey(k); name != "" {
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				if matched, _ := filepath.Match(pattern, name); matched || pattern == "*" {
+					out = append(out, name)
+				}
+			}
+		}
+		if len(out) >= count || scanned >= count*4 {
+			break
+		}
+	}
+
+	next := "0"
+	if last != "" && scanned >= count*4 {
+		next = hex.EncodeToString([]byte(last))
+	}
+	sort.Strings(out)
+	return out, next, nil
+}
+
+func (m *memoryBackend) CollectionKeys(key string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []string
+	for k := range m.kv {
+		if isCollectionStorageKey(k, key) {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
 func isCollectionStorageKey(k, key string) bool {
 	if len(k) < 2 || k[1] != 0 {
 		return false
@@ -221,6 +309,20 @@ func (m *memoryBackend) HSet(hash, field, val string) (bool, error) {
 	m.kv[key] = val
 	delete(m.ttls, key)
 	return !exists, nil
+}
+
+func (m *memoryBackend) HSetMulti(hash string, fields []string) (int64, error) {
+	var created int64
+	for i := 0; i+1 < len(fields); i += 2 {
+		isNew, err := m.HSet(hash, fields[i], fields[i+1])
+		if err != nil {
+			return created, err
+		}
+		if isNew {
+			created++
+		}
+	}
+	return created, nil
 }
 
 func (m *memoryBackend) HGet(hash, field string) (string, error) {
@@ -450,12 +552,28 @@ func (m *memoryBackend) SIsMember(key, member string) (bool, error)       { retu
 func (m *memoryBackend) SRem(key string, members []string) (int64, error) { return 0, nil }
 func (m *memoryBackend) SCard(key string) (int64, error)                  { return 0, nil }
 func (m *memoryBackend) ZAdd(key string, score float64, member string) (bool, error) { return true, nil }
+func (m *memoryBackend) ZAddMulti(key string, members []ZSetMember) (int64, error) {
+	var added int64
+	for _, member := range members {
+		isNew, err := m.ZAdd(key, member.Score, member.Member)
+		if err != nil {
+			return added, err
+		}
+		if isNew {
+			added++
+		}
+	}
+	return added, nil
+}
 func (m *memoryBackend) ZScore(key, member string) (float64, bool, error)            { return 0, false, nil }
 func (m *memoryBackend) ZRangeByScore(key string, min, max float64) ([]string, error) { return nil, nil }
 func (m *memoryBackend) ZRem(key string, members ...string) (int64, error)           { return 0, nil }
 func (m *memoryBackend) SetBit(key string, offset int64, val int) (int, error)       { return 0, nil }
 func (m *memoryBackend) GetBit(key string, offset int64) (int, error)               { return 0, nil }
 func (m *memoryBackend) BitCount(key string) (int64, error)                         { return 0, nil }
+func (m *memoryBackend) BitCountRange(key string, start, end int64, bitMode bool) (int64, error) {
+	return 0, nil
+}
 func (m *memoryBackend) DeleteBitmap(key string) error                              { return nil }
 
 func TestReplBacklog_SinceRejectsFutureSeq(t *testing.T) {

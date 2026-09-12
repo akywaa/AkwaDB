@@ -2,8 +2,10 @@ package akwadb
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/akywaa/akwadb/cache"
@@ -23,7 +25,6 @@ import (
 	"log/slog"
 	"math/bits"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -348,8 +349,10 @@ type Engine struct {
 	checkpointStop chan struct{}
 	checkpointWG   sync.WaitGroup
 
-	expiries sync.Map
-	expireMu sync.Mutex
+	expiryMu   sync.Mutex
+	expiryHeap expiryHeap
+	expiryAt   map[string]int64
+	expireMu   sync.Mutex
 
 	OnWrite func(op byte, key, val []byte, expiresAt int64)
 }
@@ -496,6 +499,7 @@ func (e *Engine) throttleL0() {
 func (e *Engine) writer() {
 	defer e.wg.Done()
 	var batch []*writeReq
+	var results []incrResult
 	for {
 		select {
 		case req, ok := <-e.writeReq:
@@ -522,8 +526,26 @@ func (e *Engine) writer() {
 				}
 			}
 
+			results = results[:0]
+			needsSync := false
 			for _, r := range batch {
-				r.errCh <- e.dispatch(r)
+				res := e.dispatch(r)
+				results = append(results, res)
+				if r.syncWAL && res.err == nil {
+					needsSync = true
+				}
+			}
+			if needsSync && !e.wal.SyncOnWrite() {
+				if serr := e.wal.FlushAndSync(); serr != nil {
+					for i, r := range batch {
+						if r.syncWAL && results[i].err == nil {
+							results[i].err = serr
+						}
+					}
+				}
+			}
+			for i, r := range batch {
+				r.errCh <- results[i]
 			}
 
 			e.flushBackpressure()
@@ -606,9 +628,6 @@ func (e *Engine) dispatch(r *writeReq) incrResult {
 		var err error
 		if existed {
 			err = e.applyEntryOpts(r.op, r.key, r.val, r.expiresAt, r.seq, r.skipWAL)
-			if r.syncWAL && err == nil {
-				err = e.wal.FlushAndSync()
-			}
 		}
 		e.walAppendMu.Unlock()
 		e.memTableMu.RUnlock()
@@ -726,6 +745,7 @@ func (e *Engine) applyBatch(r *writeReq) error {
 		switch {
 		case res.deleted:
 			mt.DeleteVersion(res.kBytes, r.seq)
+			e.trackExpiry(res.kBytes, 0)
 		case res.isPtr:
 			mt.PutVersion(res.kBytes, encodeValuePointer(res.vp), res.expAt, r.seq)
 			e.trackExpiry(res.kBytes, res.expAt)
@@ -891,6 +911,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 		ctx:          ctx,
 		cancel:       cancel,
 		opts:         opts,
+		expiryAt:     make(map[string]int64),
 		discardStats: make(map[uint32]int64),
 		gcPending:    make(map[uint32]int64),
 		writeReq:     make(chan *writeReq, 4096),
@@ -1153,13 +1174,12 @@ func (e *Engine) flushWorker() {
 }
 
 func (e *Engine) executeFlush(task flushTask) {
-	defer task.memTable.ReleaseArena()
-
 	defer func() {
 		e.immMemTable.Store(nil)
 		e.memTableMu.Lock()
 		e.l0Cond.Broadcast()
 		e.memTableMu.Unlock()
+		task.memTable.ReleaseArena()
 	}()
 
 	allVersions := task.memTable.AllVersions()
@@ -1581,6 +1601,7 @@ func (e *Engine) applyEntryOpts(op byte, key, val []byte, expiresAt int64, seq u
 	mt := e.activeMemTable()
 	if op == wal.OpDelete {
 		mt.DeleteVersion(key, seq)
+		e.trackExpiry(key, 0)
 		return nil
 	}
 	e.recordValueSize(len(val))
@@ -1600,6 +1621,7 @@ func (e *Engine) applyEntry(op byte, key, val []byte, expiresAt int64, seq uint6
 			return werr
 		}
 		mt.DeleteVersion(key, seq)
+		e.trackExpiry(key, 0)
 		return nil
 	}
 	e.recordValueSize(len(val))
@@ -1729,6 +1751,38 @@ func (e *Engine) Expire(key string, seconds int64) (bool, error) {
 	return true, e.PutEx(key, val, seconds)
 }
 
+func (e *Engine) ExpireKey(key string, seconds int64) (bool, error) {
+	phys := "s\x00" + key
+	if val, err := e.getByKey([]byte(phys)); err == nil {
+		return true, e.PutEx(phys, string(val), seconds)
+	}
+
+	keys, err := e.CollectionKeys(key)
+	if err != nil {
+		return false, err
+	}
+	if len(keys) == 0 {
+		return false, nil
+	}
+
+	expiresAt := time.Now().Unix() + seconds
+	entries := make([]server.BatchWriteEntry, 0, len(keys))
+	for _, k := range keys {
+		val, gerr := e.getByKey([]byte(k))
+		if gerr != nil {
+			continue
+		}
+		entries = append(entries, server.BatchWriteEntry{Key: k, Value: string(val), ExpiresAt: expiresAt})
+	}
+	if len(entries) == 0 {
+		return false, nil
+	}
+	if err := e.submitBatch(entries); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (e *Engine) compactionWorker() {
 	defer e.wg.Done()
 	for {
@@ -1760,11 +1814,43 @@ func (e *Engine) compactionWorker() {
 	}
 }
 
+type expiryItem struct {
+	key string
+	at  int64
+}
+
+type expiryHeap []expiryItem
+
+func (h expiryHeap) Len() int           { return len(h) }
+func (h expiryHeap) Less(i, j int) bool { return h[i].at < h[j].at }
+func (h expiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *expiryHeap) Push(x any)        { *h = append(*h, x.(expiryItem)) }
+func (h *expiryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	*h = old[:n-1]
+	return it
+}
+
 func (e *Engine) trackExpiry(key []byte, expiresAt int64) {
-	if expiresAt <= 0 {
+	if len(key) == 0 {
 		return
 	}
-	e.expiries.Store(string(key), expiresAt)
+	k := string(key)
+	e.expiryMu.Lock()
+	if expiresAt <= 0 {
+		delete(e.expiryAt, k)
+		e.expiryMu.Unlock()
+		return
+	}
+	if prev, ok := e.expiryAt[k]; ok && prev == expiresAt {
+		e.expiryMu.Unlock()
+		return
+	}
+	e.expiryAt[k] = expiresAt
+	heap.Push(&e.expiryHeap, expiryItem{key: k, at: expiresAt})
+	e.expiryMu.Unlock()
 }
 
 func (e *Engine) expireSweep() {
@@ -1784,14 +1870,20 @@ func (e *Engine) expireDueKeys(limit int) {
 
 	now := time.Now().Unix()
 	var due []string
-	e.expiries.Range(func(k, v any) bool {
-		if v.(int64) > now {
-			return true
+	e.expiryMu.Lock()
+	for len(e.expiryHeap) > 0 && len(due) < limit {
+		it := e.expiryHeap[0]
+		if it.at > now {
+			break
 		}
-		due = append(due, k.(string))
-		e.expiries.Delete(k)
-		return len(due) < limit
-	})
+		heap.Pop(&e.expiryHeap)
+		if cur, ok := e.expiryAt[it.key]; !ok || cur != it.at {
+			continue
+		}
+		delete(e.expiryAt, it.key)
+		due = append(due, it.key)
+	}
+	e.expiryMu.Unlock()
 	if len(due) == 0 || e.ctx.Err() != nil {
 		return
 	}
@@ -2532,7 +2624,7 @@ func (e *Engine) ScanKeys(pattern string) ([]string, error) {
 		prevKey = k
 
 		if !deleted && (expAt == 0 || now < expAt) {
-			if matched, _ := path.Match(pattern, k); matched || pattern == "*" {
+			if globMatch(pattern, k) {
 				keys = append(keys, k)
 			}
 		}
@@ -2578,7 +2670,7 @@ func (e *Engine) ScanAllKeys(pattern string) ([]string, error) {
 			continue
 		}
 		seen[name] = struct{}{}
-		if matched, _ := path.Match(pattern, name); matched || pattern == "*" {
+		if globMatch(pattern, name) {
 			keys = append(keys, name)
 		}
 		merged.Next()
@@ -2604,6 +2696,159 @@ func logicalKey(k []byte) string {
 	return ""
 }
 
+func (e *Engine) ScanPage(pattern string, cursor string, count int) ([]string, string, error) {
+	var seek []byte
+	if cursor != "" && cursor != "0" {
+		b, err := hex.DecodeString(cursor)
+		if err != nil {
+			return nil, "0", err
+		}
+		seek = b
+	}
+	if count <= 0 {
+		count = 10
+	}
+
+	merged, iters := e.buildMergedIterator(seek)
+	defer func() {
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}()
+
+	budget := count * 4
+	if budget < 64 {
+		budget = 64
+	}
+	if budget > 8192 {
+		budget = 8192
+	}
+
+	seen := make(map[string]struct{})
+	var names []string
+	var last []byte
+	scanned := 0
+	now := time.Now().Unix()
+	skipSeek := len(seek) > 0
+
+	for merged.Valid() {
+		k := merged.Key()
+		if skipSeek {
+			skipSeek = false
+			if bytes.Equal(k, seek) {
+				merged.Next()
+				continue
+			}
+		}
+
+		scanned++
+		last = append(last[:0], k...)
+
+		if !merged.Deleted() && !(merged.ExpiresAt() > 0 && now >= merged.ExpiresAt()) {
+			if name := logicalKey(k); name != "" {
+				if _, ok := seen[name]; !ok {
+					seen[name] = struct{}{}
+					if globMatch(pattern, name) {
+						names = append(names, name)
+					}
+				}
+			}
+		}
+
+		merged.Next()
+
+		if len(names) >= count || scanned >= budget {
+			break
+		}
+	}
+
+	next := "0"
+	if merged.Valid() && scanned > 0 {
+		next = hex.EncodeToString(last)
+	}
+	sort.Strings(names)
+	return names, next, nil
+}
+
+func globMatch(pattern, s string) bool {
+	var p, si int
+	starP, starS := -1, 0
+
+	for si < len(s) {
+		if p < len(pattern) {
+			switch pattern[p] {
+			case '*':
+				starP = p
+				starS = si
+				p++
+				continue
+			case '?':
+				p++
+				si++
+				continue
+			case '[':
+				if next, ok := matchCharClass(pattern, p, s[si]); ok {
+					p = next
+					si++
+					continue
+				}
+			case '\\':
+				if p+1 < len(pattern) && pattern[p+1] == s[si] {
+					p += 2
+					si++
+					continue
+				}
+			default:
+				if pattern[p] == s[si] {
+					p++
+					si++
+					continue
+				}
+			}
+		}
+
+		if starP >= 0 {
+			starS++
+			si = starS
+			p = starP + 1
+			continue
+		}
+		return false
+	}
+
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
+	}
+	return p == len(pattern)
+}
+
+func matchCharClass(pattern string, start int, ch byte) (int, bool) {
+	j := start + 1
+	negate := false
+	if j < len(pattern) && pattern[j] == '^' {
+		negate = true
+		j++
+	}
+	matched := false
+	for j < len(pattern) && pattern[j] != ']' {
+		if j+2 < len(pattern) && pattern[j+1] == '-' && pattern[j+2] != ']' {
+			if ch >= pattern[j] && ch <= pattern[j+2] {
+				matched = true
+			}
+			j += 3
+			continue
+		}
+		if pattern[j] == ch {
+			matched = true
+		}
+		j++
+	}
+	if j >= len(pattern) {
+		return start + 1, ch == '['
+	}
+	return j + 1, matched != negate
+}
+
 const deleteBatchSize = 1024
 
 func (e *Engine) DeleteCollection(key string) (int64, error) {
@@ -2616,6 +2861,33 @@ func (e *Engine) DeleteCollection(key string) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+func (e *Engine) CollectionKeys(key string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var out []string
+	now := time.Now().Unix()
+	for _, prefix := range collectionPrefixes(key) {
+		merged, iters := e.buildMergedIterator(prefix)
+		for merged.Valid() {
+			k := merged.Key()
+			if !bytes.HasPrefix(k, prefix) {
+				break
+			}
+			if !merged.Deleted() && (merged.ExpiresAt() == 0 || now < merged.ExpiresAt()) {
+				ks := string(k)
+				if _, ok := seen[ks]; !ok {
+					seen[ks] = struct{}{}
+					out = append(out, ks)
+				}
+			}
+			merged.Next()
+		}
+		for _, it := range iters {
+			_ = it.Close()
+		}
+	}
+	return out, nil
 }
 
 func collectionPrefixes(key string) [][]byte {
@@ -2727,6 +2999,36 @@ func (e *Engine) HSet(hash, field, val string) (bool, error) {
 	}
 
 	return isNew, nil
+}
+
+func (e *Engine) HSetMulti(hash string, fields []string) (int64, error) {
+	mu := e.lockKey(hash)
+	defer mu.Unlock()
+
+	entries := make([]server.BatchWriteEntry, 0, len(fields)/2)
+	idx := make(map[string]int, len(fields)/2)
+	var created int64
+	for i := 0; i+1 < len(fields); i += 2 {
+		field := fields[i]
+		val := fields[i+1]
+		if j, ok := idx[field]; ok {
+			entries[j].Value = val
+			continue
+		}
+		idx[field] = len(entries)
+		kBytes := hashFieldKey(hash, field)
+		if _, err := e.getByKey(kBytes); err != nil {
+			created++
+		}
+		entries = append(entries, server.BatchWriteEntry{Key: string(kBytes), Value: val})
+	}
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	if err := e.submitBatch(entries); err != nil {
+		return 0, err
+	}
+	return created, nil
 }
 
 func (e *Engine) HGet(hash, field string) (string, error) {
@@ -2970,6 +3272,34 @@ func (e *Engine) clearInternal() error {
 	defer e.walMu.Unlock()
 	defer e.walAppendMu.Unlock()
 
+	walPath := filepath.Join(e.dataDir, "wal.log")
+	tmpWalPath := filepath.Join(e.dataDir, "wal.log.clear")
+	_ = os.Remove(tmpWalPath)
+	newWal, err := wal.OpenWithOptionsAndRegistry(tmpWalPath, true, e.opts.KeyRegistry)
+	if err != nil {
+		return err
+	}
+	if err := newWal.Sync(); err != nil {
+		_ = newWal.Close()
+		_ = os.Remove(tmpWalPath)
+		return err
+	}
+	if err := newWal.Close(); err != nil {
+		_ = os.Remove(tmpWalPath)
+		return err
+	}
+	_ = e.wal.Close()
+	if err := os.Rename(tmpWalPath, walPath); err != nil {
+		return err
+	}
+	_ = fsutil.SyncDir(e.dataDir)
+	reopened, err := wal.OpenWithOptionsAndRegistry(walPath, true, e.opts.KeyRegistry)
+	if err != nil {
+		return err
+	}
+	e.wal = reopened
+	reopened.SetSyncHook(e.vl.Sync)
+
 	e.memTable.Store(memtable.NewSkipList())
 	e.immMemTable.Store(nil)
 
@@ -3016,16 +3346,6 @@ func (e *Engine) clearInternal() error {
 	e.gcPending = make(map[uint32]int64)
 	e.discardMu.Unlock()
 	_ = os.Remove(discardPath(e.dataDir))
-
-	_ = e.wal.Close()
-	walPath := filepath.Join(e.dataDir, "wal.log")
-	_ = os.Remove(walPath)
-	newWal, err := wal.OpenWithOptionsAndRegistry(walPath, true, e.opts.KeyRegistry)
-	if err != nil {
-		return err
-	}
-	e.wal = newWal
-	newWal.SetSyncHook(e.vl.Sync)
 
 	return nil
 }
@@ -3075,6 +3395,10 @@ func (e *Engine) BatchApplyWithVersion(entries []server.BatchWriteEntry, version
 
 func (e *Engine) ReleaseVersion(version uint64) {
 	e.oracle.MarkApplied(version)
+}
+
+func (e *Engine) AbortCommit(version uint64) {
+	e.oracle.AbortCommit(version)
 }
 
 func (e *Engine) compactManifest() error {
@@ -3583,37 +3907,54 @@ func (e *Engine) SInter(keys []string) ([]string, error) {
 // ==========================================
 
 func (e *Engine) ZAdd(key string, score float64, member string) (bool, error) {
+	added, err := e.ZAddMulti(key, []server.ZSetMember{{Score: score, Member: member}})
+	if err != nil {
+		return false, err
+	}
+	return added > 0, nil
+}
+
+func (e *Engine) ZAddMulti(key string, members []server.ZSetMember) (int64, error) {
 	mu := e.lockKey(key)
 	defer mu.Unlock()
 
-	// check if member already exists with a different score
-	oldVal, err := e.getByKey(encoding.ZValKey(key, member))
-	var oldScore float64
-	isNew := err != nil
-	if err == nil && len(oldVal) > 0 {
-		oldScore = encoding.DecodeScore(oldVal)
+	order := make([]string, 0, len(members))
+	scores := make(map[string]float64, len(members))
+	for _, m := range members {
+		if _, ok := scores[m.Member]; !ok {
+			order = append(order, m.Member)
+		}
+		scores[m.Member] = m.Score
 	}
 
-	var entries []server.BatchWriteEntry
-
-	// remove old score index if score changed
-	if !isNew && oldScore != score {
-		entries = append(entries, server.BatchWriteEntry{
-			Key:     string(encoding.ZScoreKey(key, oldScore, member)),
-			Deleted: true,
-		})
+	entries := make([]server.BatchWriteEntry, 0, len(order)*2)
+	var added int64
+	for _, member := range order {
+		score := scores[member]
+		oldVal, err := e.getByKey(encoding.ZValKey(key, member))
+		isNew := err != nil
+		var oldScore float64
+		if err == nil && len(oldVal) > 0 {
+			oldScore = encoding.DecodeScore(oldVal)
+		}
+		if isNew {
+			added++
+		} else if oldScore != score {
+			entries = append(entries, server.BatchWriteEntry{
+				Key:     string(encoding.ZScoreKey(key, oldScore, member)),
+				Deleted: true,
+			})
+		}
+		entries = append(entries,
+			server.BatchWriteEntry{Key: string(encoding.ZValKey(key, member)), Value: string(encoding.EncodeScore(score))},
+			server.BatchWriteEntry{Key: string(encoding.ZScoreKey(key, score, member)), Value: ""},
+		)
 	}
-
-	// write value key and new score index
-	entries = append(entries,
-		server.BatchWriteEntry{Key: string(encoding.ZValKey(key, member)), Value: string(encoding.EncodeScore(score))},
-		server.BatchWriteEntry{Key: string(encoding.ZScoreKey(key, score, member)), Value: ""},
-	)
 
 	if err := e.submitBatch(entries); err != nil {
-		return false, err
+		return 0, err
 	}
-	return isNew, nil
+	return added, nil
 }
 
 func (e *Engine) ZScore(key, member string) (float64, bool, error) {
@@ -3794,6 +4135,112 @@ func (e *Engine) BitCount(key string) (int64, error) {
 		}
 	}
 	return count, nil
+}
+
+func (e *Engine) BitCountRange(key string, start, end int64, bitMode bool) (int64, error) {
+	prefix := bitmapPrefix(key)
+	pages := e.getByPrefix(prefix)
+
+	var totalBytes int64
+	for k, v := range pages {
+		if len(v) == 0 || len(k) < len(prefix)+8 {
+			continue
+		}
+		page := int64(binary.BigEndian.Uint64([]byte(k)[len(prefix):]))
+		endByte := page*bitmapPageBits/8 + int64(len(v))
+		if endByte > totalBytes {
+			totalBytes = endByte
+		}
+	}
+
+	var totalUnits int64
+	if bitMode {
+		totalUnits = totalBytes * 8
+	} else {
+		totalUnits = totalBytes
+	}
+
+	if start < 0 {
+		start = totalUnits + start
+	}
+	if end < 0 {
+		end = totalUnits + end
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 || start > end {
+		return 0, nil
+	}
+
+	var lo, hi int64
+	if bitMode {
+		lo, hi = start, end
+	} else {
+		lo, hi = start*8, end*8+7
+	}
+	if totalBytes == 0 {
+		return 0, nil
+	}
+	maxBit := totalBytes*8 - 1
+	if hi > maxBit {
+		hi = maxBit
+	}
+	if lo > hi {
+		return 0, nil
+	}
+
+	var count int64
+	for k, v := range pages {
+		if len(v) == 0 || len(k) < len(prefix)+8 {
+			continue
+		}
+		page := int64(binary.BigEndian.Uint64([]byte(k)[len(prefix):]))
+		pageStart := page * bitmapPageBits
+		pageEnd := pageStart + int64(len(v))*8 - 1
+		overlapLo := lo
+		if overlapLo < pageStart {
+			overlapLo = pageStart
+		}
+		overlapHi := hi
+		if overlapHi > pageEnd {
+			overlapHi = pageEnd
+		}
+		if overlapLo > overlapHi {
+			continue
+		}
+		count += countBitsInRange(v, int(overlapLo-pageStart), int(overlapHi-pageStart))
+	}
+	return count, nil
+}
+
+func countBitsInRange(data []byte, loBit, hiBit int) int64 {
+	if loBit < 0 || hiBit < loBit || len(data) == 0 {
+		return 0
+	}
+	maxBit := len(data)*8 - 1
+	if hiBit > maxBit {
+		hiBit = maxBit
+	}
+	if loBit > maxBit {
+		return 0
+	}
+
+	firstByte := loBit / 8
+	lastByte := hiBit / 8
+	if firstByte == lastByte {
+		mask := byte((1 << uint(8-loBit%8)) - 1)
+		mask &= byte(0xFF << uint(7-hiBit%8))
+		return int64(bits.OnesCount8(data[firstByte] & mask))
+	}
+
+	var count int64
+	count += int64(bits.OnesCount8(data[firstByte] & byte((1<<uint(8-loBit%8))-1)))
+	for b := firstByte + 1; b < lastByte; b++ {
+		count += int64(bits.OnesCount8(data[b]))
+	}
+	count += int64(bits.OnesCount8(data[lastByte] & byte(0xFF<<uint(7-hiBit%8))))
+	return count
 }
 
 func (e *Engine) DeleteBitmap(key string) error {
