@@ -1312,12 +1312,13 @@ func (s *Server) cmdTTL(srv *Server, cl *client, args []string) error {
 		return nil
 	}
 	rem, _ := srv.db.TTL(strKey(args[0]))
+	if rem == -2 {
+		if collKeys, err := srv.db.CollectionKeys(args[0]); err == nil && len(collKeys) > 0 {
+			rem, _ = srv.db.TTL(collKeys[0])
+		}
+	}
 	srv.writeInt(cl, rem)
 	return nil
-}
-
-func (s *Server) cmdIncr(srv *Server, cl *client, args []string) error {
-	return s.cmdIncrByDelta(srv, cl, args, 1)
 }
 
 func (s *Server) cmdDecr(srv *Server, cl *client, args []string) error {

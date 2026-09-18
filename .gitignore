@@ -17,3 +17,4 @@ LOCK
 
 # OS specific
 .DS_Store
+*.ps1
