@@ -1,6 +1,11 @@
 package akwadb
 
 import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"github.com/akywaa/akwadb/cache"
 	"github.com/akywaa/akwadb/iterator"
 	"github.com/akywaa/akwadb/memtable"
@@ -8,12 +13,7 @@ import (
 	"github.com/akywaa/akwadb/sstable"
 	"github.com/akywaa/akwadb/vlog"
 	"github.com/akywaa/akwadb/wal"
-	"bytes"
-	"context"
-	"encoding/binary"
-		"errors"
 	"hash/crc32"
-	"fmt"
 	"io"
 	"log/slog"
 	"math/bits"
@@ -180,12 +180,12 @@ func (e *Engine) saveDiscardStats() {
 }
 
 const MaxLevels = 5
-const levelSizeRatio = 10 // each level is 10x larger than the one above
+const levelSizeRatio = 10         // each level is 10x larger than the one above
 const l0BackpressureThreshold = 8 // start throttling writers at this L0 count
-const subcompactionSplits = 4 // number of parallel key-range splits per compaction
+const subcompactionSplits = 4     // number of parallel key-range splits per compaction
 
 const (
-	CacheBackendLRU    = 0
+	CacheBackendLRU     = 0
 	CacheBackendTinyLFU = 1
 )
 
@@ -195,9 +195,9 @@ type Options struct {
 	CompactionThreshold int
 	BlockCacheSize      int
 	MaxDiskBytes        int64
-	LevelSizeRatio      int  // dynamic level size ratio (default 10)
-	ValueThreshold      int  // values smaller than this are stored inline (default 128)
-	CacheBackend        int  // CacheBackendLRU (default) or CacheBackendTinyLFU
+	LevelSizeRatio      int // dynamic level size ratio (default 10)
+	ValueThreshold      int // values smaller than this are stored inline (default 128)
+	CacheBackend        int // CacheBackendLRU (default) or CacheBackendTinyLFU
 }
 
 func (o Options) levelRatio() int {
@@ -219,26 +219,26 @@ func DefaultOptions(dataDir string) Options {
 }
 
 type flushTask struct {
-	seq          uint64
-	memTable     *memtable.SkipList
-	oldWal       *wal.WAL
-	oldWalPath   string
-	oldVlogFid   uint32 // fid of VLog segment that was active before flush
+	seq        uint64
+	memTable   *memtable.SkipList
+	oldWal     *wal.WAL
+	oldWalPath string
+	oldVlogFid uint32 // fid of VLog segment that was active before flush
 }
 
 const opIncr byte = 128
 const opGCRewrite byte = 129
 
 type writeReq struct {
-	op          byte
-	key         []byte
-	val         []byte
-	expiresAt   int64
-	delta       int64
-	seq         uint64
-	expectedVp  ValuePointer
-	batch       []server.BatchWriteEntry // atomic batch writes
-	errCh       chan incrResult
+	op         byte
+	key        []byte
+	val        []byte
+	expiresAt  int64
+	delta      int64
+	seq        uint64
+	expectedVp ValuePointer
+	batch      []server.BatchWriteEntry // atomic batch writes
+	errCh      chan incrResult
 }
 
 type incrResult struct {
@@ -247,18 +247,18 @@ type incrResult struct {
 }
 
 type Engine struct {
-	levelMu  [MaxLevels]sync.RWMutex
-	metrics  metricsCollector
-	memTable atomic.Pointer[memtable.SkipList]
+	levelMu     [MaxLevels]sync.RWMutex
+	metrics     metricsCollector
+	memTable    atomic.Pointer[memtable.SkipList]
 	immMemTable atomic.Pointer[memtable.SkipList]
-	memTableMu sync.Mutex
+	memTableMu  sync.Mutex
 
 	levels [MaxLevels][]*sstable.SSTable
 
 	wal           *wal.WAL
 	walMu         sync.RWMutex // guards wal pointer during rotation
 	currentWalFid uint32
-	vl          *vlog.ValueLog
+	vl            *vlog.ValueLog
 	vlogMu        sync.RWMutex
 	dataDir       string
 	nextSeq       uint64
@@ -280,7 +280,7 @@ type Engine struct {
 	gcDiscardTs uint64 // max version at start of GC; tombstones above this are preserved
 
 	oracle *Oracle
-	lock     *dirLock
+	lock   *dirLock
 
 	writeReq chan *writeReq
 
@@ -397,7 +397,7 @@ func (e *Engine) writer() {
 			}
 
 			batch = append(batch[:0], req)
-			drain:
+		drain:
 			for len(batch) < 256 {
 				select {
 				case t := <-e.writeReq:
@@ -410,18 +410,23 @@ func (e *Engine) writer() {
 			mt := e.activeMemTable()
 			for _, r := range batch {
 				if r.seq == 0 {
-					r.seq = atomic.AddUint64(&e.nextSeq, 1)
+					r.seq = e.oracle.NewCommitTs()
+					atomic.StoreUint64(&e.nextSeq, r.seq)
 				}
 
 				if r.op == opClear {
 					r.errCh <- incrResult{err: e.clearInternal()}
 					continue
-			}
+				}
 
-			if r.op == opIncr {
-					r.errCh <- e.processIncr(r, mt)
+				if r.op == opIncr {
+					res := e.processIncr(r, mt)
+					if res.err == nil {
+						e.oracle.SetAppliedTs(r.seq)
+					}
+					r.errCh <- res
 					continue
-			}
+				}
 
 				if r.op == opGCRewrite {
 					curVal, err := e.getWithoutLock(r.key)
@@ -499,20 +504,25 @@ func (e *Engine) writer() {
 					if batchErr == nil {
 						for _, res := range results {
 							if res.deleted {
-								mt.Delete(res.kBytes)
+								mt.DeleteVersion(res.kBytes, r.seq)
 							} else if res.isPtr {
 								mt.PutVersion(res.kBytes, encodeValuePointer(res.vp), res.expAt, r.seq)
 							} else {
 								mt.PutVersion(res.kBytes, encodeInlineValue(res.vBytes), res.expAt, r.seq)
 							}
 						}
+						e.oracle.SetAppliedTs(r.seq)
 					}
 					r.errCh <- incrResult{err: batchErr}
 					continue
 				}
 
 				if r.op == wal.OpPut || r.op == wal.OpDelete {
-					r.errCh <- incrResult{err: e.applyEntry(r.op, r.key, r.val, r.expiresAt, r.seq)}
+					err := e.applyEntry(r.op, r.key, r.val, r.expiresAt, r.seq)
+					if err == nil {
+						e.oracle.SetAppliedTs(r.seq)
+					}
+					r.errCh <- incrResult{err: err}
 					continue
 				}
 
@@ -528,12 +538,12 @@ func (e *Engine) writer() {
 					for e.immutableMemTable() != nil && e.ctx.Err() == nil {
 						e.l0Cond.Wait()
 					}
-			} else if task, err := e.triggerFlushLocked(); err == nil {
-				select {
-				case e.flushChan <- *task:
-				case <-e.ctx.Done():
+				} else if task, err := e.triggerFlushLocked(); err == nil {
+					select {
+					case e.flushChan <- *task:
+					case <-e.ctx.Done():
+					}
 				}
-			}
 			}
 			e.memTableMu.Unlock()
 
@@ -556,8 +566,6 @@ func (e *Engine) writer() {
 		}
 	}
 }
-
-
 
 func OpenEngine(dataDir string) (*Engine, error) {
 	return OpenEngineWithOpts(DefaultOptions(dataDir))
@@ -594,17 +602,17 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	e := &Engine{
-		memTable:    atomic.Pointer[memtable.SkipList]{},
-		wal:         w,
-		dataDir:     opts.DataDir,
-		blockCache:  blockCache,
-		flushChan:   make(chan flushTask, 16),
-		compactChan: make(chan struct{}, 1),
-		ctx:         ctx,
-		cancel:      cancel,
-		opts:        opts,
+		memTable:     atomic.Pointer[memtable.SkipList]{},
+		wal:          w,
+		dataDir:      opts.DataDir,
+		blockCache:   blockCache,
+		flushChan:    make(chan flushTask, 16),
+		compactChan:  make(chan struct{}, 1),
+		ctx:          ctx,
+		cancel:       cancel,
+		opts:         opts,
 		discardStats: make(map[uint32]int64),
-		writeReq:    make(chan *writeReq, 4096),
+		writeReq:     make(chan *writeReq, 4096),
 	}
 	e.l0Cond = sync.NewCond(&e.memTableMu)
 	e.oracle = newOracle()
@@ -659,7 +667,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	e.nextSeq = maxSeq
 	atomic.StoreUint32(&e.currentWalFid, uint32(maxSeq+1))
 	if maxSeq > 0 {
-		e.oracle.nextTs = maxSeq + 1
+		e.oracle.Bump(maxSeq)
 	}
 
 	// read manifest to figure out which level each table belongs to
@@ -775,7 +783,7 @@ func (e *Engine) executeFlush(task flushTask) {
 	}
 	sst, err := sstable.CreateAtLevel(sstName, entries, e.blockCache, 0)
 	if err != nil {
-			slog.Error("flush error", "seq", task.seq, "err", err)
+		slog.Error("flush error", "seq", task.seq, "err", err)
 		return
 	}
 	syncDir(e.dataDir)
@@ -1058,9 +1066,9 @@ type memVersionIter struct {
 	inner *memtable.SkipListVersionIterator
 }
 
-func (it *memVersionIter) Next() bool              { return it.inner.Next() }
-func (it *memVersionIter) Valid() bool              { return it.inner.Valid() }
-func (it *memVersionIter) Close() error             { return it.inner.Close() }
+func (it *memVersionIter) Next() bool   { return it.inner.Next() }
+func (it *memVersionIter) Valid() bool  { return it.inner.Valid() }
+func (it *memVersionIter) Close() error { return it.inner.Close() }
 func (it *memVersionIter) Entry() iterator.VersionEntry {
 	e := it.inner.Entry()
 	return iterator.VersionEntry{Key: e.Key, Value: e.Value, Version: e.Version}
@@ -1179,8 +1187,6 @@ func (e *Engine) submitBatch(entries []server.BatchWriteEntry) error {
 	res := <-req.errCh
 	return res.err
 }
-
-
 
 func (e *Engine) getByPrefix(prefix []byte) map[string][]byte {
 	result := make(map[string][]byte)
@@ -1307,26 +1313,26 @@ func (e *Engine) maintenanceWorker() {
 			if e.opts.MaxDiskBytes > 0 {
 				e.evictIfNeeded()
 			}
-	case <-gcTicker.C:
-		e.discardMu.Lock()
-		var bestFid uint32
-		var maxDiscard int64
-		for fid, discBytes := range e.discardStats {
-			if discBytes > maxDiscard {
-				maxDiscard = discBytes
-				bestFid = fid
-			}
-		}
-		e.discardMu.Unlock()
-
-		if maxDiscard > 16*1024*1024 {
-			go func(fid uint32, disc int64) {
-				slog.Info("starting vlog GC via discard stats", "fid", fid, "discarded_bytes", disc)
-				if err := e.RunValueLogGC(fid); err != nil {
-					slog.Error("vlog GC failed", "fid", fid, "err", err)
+		case <-gcTicker.C:
+			e.discardMu.Lock()
+			var bestFid uint32
+			var maxDiscard int64
+			for fid, discBytes := range e.discardStats {
+				if discBytes > maxDiscard {
+					maxDiscard = discBytes
+					bestFid = fid
 				}
-			}(bestFid, maxDiscard)
-		}
+			}
+			e.discardMu.Unlock()
+
+			if maxDiscard > 16*1024*1024 {
+				go func(fid uint32, disc int64) {
+					slog.Info("starting vlog GC via discard stats", "fid", fid, "discarded_bytes", disc)
+					if err := e.RunValueLogGC(fid); err != nil {
+						slog.Error("vlog GC failed", "fid", fid, "err", err)
+					}
+				}(bestFid, maxDiscard)
+			}
 		case <-e.ctx.Done():
 			return
 		}
@@ -1386,9 +1392,9 @@ func (e *Engine) evictIfNeeded() {
 		e.levels[lvl] = e.levels[lvl][1:]
 		e.levelMu[lvl].Unlock()
 
-	e.discardSSTablePointers(victim)
-	victim.MarkRemove()
-	e.appendManifest('D', lvl, sstSeqNum(victim), victim.MinKey(), victim.MaxKey())
+		e.discardSSTablePointers(victim)
+		victim.MarkRemove()
+		e.appendManifest('D', lvl, sstSeqNum(victim), victim.MinKey(), victim.MaxKey())
 
 		slog.Info("evicted sst", "level", lvl, "file", filepath.Base(victim.Filename()), "disk_usage", e.totalDiskUsage())
 		return
@@ -1440,9 +1446,8 @@ func (e *Engine) compactLevel0() error {
 	baseLevel := e.findBaseLevel()
 
 	// find overlapping tables in baseLevel
-	e.levelMu[baseLevel].Lock()
+	e.levelMu[baseLevel].RLock()
 	var overlapsBase []*sstable.SSTable
-	var remainingBase []*sstable.SSTable
 	for _, t := range e.levels[baseLevel] {
 		overlaps := false
 		for _, l0Tbl := range toCompactL0 {
@@ -1453,23 +1458,24 @@ func (e *Engine) compactLevel0() error {
 		}
 		if overlaps {
 			overlapsBase = append(overlapsBase, t)
-		} else {
-			remainingBase = append(remainingBase, t)
 		}
 	}
-	e.levels[baseLevel] = remainingBase
-	e.levelMu[baseLevel].Unlock()
-
-	all := append(toCompactL0, overlapsBase...)
+	e.levelMu[baseLevel].RUnlock()
 
 	var iters []iterator.Iterator
 	var priorities []int
-	total := len(all)
-	for i := total - 1; i >= 0; i-- {
-		it := all[i].NewIterator()
+	for i, t := range overlapsBase {
+		it := t.NewIterator()
 		it.Seek([]byte(""))
 		iters = append(iters, it)
-		priorities = append(priorities, total-1-i)
+		priorities = append(priorities, i)
+	}
+	basePrio := len(overlapsBase)
+	for i, t := range toCompactL0 {
+		it := t.NewIterator()
+		it.Seek([]byte(""))
+		iters = append(iters, it)
+		priorities = append(priorities, basePrio+i)
 	}
 
 	merged := iterator.NewMergedIterator(iters, priorities)
@@ -1477,30 +1483,41 @@ func (e *Engine) compactLevel0() error {
 
 	newTables := e.writeSSTablesAtLevel(consolidated, baseLevel)
 
-	// Now that compaction is done, remove old tables and add new ones atomically.
-	e.removeFromLevel(0, toCompactL0)
-
 	e.levelMu[baseLevel].Lock()
-	e.levels[baseLevel] = append(e.levels[baseLevel], newTables...)
+	var remainingBase []*sstable.SSTable
+	for _, t := range e.levels[baseLevel] {
+		keep := true
+		for _, rm := range overlapsBase {
+			if t == rm {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			remainingBase = append(remainingBase, t)
+		}
+	}
+	e.levels[baseLevel] = append(remainingBase, newTables...)
 	sort.Slice(e.levels[baseLevel], func(i, j int) bool {
 		return bytes.Compare(e.levels[baseLevel][i].MinKey(), e.levels[baseLevel][j].MinKey()) < 0
 	})
 	e.levelMu[baseLevel].Unlock()
 
+	e.removeFromLevel(0, toCompactL0)
+
 	// log deletions and additions
 	for _, s := range overlapsBase {
 		e.appendManifest('D', baseLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
+		e.discardSSTablePointers(s)
+		s.MarkRemove()
 	}
 	for _, s := range toCompactL0 {
 		e.appendManifest('D', 0, sstSeqNum(s), s.MinKey(), s.MaxKey())
+		e.discardSSTablePointers(s)
+		s.MarkRemove()
 	}
 	for _, s := range newTables {
 		e.appendManifest('A', baseLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
-	}
-
-	for _, s := range all {
-		e.discardSSTablePointers(s)
-		s.MarkRemove()
 	}
 
 	return nil
@@ -1524,29 +1541,28 @@ func (e *Engine) compactLevel(fromLevel int) error {
 
 	// find overlapping tables in target level
 	var overlaps []*sstable.SSTable
-	var remaining []*sstable.SSTable
-	e.levelMu[toLevel].Lock()
+	e.levelMu[toLevel].RLock()
 	for _, t := range e.levels[toLevel] {
 		if rangesOverlap(pick, t) {
 			overlaps = append(overlaps, t)
-		} else {
-			remaining = append(remaining, t)
 		}
 	}
-	e.levels[toLevel] = remaining
-	e.levelMu[toLevel].Unlock()
-
-	all := append([]*sstable.SSTable{pick}, overlaps...)
+	e.levelMu[toLevel].RUnlock()
 
 	// parallel sub-compaction: split key range and merge in parallel
 	var iters []iterator.Iterator
 	var priorities []int
-	for i := len(all) - 1; i >= 0; i-- {
-		it := all[i].NewIterator()
+	for i, t := range overlaps {
+		it := t.NewIterator()
 		it.Seek([]byte(""))
 		iters = append(iters, it)
-		priorities = append(priorities, len(all)-1-i)
+		priorities = append(priorities, i)
 	}
+	it := pick.NewIterator()
+	it.Seek([]byte(""))
+	iters = append(iters, it)
+	priorities = append(priorities, len(overlaps))
+
 	merged := iterator.NewMergedIterator(iters, priorities)
 	consolidated := e.drainMergedIterator(merged, iters, toLevel)
 
@@ -1600,26 +1616,38 @@ func (e *Engine) compactLevel(fromLevel int) error {
 		}
 	}
 
-	e.removeFromLevel(fromLevel, []*sstable.SSTable{pick})
-
 	e.levelMu[toLevel].Lock()
-	e.levels[toLevel] = append(newTables, e.levels[toLevel]...)
+	var remaining []*sstable.SSTable
+	for _, t := range e.levels[toLevel] {
+		keep := true
+		for _, rm := range overlaps {
+			if t == rm {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			remaining = append(remaining, t)
+		}
+	}
+	e.levels[toLevel] = append(remaining, newTables...)
 	sort.Slice(e.levels[toLevel], func(i, j int) bool {
 		return bytes.Compare(e.levels[toLevel][i].MinKey(), e.levels[toLevel][j].MinKey()) < 0
 	})
 	e.levelMu[toLevel].Unlock()
 
+	e.removeFromLevel(fromLevel, []*sstable.SSTable{pick})
+
 	for _, s := range overlaps {
 		e.appendManifest('D', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
-	}
-	e.appendManifest('D', fromLevel, sstSeqNum(pick), pick.MinKey(), pick.MaxKey())
-	for _, s := range newTables {
-		e.appendManifest('A', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
-	}
-
-	for _, s := range all {
 		e.discardSSTablePointers(s)
 		s.MarkRemove()
+	}
+	e.appendManifest('D', fromLevel, sstSeqNum(pick), pick.MinKey(), pick.MaxKey())
+	e.discardSSTablePointers(pick)
+	pick.MarkRemove()
+	for _, s := range newTables {
+		e.appendManifest('A', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
 	}
 
 	return nil
@@ -1722,7 +1750,7 @@ func (e *Engine) writeSSTablesAtLevel(entries []memtable.Entry, level int) []*ss
 		sstName := filepath.Join(e.dataDir, fmt.Sprintf("%06d.sst", seq))
 		sst, err := sstable.CreateAtLevel(sstName, batch, e.blockCache, level)
 		if err != nil {
-				slog.Error("error creating sstable", "level", level, "err", err)
+			slog.Error("error creating sstable", "level", level, "err", err)
 			continue
 		}
 		syncDir(e.dataDir)
@@ -1887,16 +1915,16 @@ func (e *Engine) buildMergedIterator(seekKey []byte) (*iterator.MergedIterator, 
 	memIt := mt.NewIterator()
 	memIt.Seek(seekKey)
 	iters = append(iters, memIt)
-	priorities = append(priorities, 0)
+	priorities = append(priorities, 1000)
 
 	if imm != nil {
 		immIt := imm.NewIterator()
 		immIt.Seek(seekKey)
 		iters = append(iters, immIt)
-		priorities = append(priorities, 1)
+		priorities = append(priorities, 999)
 	}
 
-	prio := 2
+	prio := 900
 	for lvl := 0; lvl < MaxLevels; lvl++ {
 		e.levelMu[lvl].RLock()
 		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
@@ -1907,7 +1935,7 @@ func (e *Engine) buildMergedIterator(seekKey []byte) (*iterator.MergedIterator, 
 			it.Seek(seekKey)
 			iters = append(iters, it)
 			priorities = append(priorities, prio)
-			prio++
+			prio--
 		}
 	}
 
@@ -1947,8 +1975,6 @@ func (e *Engine) ScanKeys(pattern string) ([]string, error) {
 
 	return keys, nil
 }
-
-
 
 func hashFieldKey(hash, field string) []byte {
 	return []byte("h\x00" + hash + "\x00" + field)
@@ -2181,7 +2207,7 @@ func (e *Engine) Clear() error {
 	// Send through the write channel so the writer goroutine handles
 	// the WAL swap atomically, avoiding a data race.
 	req := &writeReq{
-		op:   opClear,
+		op:    opClear,
 		errCh: make(chan incrResult, 1),
 	}
 	e.writeReq <- req
@@ -2205,7 +2231,7 @@ func (e *Engine) clearInternal() error {
 			s.MarkRemove()
 		}
 		e.levels[lvl] = nil
-			e.levelMu[lvl].Unlock()
+		e.levelMu[lvl].Unlock()
 	}
 
 	_ = e.wal.Close()
@@ -2330,9 +2356,9 @@ func (e *Engine) RunValueLogGC(targetFid uint32) error {
 
 	for _, entry := range entriesToRewrite {
 		req := &writeReq{
-			op:   opGCRewrite,
-			key:  entry.Key,
-			val:  entry.Value,
+			op:        opGCRewrite,
+			key:       entry.Key,
+			val:       entry.Value,
 			expiresAt: entry.ExpiresAt,
 			expectedVp: ValuePointer{
 				Fid:    targetFid,
@@ -2536,7 +2562,6 @@ func (e *Engine) LRange(key string, start, stop int64) ([]string, error) {
 // ==========================================
 //
 // Each member is stored as a separate key: t\x00<setKey>\x00<member> -> ""
-//
 func setMemberKey(key, member string) []byte {
 	return []byte("t\x00" + key + "\x00" + member)
 }

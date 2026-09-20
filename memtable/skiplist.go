@@ -32,9 +32,9 @@ type SkipList struct {
 	head           *Node
 	level          atomic.Int32
 	sizeBytes      atomic.Int64
-	randSeed      uint64 // per-skiplist xorshift64 seed (atomic for lock-free access)
-	versionCounter uint64 // atomic: monotonic version counter for MVCC
-	writeMu       sync.Mutex // serializes writers so duplicate keys stay version-ordered
+	randSeed       uint64     // per-skiplist xorshift64 seed (atomic for lock-free access)
+	versionCounter uint64     // atomic: monotonic version counter for MVCC
+	writeMu        sync.Mutex // serializes writers so duplicate keys stay version-ordered
 
 	bytes *byteSlab
 }
@@ -211,7 +211,23 @@ func (s *SkipList) Put(key, val []byte, expiresAt int64) {
 }
 
 func (s *SkipList) Delete(key []byte) {
-	version := atomic.AddUint64(&s.versionCounter, 1)
+	s.DeleteVersion(key, 0)
+}
+
+func (s *SkipList) DeleteVersion(key []byte, version uint64) {
+	if version == 0 {
+		version = atomic.AddUint64(&s.versionCounter, 1)
+	} else {
+		for {
+			cur := atomic.LoadUint64(&s.versionCounter)
+			if version <= cur {
+				break
+			}
+			if atomic.CompareAndSwapUint64(&s.versionCounter, cur, version) {
+				break
+			}
+		}
+	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -266,20 +282,20 @@ insert:
 		}
 		newNode.deleted.Store(true)
 
-	for i := 0; i < lvl; i++ {
-		for {
-			next := atomic.LoadPointer(&update[i].fwd[i])
-			atomic.StorePointer(&newNode.fwd[i], next)
-			if atomic.CompareAndSwapPointer(&update[i].fwd[i], next, unsafe.Pointer(newNode)) {
-				break
+		for i := 0; i < lvl; i++ {
+			for {
+				next := atomic.LoadPointer(&update[i].fwd[i])
+				atomic.StorePointer(&newNode.fwd[i], next)
+				if atomic.CompareAndSwapPointer(&update[i].fwd[i], next, unsafe.Pointer(newNode)) {
+					break
+				}
+				s.findSpliceForLevel(update[i], key, i, update)
 			}
-			s.findSpliceForLevel(update[i], key, i, update)
 		}
-	}
 
-	nodeOverhead := int64(unsafe.Sizeof(Node{}))
-	s.sizeBytes.Add(nodeOverhead)
-	return
+		nodeOverhead := int64(unsafe.Sizeof(Node{}))
+		s.sizeBytes.Add(nodeOverhead)
+		return
 	}
 }
 

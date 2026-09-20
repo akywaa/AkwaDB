@@ -266,21 +266,23 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 	// Write minKey/maxKey before the 24-byte footer so Open can read
 	// the footer from the very end of the file.
 	var mkHdr [4]byte
+	minKeyOffsetStart := currentOffset
 	binary.BigEndian.PutUint32(mkHdr[:], uint32(len(minKey)))
 	file.Write(mkHdr[:])
 	file.Write(minKey)
 	currentOffset += int64(len(mkHdr)) + int64(len(minKey))
+
 	binary.BigEndian.PutUint32(mkHdr[:], uint32(len(maxKey)))
 	file.Write(mkHdr[:])
 	file.Write(maxKey)
-	// Record where minKey starts, then write a 32-byte footer:
-	// [indexOff(8)][bloomOff(8)][compress(1)][minKeyOff(8)][reserved(7)]
-	minKeyOffset := currentOffset // current position = start of minKey data
+	currentOffset += int64(len(mkHdr)) + int64(len(maxKey))
+
+	// footer: [indexOff(8)][bloomOff(8)][compress(1)][minKeyOff(8)][reserved(7)]
 	footerBuf := make([]byte, 32)
 	binary.BigEndian.PutUint64(footerBuf[0:8], uint64(indexStartOffset))
 	binary.BigEndian.PutUint64(footerBuf[8:16], uint64(bloomStartOffset))
 	footerBuf[16] = compressSnappy
-	binary.BigEndian.PutUint64(footerBuf[17:25], uint64(minKeyOffset))
+	binary.BigEndian.PutUint64(footerBuf[17:25], uint64(minKeyOffsetStart))
 	file.Write(footerBuf)
 
 	file.Sync()
