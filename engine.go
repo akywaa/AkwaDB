@@ -766,9 +766,11 @@ func (e *Engine) executeFlush(task flushTask) {
 	entries := make([]memtable.Entry, len(allVersions))
 	for i, ve := range allVersions {
 		entries[i] = memtable.Entry{
-			Key:     ve.Key,
-			Value:   ve.Value,
-			Version: ve.Version,
+			Key:       ve.Key,
+			Value:     ve.Value,
+			Version:   ve.Version,
+			Deleted:   ve.Deleted,
+			ExpiresAt: ve.ExpiresAt,
 		}
 	}
 	sst, err := sstable.CreateAtLevel(sstName, entries, e.blockCache, 0)
@@ -1658,6 +1660,7 @@ func (e *Engine) drainMergedIterator(merged *iterator.MergedIterator, iters []it
 					Value:     v,
 					Deleted:   true,
 					ExpiresAt: merged.ExpiresAt(),
+					Version:   merged.Version(),
 				})
 			}
 		} else {
@@ -1669,6 +1672,7 @@ func (e *Engine) drainMergedIterator(merged *iterator.MergedIterator, iters []it
 				Key:       k,
 				Value:     v,
 				ExpiresAt: merged.ExpiresAt(),
+				Version:   merged.Version(),
 			})
 		}
 		merged.Next()

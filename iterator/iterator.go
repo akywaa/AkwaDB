@@ -12,6 +12,7 @@ type Iterator interface {
 	Value() []byte
 	Deleted() bool
 	ExpiresAt() int64
+	Version() uint64
 	Valid() bool
 	Close() error
 }
@@ -24,6 +25,7 @@ type MergedIterator struct {
 	// cached state for the current element
 	currKey   []byte
 	currVal   []byte
+	currVer   uint64
 	currDel   bool
 	currExp   int64
 	currValid bool
@@ -33,6 +35,7 @@ type heapItem struct {
 	iter     Iterator
 	key      []byte
 	value    []byte
+	version  uint64
 	deleted  bool
 	expAt    int64
 	priority int
@@ -83,6 +86,7 @@ func NewMergedIteratorWithDiscard(iters []Iterator, priorities []int, onDiscard 
 				iter:     it,
 				key:      it.Key(),
 				value:    it.Value(),
+				version:  it.Version(),
 				deleted:  it.Deleted(),
 				expAt:    it.ExpiresAt(),
 				priority: p,
@@ -107,6 +111,7 @@ func (m *MergedIterator) Next() bool {
 	// save state so its stable even if underlying iter moves
 	m.currKey = top.key
 	m.currVal = top.value
+	m.currVer = top.version
 	m.currDel = top.deleted
 	m.currExp = top.expAt
 	m.currValid = true
@@ -115,6 +120,7 @@ func (m *MergedIterator) Next() bool {
 	if top.iter.Next() {
 		top.key = top.iter.Key()
 		top.value = top.iter.Value()
+		top.version = top.iter.Version()
 		top.deleted = top.iter.Deleted()
 		top.expAt = top.iter.ExpiresAt()
 		heap.Push(&m.heap, top)
@@ -133,6 +139,7 @@ func (m *MergedIterator) Next() bool {
 		if dup.iter.Next() {
 			dup.key = dup.iter.Key()
 			dup.value = dup.iter.Value()
+			dup.version = dup.iter.Version()
 			dup.deleted = dup.iter.Deleted()
 			dup.expAt = dup.iter.ExpiresAt()
 			heap.Push(&m.heap, dup)
@@ -144,6 +151,7 @@ func (m *MergedIterator) Next() bool {
 
 func (m *MergedIterator) Key() []byte      { return m.currKey }
 func (m *MergedIterator) Value() []byte    { return m.currVal }
+func (m *MergedIterator) Version() uint64  { return m.currVer }
 func (m *MergedIterator) Deleted() bool    { return m.currDel }
 func (m *MergedIterator) ExpiresAt() int64 { return m.currExp }
 func (m *MergedIterator) Valid() bool      { return m.currValid }
