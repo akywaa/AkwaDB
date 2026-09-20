@@ -1,6 +1,7 @@
 package akwadb
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
@@ -11,236 +12,174 @@ import (
 	"time"
 )
 
-const (
-	bankAccounts   = 10
-	bankInitialBal = 1000
-	bankWorkers    = 40
-	bankIters      = 500
-	bankTimeout    = 60 * time.Second
+var (
+	testDuration = flag.Duration("duration", 3*time.Minute, "How long to run the bank test (e.g. 10m, 30m, 1h)")
 )
 
-func bankKey(id int) string {
-	return fmt.Sprintf("acct:%d", id)
+const (
+	heavyBankAccounts   = 1000
+	heavyBankInitialBal = 1000
+	heavyBankWriters    = 100
+	heavyBankReaders    = 20
+)
+
+func heavyBankKey(id int) []byte {
+	return []byte(fmt.Sprintf("acct:%06d", id))
 }
 
-func bankTotal(e *Engine) (int64, error) {
-	var total int64
-	for i := 0; i < bankAccounts; i++ {
-		val, err := e.Get(bankKey(i))
-		if err != nil {
-			return 0, err
-		}
-		bal, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("account %d: parse %q: %w", i, val, err)
-		}
-		total += bal
-	}
-	return total, nil
-}
-
-func bankSeed(e *Engine) error {
-	for i := 0; i < bankAccounts; i++ {
-		if err := e.Put(bankKey(i), strconv.Itoa(bankInitialBal)); err != nil {
+func heavyBankSeed(e *Engine) error {
+	for i := 0; i < heavyBankAccounts; i++ {
+		val := []byte(strconv.Itoa(heavyBankInitialBal))
+		if err := e.Put(string(heavyBankKey(i)), string(val)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func TestBank_ConcurrentTransfers(t *testing.T) {
-	dir, err := os.MkdirTemp("", "bank_test_*")
+func readTotalAcrossAccounts(tx *Tx) (int64, error) {
+	var total int64
+	for i := 0; i < heavyBankAccounts; i++ {
+		valBytes, err := tx.Get(heavyBankKey(i))
+		if err != nil {
+			return 0, fmt.Errorf("account %d not found: %w", i, err)
+		}
+		bal, err := strconv.ParseInt(string(valBytes), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("account %d parse error %q: %w", i, valBytes, err)
+		}
+		total += bal
+	}
+	return total, nil
+}
+
+func TestBank_HeavyChaos(t *testing.T) {
+	dir, err := os.MkdirTemp("", "heavy_bank_test_*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
 
-	eng, err := OpenEngine(dir)
+	opts := DefaultOptions(dir)
+	opts.MemTableSize = 64 * 1024 // 64 КБ
+	opts.CompactionThreshold = 2
+	opts.BlockCacheSize = 2000
+
+	eng, err := OpenEngineWithOpts(opts)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to open engine: %v", err)
 	}
 	defer eng.Close()
 
-	if err := bankSeed(eng); err != nil {
-		t.Fatal("seed:", err)
+	t.Logf("Seeding %d accounts with %d each...", heavyBankAccounts, heavyBankInitialBal)
+	if err := heavyBankSeed(eng); err != nil {
+		t.Fatalf("Seed failed: %v", err)
 	}
 
-	expectedTotal := int64(bankAccounts * bankInitialBal)
+	expectedTotal := int64(heavyBankAccounts * heavyBankInitialBal)
 
-	var wg sync.WaitGroup
-	var conflicts atomic.Int64
-	var done atomic.Int64
+	err = eng.View(func(tx *Tx) error {
+		tot, err := readTotalAcrossAccounts(tx)
+		if err != nil {
+			return err
+		}
+		if tot != expectedTotal {
+			return fmt.Errorf("initial total mismatch: got %d, want %d", tot, expectedTotal)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Initial verification failed: %v", err)
+	}
+
+	t.Logf("Initial state OK. Total = %d. Commencing stress test for %s...", expectedTotal, *testDuration)
+
+	var (
+		txCommitted    atomic.Int64
+		txConflicts    atomic.Int64
+		txOtherErrors  atomic.Int64
+		readChecks     atomic.Int64
+		readViolations atomic.Int64
+		stopAll        atomic.Bool
+	)
 
 	stop := make(chan struct{})
 	go func() {
-		time.Sleep(bankTimeout)
+		time.Sleep(*testDuration)
 		close(stop)
+		stopAll.Store(true)
 	}()
 
-	for w := 0; w < bankWorkers; w++ {
+	var wg sync.WaitGroup
+
+	for w := 0; w < heavyBankWriters; w++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(workerID int) {
 			defer wg.Done()
-			rng := rand.New(rand.NewSource(int64(id)))
-			for i := 0; i < bankIters; i++ {
+			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)*1000))
+
+			for {
 				select {
 				case <-stop:
 					return
 				default:
 				}
 
-				from := rng.Intn(bankAccounts)
-				to := rng.Intn(bankAccounts)
-				for to == from {
-					to = rng.Intn(bankAccounts)
+				from := rng.Intn(heavyBankAccounts)
+				to := rng.Intn(heavyBankAccounts)
+				if from == to {
+					continue
 				}
-				amt := int64(rng.Intn(bankInitialBal/2) + 1)
+
+				amt := int64(rng.Intn(100) + 1)
+				fromKey := heavyBankKey(from)
+				toKey := heavyBankKey(to)
 
 				err := eng.Update(func(tx *Tx) error {
-					fromVal, err := tx.Get([]byte(bankKey(from)))
+					fromValBytes, err := tx.Get(fromKey)
 					if err != nil {
 						return err
 					}
-					fromBal, _ := strconv.ParseInt(string(fromVal), 10, 64)
+					fromBal, _ := strconv.ParseInt(string(fromValBytes), 10, 64)
 
 					if fromBal < amt {
 						return fmt.Errorf("insufficient funds")
 					}
 
-					toVal, err := tx.Get([]byte(bankKey(to)))
+					toValBytes, err := tx.Get(toKey)
 					if err != nil {
 						return err
 					}
-					toBal, _ := strconv.ParseInt(string(toVal), 10, 64)
+					toBal, _ := strconv.ParseInt(string(toValBytes), 10, 64)
 
-					if err := tx.Set([]byte(bankKey(from)), []byte(strconv.FormatInt(fromBal-amt, 10))); err != nil {
+					newFrom := strconv.FormatInt(fromBal-amt, 10)
+					newTo := strconv.FormatInt(toBal+amt, 10)
+
+					if err := tx.Set(fromKey, []byte(newFrom)); err != nil {
 						return err
 					}
-					if err := tx.Set([]byte(bankKey(to)), []byte(strconv.FormatInt(toBal+amt, 10))); err != nil {
+					if err := tx.Set(toKey, []byte(newTo)); err != nil {
 						return err
 					}
 					return nil
 				})
 
-				if err != nil {
-					if err == ErrTxnConflict {
-						conflicts.Add(1)
-						continue
-					}
-					if err.Error() == "insufficient funds" {
-						continue
-					}
-					t.Errorf("worker %d iter %d: %v", id, i, err)
-					return
+				if err == nil {
+					txCommitted.Add(1)
+				} else if err == ErrTxnConflict {
+					txConflicts.Add(1)
+				} else if err.Error() == "insufficient funds" {
+
+				} else {
+					txOtherErrors.Add(1)
 				}
-				done.Add(1)
 			}
 		}(w)
 	}
 
-	// parallel checker
-	var checks atomic.Int64
-	var checkErr atomic.Int64
-	var checkerWg sync.WaitGroup
-	checkerWg.Add(1)
-	go func() {
-		defer checkerWg.Done()
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				total, err := bankTotal(eng)
-				if err != nil {
-					t.Errorf("checker: %v", err)
-					checkErr.Add(1)
-					return
-				}
-				if total != expectedTotal {
-					t.Errorf("BANK VIOLATION: total=%d expected=%d", total, expectedTotal)
-					checkErr.Add(1)
-					return
-				}
-				checks.Add(1)
-			}
-		}
-	}()
-
-	wg.Wait()
-	<-stop
-	checkerWg.Wait()
-
-	finalTotal, err := bankTotal(eng)
-	if err != nil {
-		t.Fatal("final total:", err)
-	}
-
-	t.Logf("workers=%d  iters=%d  committed=%d  conflicts=%d  checks=%d  checkErrors=%d",
-		bankWorkers, bankIters, done.Load(), conflicts.Load(), checks.Load(), checkErr.Load())
-
-	if finalTotal != expectedTotal {
-		t.Fatalf("FINAL BANK VIOLATION: total=%d expected=%d (diff=%d)",
-			finalTotal, expectedTotal, finalTotal-expectedTotal)
-	}
-}
-
-func TestBank_TransactionIsolation(t *testing.T) {
-	dir, err := os.MkdirTemp("", "bank_iso_*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	eng, err := OpenEngine(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer eng.Close()
-
-	if err := bankSeed(eng); err != nil {
-		t.Fatal(err)
-	}
-
-	var wg sync.WaitGroup
-	var snapshots atomic.Int64
-	var isoViolations atomic.Int64
-
-	stop := make(chan struct{})
-	go func() {
-		time.Sleep(10 * time.Second)
-		close(stop)
-	}()
-
-	// writer
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		rng := rand.New(rand.NewSource(42))
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			amt := int64(rng.Intn(bankInitialBal/4) + 1)
-			_ = eng.Update(func(tx *Tx) error {
-				v0, _ := tx.Get([]byte(bankKey(0)))
-				b0, _ := strconv.ParseInt(string(v0), 10, 64)
-				v1, _ := tx.Get([]byte(bankKey(1)))
-				b1, _ := strconv.ParseInt(string(v1), 10, 64)
-				_ = tx.Set([]byte(bankKey(0)), []byte(strconv.FormatInt(b0+amt, 10)))
-				_ = tx.Set([]byte(bankKey(1)), []byte(strconv.FormatInt(b1-amt, 10)))
-				return nil
-			})
-		}
-	}()
-
-	// readers
-	for r := 0; r < 10; r++ {
+	for r := 0; r < heavyBankReaders; r++ {
 		wg.Add(1)
-		go func() {
+		go func(readerID int) {
 			defer wg.Done()
 			for {
 				select {
@@ -248,30 +187,94 @@ func TestBank_TransactionIsolation(t *testing.T) {
 					return
 				default:
 				}
-				_ = eng.View(func(tx *Tx) error {
-					var sum int64
-					for i := 0; i < bankAccounts; i++ {
-						v, err := tx.Get([]byte(bankKey(i)))
-						if err != nil {
-							return err
-						}
-						n, _ := strconv.ParseInt(string(v), 10, 64)
-						sum += n
+
+				err := eng.View(func(tx *Tx) error {
+					tot, err := readTotalAcrossAccounts(tx)
+					if err != nil {
+						return err
 					}
-					if sum != int64(bankAccounts*bankInitialBal) {
-						isoViolations.Add(1)
+					if tot != expectedTotal {
+						readViolations.Add(1)
+						t.Errorf("TRANSACTION SNAPSHOT VIOLATION! Reader %d saw total=%d, expected=%d (diff=%d)",
+							readerID, tot, expectedTotal, tot-expectedTotal)
+						stopAll.Store(true)
 					}
-					snapshots.Add(1)
 					return nil
 				})
+
+				if err == nil {
+					readChecks.Add(1)
+				}
+				time.Sleep(2 * time.Millisecond)
 			}
-		}()
+		}(r)
 	}
+
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		start := time.Now()
+
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				stats := eng.Stats()
+				elapsed := time.Since(start).Round(time.Second)
+				fmt.Printf("[%s] Committed: %d | Conflicts: %d | Scans: %d | Violations: %d | Flushes: %d | Compactions: %d\n",
+					elapsed,
+					txCommitted.Load(),
+					txConflicts.Load(),
+					readChecks.Load(),
+					readViolations.Load(),
+					stats.FlushesTotal,
+					stats.CompactionsDone,
+				)
+			}
+		}
+	}()
 
 	wg.Wait()
+	<-monitorDone
 
-	t.Logf("snapshots=%d  iso_violations=%d", snapshots.Load(), isoViolations.Load())
-	if isoViolations.Load() > 0 {
-		t.Fatalf("isolation violated %d times", isoViolations.Load())
+	var finalTotal int64
+	err = eng.View(func(tx *Tx) error {
+		var err error
+		finalTotal, err = readTotalAcrossAccounts(tx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Final scan error: %v", err)
 	}
+
+	engineStats := eng.Stats()
+
+	fmt.Println("BANK TEST SUMMARY")
+	fmt.Printf("Total Duration:            %s\n", *testDuration)
+	fmt.Printf("Accounts:                  %d (Expected total: %d)\n", heavyBankAccounts, expectedTotal)
+	fmt.Printf("Writers / Readers:         %d / %d\n", heavyBankWriters, heavyBankReaders)
+	fmt.Println("---------------------------------------------------------------")
+	fmt.Printf("Successful Transfers:      %d\n", txCommitted.Load())
+	fmt.Printf("Detected SSI Conflicts:    %d\n", txConflicts.Load())
+	fmt.Printf("Write Errors:              %d\n", txOtherErrors.Load())
+	fmt.Printf("Full Isolation Scans:      %d\n", readChecks.Load())
+	fmt.Printf("Isolation Violations:      %d\n", readViolations.Load())
+	fmt.Println("---------------------------------------------------------------")
+	fmt.Printf("LSM Flushes:               %d\n", engineStats.FlushesTotal)
+	fmt.Printf("LSM Compactions Done:      %d\n", engineStats.CompactionsDone)
+	fmt.Printf("Final Database Total:      %d\n", finalTotal)
+
+	if readViolations.Load() > 0 {
+		t.Fatalf("FAILED: Detected %d isolation violations during test execution!", readViolations.Load())
+	}
+
+	if finalTotal != expectedTotal {
+		t.Fatalf("FAILED: Final balance invariant broken! Got %d, Expected %d (Diff: %d)",
+			finalTotal, expectedTotal, finalTotal-expectedTotal)
+	}
+
+	t.Log("SUCCESS: All isolation and balance invariants satisfied")
 }

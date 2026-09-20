@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,6 +80,7 @@ type replicaConn struct {
 	closeOnce sync.Once
 	lastPing  time.Time
 	sendCh    chan replEntry
+	snapshotActive atomic.Bool // true while the initial snapshot is streaming
 }
 
 // stopReplica safely closes stopCh exactly once, preventing double-close panics.
@@ -99,7 +101,7 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 
 	rc := &replicaConn{
 		conn:    cl.conn,
-		w:       cl.writer,
+		w:       cl.writer.w,
 		addr:    addr,
 		running: true,
 		stopCh:  make(chan struct{}),
@@ -119,16 +121,14 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 		slog.Info("replica disconnected", "addr", addr)
 	}()
 
-	// send full snapshot to the replica before streaming WAL
-	// During snapshot, incoming writes are buffered in backlog so the
-	// replica is not force-disconnected when sendCh fills up.
+	rc.snapshotActive.Store(true)
 	sendsnapshot := func() error {
-	if _, err := rc.w.Write([]byte{opSnapshotStart}); err != nil {
-		return err
-	}
-	if err := rc.w.Flush(); err != nil {
-		return err
-	}
+		if _, err := rc.w.Write([]byte{opSnapshotStart}); err != nil {
+			return err
+		}
+		if err := rc.w.Flush(); err != nil {
+			return err
+		}
 
 		// stream entries one at a time — constant memory usage
 		count, err := s.db.StreamSnapshot(func(op byte, key, val []byte, expiresAt int64) error {
@@ -139,10 +139,10 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 		}
 		_ = count
 
-	if _, err := rc.w.Write([]byte{opSnapshotEnd}); err != nil {
-		return err
-	}
-	return rc.w.Flush()
+		if _, err := rc.w.Write([]byte{opSnapshotEnd}); err != nil {
+			return err
+		}
+		return rc.w.Flush()
 	}
 
 	err := sendsnapshot()
@@ -150,6 +150,7 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 		slog.Error("snapshot send failed", "addr", addr, "err", err)
 		return
 	}
+	rc.snapshotActive.Store(false)
 	slog.Info("snapshot sent", "addr", addr)
 
 	// drain goroutine: reads entries from sendCh and writes to the replica
@@ -185,10 +186,12 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 		cl.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		_, err := r.Read(buf)
 		if err != nil {
-			if err == io.EOF || isTimeout(err) {
+			if isTimeout(err) {
 				continue
 			}
-			slog.Error("replica read failed", "addr", addr, "err", err)
+			if err != io.EOF {
+				slog.Error("replica read failed", "addr", addr, "err", err)
+			}
 			return
 		}
 	}
@@ -223,10 +226,25 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 	s.replicasMu.RUnlock()
 
 	for _, rc := range targets {
-		// During snapshot streaming, buffer to backlog instead of force-disconnecting
+		// While the initial snapshot streams, entries go to the backlog instead
+		// of force-disconnecting a slow replica — otherwise it could never
+		// finish syncing. After the snapshot, a full backlog means the replica
+		// cannot keep up: drop it so it reconnects with a fresh SYNC rather
+		// than silently missing entries.
 		select {
 		case rc.sendCh <- entry:
 		default:
+			if rc.snapshotActive.Load() {
+				s.replBacklog.Push(entry)
+				continue
+			}
+			rc.mu.Lock()
+			rc.running = false
+			rc.mu.Unlock()
+			rc.stopReplica()
+			if rc.conn != nil {
+				_ = rc.conn.Close()
+			}
 			s.replBacklog.Push(entry)
 		}
 	}

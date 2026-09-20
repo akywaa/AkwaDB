@@ -144,7 +144,7 @@ type txWriteEntry struct {
 
 type client struct {
 	conn   net.Conn
-	writer *bufio.Writer
+	writer *respWriter
 	sendCh chan []byte
 	subs   map[string]struct{}
 	mu     sync.Mutex
@@ -161,10 +161,39 @@ type client struct {
 func newClient(conn net.Conn) *client {
 	return &client{
 		conn:   conn,
-		writer: bufio.NewWriterSize(conn, 16*1024),
+		writer: newRespWriter(bufio.NewWriterSize(conn, 16*1024)),
 		sendCh: make(chan []byte, 128),
 		subs:   make(map[string]struct{}),
 	}
+}
+
+// respWriter wraps a bufio.Writer with a mutex because it is written to
+// concurrently by the connection goroutine and the pub/sub pump goroutine.
+type respWriter struct {
+	mu  sync.Mutex
+	w   *bufio.Writer
+}
+
+func newRespWriter(w *bufio.Writer) *respWriter {
+	return &respWriter{w: w}
+}
+
+func (rw *respWriter) Write(p []byte) (int, error) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.w.Write(p)
+}
+
+func (rw *respWriter) WriteString(s string) (int, error) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.w.WriteString(s)
+}
+
+func (rw *respWriter) Flush() error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.w.Flush()
 }
 
 type pubsubHub struct {
@@ -619,18 +648,19 @@ func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 	cl.inTx = false
 	queue := cl.txQueue
 	cl.txQueue = nil
-	savedReadSet := cl.txReadSet
 	savedReadTs := cl.txReadTs
 	savedWriter := cl.writer
 
 	var buf bytes.Buffer
-	cl.writer = bufio.NewWriter(&buf)
+	cl.writer = newRespWriter(bufio.NewWriter(&buf))
 	// Execute queued commands. Use execReadTs so handlers can perform
 	// snapshot reads at the transaction's read timestamp.
 	savedExecReadTs := cl.execReadTs
 	cl.execReadTs = savedReadTs
-	savedTxWrites := cl.txWrites
-	cl.txWrites = nil
+	defer func() {
+		cl.writer = savedWriter
+		cl.execReadTs = savedExecReadTs
+	}()
 	for _, q := range queue {
 		if handler, ok := srv.handlers[q.name]; ok {
 			_ = handler(srv, cl, q.args)
@@ -640,9 +670,6 @@ func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 	}
 	cl.writer.Flush()
 	cl.writer = savedWriter
-	cl.txWrites = savedTxWrites
-	cl.txReadSet = savedReadSet
-	cl.txReadTs = savedReadTs
 	cl.execReadTs = savedExecReadTs
 
 	if len(cl.txWrites) == 0 {
@@ -1359,7 +1386,7 @@ func (s *Server) cmdSetBit(srv *Server, cl *client, args []string) error {
 		srv.writeError(cl, "ERR bit must be 0 or 1")
 		return nil
 	}
-	old, err := srv.db.SetBit(args[0], offset, val)
+	old, err := srv.db.SetBit(strKey(args[0]), offset, val)
 	if err != nil {
 		srv.writeError(cl, err.Error())
 	} else {
@@ -1378,7 +1405,7 @@ func (s *Server) cmdGetBit(srv *Server, cl *client, args []string) error {
 		srv.writeError(cl, "ERR offset is not an integer")
 		return nil
 	}
-	bit, err := srv.db.GetBit(args[0], offset)
+	bit, err := srv.db.GetBit(strKey(args[0]), offset)
 	if err != nil {
 		srv.writeError(cl, err.Error())
 	} else {
@@ -1392,7 +1419,7 @@ func (s *Server) cmdBitCount(srv *Server, cl *client, args []string) error {
 		srv.writeError(cl, "ERR wrong number of arguments for 'bitcount' command")
 		return nil
 	}
-	n, err := srv.db.BitCount(args[0])
+	n, err := srv.db.BitCount(strKey(args[0]))
 	if err != nil {
 		srv.writeError(cl, err.Error())
 	} else {
