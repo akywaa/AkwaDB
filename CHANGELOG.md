@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.1] - 2026-09-20
+## [0.1.1] - 2026-09-20
 
 ### Fixed
 
@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MVCC Version Retention in Compaction**: Propagated `Version uint64` through the `Iterator` and `MergedIterator` abstractions into `drainMergedIterator`. Prevented historical version numbers from being dropped and reset to `0` during LSM compaction.
 - **Bank Isolation Test Stabilization**: Resolved the `account 0 not found: key not found` failure during `TestBank_HeavyChaos`, ensuring reliable snapshot reads across high-frequency MemTable flushes and L0 compactions.
 
-## [1.0.2] - 2026-09-20
+## [0.1.2] - 2026-09-20
 
 ### Fixed
 
@@ -27,3 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Explicit Version Deletions in MemTable**: Introduced `SkipList.DeleteVersion` to guarantee delete tombstones in batch transactions preserve their explicit `commitTs`.
 - **Bank Chaos Balance Invariant**: Fully eliminated snapshot isolation violations in `TestBank_HeavyChaos`, ensuring mathematical balance conservation and accurate SSI conflict detection under high contention.
 - **Result in bank_test.go**: Before these corrections, the final balance went from 100,000 to 100,578. After these corrections, the bug disappeared, and the final balance will now be exactly 100,000.
+
+## [0.1.3] - 2026-09-21
+
+### Fixed
+
+- **Linux `io_uring` SQE Struct Alignment**: Removed redundant padding in `ioSqe` to ensure the structure strictly complies with the 64-byte Linux kernel ABI, eliminating memory offset shifts and invalid system calls under native async I/O.
+- **RESP `MULTI`/`EXEC` Protocol Compliance**: Corrected command replay inside `cmdExec` so that executed batch operations return their actual responses (e.g., `+OK`) instead of `+QUEUED`. Added standard null-array responses (`*-1`) when transactions abort due to SSI conflicts.
+- **Raft State Machine Durability**: Removed the lossy `select/default` drop in `sendCommittedEntries()`, ensuring committed Raft entries cannot be discarded when `applyCh` is under high load.
+- **L0 Backpressure Synchronization**: Relocated `l0Cond.Broadcast()` from `executeFlush` into `removeFromLevel(0)`. Writers throttled by L0 capacity now wake up strictly after L0 compaction completes, preventing premature lock contention and uncontrolled MemTable memory growth.
+- **Compaction Metrics Accounting**: Added missing `incCompaction()` telemetry calls into `compactLevel0` and `compactLevel`, ensuring `/metrics` and `INFO` accurately reflect background compaction activity.
+- **Merged Iterator Version Resolution**: Refined key deduplication in `iterator/iterator.go` to guarantee that duplicate entries originating from the same iterator preserve the entry with the highest MVCC version.
+- **SSTable Restart Binary Search**: Updated search bound comparison to `cmp <= 0` in `scanBlockForKeyBinary` and `scanBlockForKeyVersionBinary`, enabling immediate exact-offset hits on restart points without redundant linear scan rollbacks.
+- **Bank Chaos Test Diagnostics**: Added dedicated `[READER ERR]` logging in `bank_test.go` to capture detailed failure context during snapshot isolation stress tests.
+
+### Changed
+
+- **MemTable Flush Deduplication**: Switched `executeFlush` to traverse records via `All()` instead of `AllVersions()`, collapsing intermediate in-memory overwrites prior to writing SSTables to drastically reduce disk write amplification.
+- **Memory Arena Recycling**: Enabled explicit recycling of slab buffers into `byteSlabPool` upon SkipList teardown to eliminate unnecessary heap allocation churn.

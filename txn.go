@@ -143,10 +143,8 @@ func (tx *Tx) commit() error {
 	}
 
 	tx.db.oracle.CommitLock()
-	defer tx.db.oracle.CommitUnlock()
-
-	// SSI validation and commitTs allocation via Oracle
 	commitTs, err := tx.db.oracle.CheckAndCommit(tx.readTs, tx.readSet, tx.writes)
+	tx.db.oracle.CommitUnlock()
 	if err != nil {
 		return err
 	}

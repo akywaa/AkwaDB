@@ -260,8 +260,8 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 
 	var minKey, maxKey []byte
 	if len(entries) > 0 {
-		minKey = entries[0].Key
-		maxKey = entries[len(entries)-1].Key
+		minKey = append([]byte(nil), entries[0].Key...)
+		maxKey = append([]byte(nil), entries[len(entries)-1].Key...)
 	}
 	// Write minKey/maxKey before the 24-byte footer so Open can read
 	// the footer from the very end of the file.
@@ -668,7 +668,7 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) < 0 {
+		if bytes.Compare(curKey, targetKey) <= 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {
@@ -774,7 +774,7 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) < 0 {
+		if bytes.Compare(curKey, targetKey) <= 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {

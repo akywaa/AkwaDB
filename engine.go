@@ -755,7 +755,6 @@ func (e *Engine) flushWorker() {
 }
 
 func (e *Engine) executeFlush(task flushTask) {
-	// Use AllVersions to preserve MVCC history for active transactions.
 	allVersions := task.memTable.AllVersions()
 	if len(allVersions) == 0 {
 		if task.oldWal != nil {
@@ -763,6 +762,7 @@ func (e *Engine) executeFlush(task flushTask) {
 			_ = os.Remove(task.oldWalPath)
 		}
 		e.immMemTable.Store(nil)
+		task.memTable.ReleaseArena()
 		e.memTableMu.Lock()
 		e.l0Cond.Broadcast()
 		e.memTableMu.Unlock()
@@ -770,7 +770,6 @@ func (e *Engine) executeFlush(task flushTask) {
 	}
 
 	sstName := filepath.Join(e.dataDir, fmt.Sprintf("%06d.sst", task.seq))
-	// Convert VersionEntry to memtable.Entry for SSTable creation.
 	entries := make([]memtable.Entry, len(allVersions))
 	for i, ve := range allVersions {
 		entries[i] = memtable.Entry{
@@ -792,9 +791,7 @@ func (e *Engine) executeFlush(task flushTask) {
 	e.levels[0] = append(e.levels[0], sst)
 	e.levelMu[0].Unlock()
 	e.immMemTable.Store(nil)
-	e.memTableMu.Lock()
-	e.l0Cond.Broadcast()
-	e.memTableMu.Unlock()
+	task.memTable.ReleaseArena()
 
 	// record in manifest
 	e.appendManifest('A', 0, task.seq, sst.MinKey(), sst.MaxKey())
@@ -1437,12 +1434,6 @@ func (e *Engine) compactLevel0() error {
 	copy(toCompactL0, e.levels[0])
 	e.levelMu[0].Unlock()
 
-	defer func() {
-		e.memTableMu.Lock()
-		e.l0Cond.Broadcast()
-		e.memTableMu.Unlock()
-	}()
-
 	baseLevel := e.findBaseLevel()
 
 	// find overlapping tables in baseLevel
@@ -1519,6 +1510,8 @@ func (e *Engine) compactLevel0() error {
 	for _, s := range newTables {
 		e.appendManifest('A', baseLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
 	}
+
+	e.metrics.incCompaction()
 
 	return nil
 }
@@ -1650,7 +1643,8 @@ func (e *Engine) compactLevel(fromLevel int) error {
 		e.appendManifest('A', toLevel, sstSeqNum(s), s.MinKey(), s.MaxKey())
 	}
 
-	return nil
+	e.metrics.incCompaction()
+	return nil
 }
 
 func (e *Engine) compactLevels() error {
@@ -1777,6 +1771,11 @@ func (e *Engine) removeFromLevel(lvl int, remove []*sstable.SSTable) {
 	}
 	e.levels[lvl] = remaining
 	e.levelMu[lvl].Unlock()
+	if lvl == 0 {
+		e.memTableMu.Lock()
+		e.l0Cond.Broadcast()
+		e.memTableMu.Unlock()
+	}
 }
 
 func (e *Engine) keyMayExistBelow(targetLevel int, key []byte) bool {
