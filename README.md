@@ -1,6 +1,6 @@
 # AkwaDB
 
-[![Go Version](https://img.shields.io/badge/go-1.24%2B-007d9c?style=flat-square&logo=go&logoColor=white)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.26.5-007d9c?style=flat-square&logo=go&logoColor=white)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Protocol](https://img.shields.io/badge/protocol-RESP%20(Redis)-d82c20?style=flat-square&logo=redis&logoColor=white)](https://redis.io)
 [![I/O Engine](https://img.shields.io/badge/async_I%2FO-Linux_io__uring-333333?style=flat-square&logo=linux&logoColor=white)](https://kernel.org)
@@ -179,7 +179,7 @@ AkwaDB translates standard Redis commands directly into indexed LSM-tree lookups
 ## Getting Started
 
 ### Prerequisites
-* Go 1.22 or higher (Go 1.24+ recommended for memory pinning optimizations)
+* Go 1.24 or higher (Go 1.24+ required for `runtime.Pinner` support)
 * Linux kernel 5.10+ recommended for `io_uring` support (Transparent fallback available for POSIX and Windows)
 
 ### Build and Run
@@ -189,11 +189,13 @@ AkwaDB translates standard Redis commands directly into indexed LSM-tree lookups
 git clone https://github.com/akywaa/akwadb.git
 cd akwadb
 
-# Compile the static binary
+# Linux / macOS
 make build
-
-# Start the server daemon
 ./bin/akwadb -addr :6379 -data-dir ./akwadata -memtable-mb 16
+
+# Windows (PowerShell)
+go build -ldflags="-s -w" -o bin/akwadb.exe ./cmd/akwadb
+.\bin\akwadb.exe -addr :6379 -data-dir .\akwadata
 ```
 
 Interact via standard CLI:
@@ -280,7 +282,7 @@ Run verification suites:
 make test
 
 # Execute heavy transaction isolation chaos suite (3-minute run)
-go test -v -run TestBank_HeavyChaos -duration=3m ./test/chaos/...
+go test -v -timeout 10m ./test/chaos/... -duration=3m
 ```
 
 ---
@@ -297,7 +299,6 @@ password: ""                  # Optional AUTH password
 memtable_mb: 16               # Active SkipList memory threshold prior to flush
 compaction_threshold: 4       # Number of L0 tables triggering background compaction
 block_cache_size: 4096        # SSTable uncompressed block cache count
-value_threshold: 128          # Minimum byte size for VLog separation
 max_disk_bytes: 107374182400  # 100 GB volume limit before auto-eviction triggers
 repl_backlog_size: 50000      # Ring-buffer entry capacity for PSYNC catch-up
 ```

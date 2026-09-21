@@ -78,3 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Write Request Channel Deadlock**: Decoupled background internal tasks (VLog GC rewrites, internal flushes) from the public `writeReq` queue, preventing deadlock freezes under heavy client backpressure.
 - **Cross-Platform Directory Syncing**: Extracted `syncDir` into OS-specific implementations via build tags (`!windows` and `windows`), fixing unhandled `f.Sync()` filesystem errors on Windows directory handles.
 - **LRU Small-Capacity Dispersion**: Adjusted shard partitioning in `LRUCache` to scale dynamically for small capacities, preventing under-allocation and premature per-shard evictions under non-uniform key distributions.
+
+## [0.1.6] - 2026-09-21
+
+### Fixed
+
+- **SSI / MVCC Multi-Version Invariant & Block Scan Ordering**: Resolved a severe race condition during concurrent transactions and flushes by enforcing strict `(Key ASC, Version DESC)` ordering in `SkipList.AllVersions()`. SSTable block scanners (`scanBlockForKeyBinary` / `scanBlockForKeyVersionBinary`) now deterministically observe the latest commit version first, completely eliminating stale-version resurfacing and phantom reads in the bank isolation chaos suite.
+- **Atomic Batch Commit Visibility**: Synchronized `Oracle.MarkApplied(r.seq)` progression in `Engine.writer()` to execute strictly after all keys of a transactional batch are fully applied to the active MemTable, preventing concurrent readers from observing partially committed multi-key states.
+- **Compaction Watermark Fluctuation**: Prevented premature deduplication and purge of historical MVCC versions in `drainMergedIterator` when active readers momentarily drop to zero, ensuring historical versions remain accessible to newly arriving snapshot transactions.
+- **LSM Shadow Leak on MemTable TTL Expiration**: Fixed an issue where expired keys in active or immutable MemTables returned `found = false`, causing engine point lookups (`getByString` / `GetByVersion`) to fall through to lower SSTable levels and resurrect outdated data. Expired MemTable records now correctly return tombstones (`found = true, deleted = true`) to properly mask underlying LSM levels.
+- **Raft Commit Quorum Split-Brain**: Fixed commit quorum evaluation in `maybeAdvanceCommitLocked`. Commit criteria now evaluate majorities against the full cluster size (`(len(Peers) + 1) / 2 + 1`) instead of `len(Peers) / 2`, preventing split-brain commits in two-node and even-sized cluster partitions.
+- **Direct Incr Concurrency Synchronization**: Guarded `processIncr` against read-skew anomalies during concurrent compactions by tying counter evaluations to deterministic snapshot sequence reads.
+
+### Changed
+
+- **Cursor-Based Zero-Allocation SkipList Iterator**: Replaced full slice-copy snapshots (`s.All()`) inside `SkipList.NewIterator()` with a lazy, lock-free cursor iterating directly over level-0 forward pointers (`fwd[0]`). This completely eliminates $O(N)$ heap allocations and GC pause spikes on collection and prefix operations (`SADD`, `HGETALL`, `SMEMBERS`, `SCAN`).
+- **Memory Arena Safety**: Hardened `byteSlab` lifecycle management to prevent use-after-free and buffer race conditions when slabs are recycled under active read iterators.
