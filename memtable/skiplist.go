@@ -164,20 +164,6 @@ insert:
 			}
 			update[i] = curr
 		}
-		// insert after any existing versions of the same key so that level 0
-		// order for duplicates is deterministic (newer version follows older)
-		for i := curLevel - 1; i >= 0; i-- {
-			tail := update[i]
-			next := loadForward(tail, i)
-			for next != nil && bytes.Equal(next.key, key) {
-				tail = next
-				next = loadForward(tail, i)
-			}
-			if tail != update[i] {
-				update[i] = tail
-			}
-		}
-
 		lvl := s.randomLevel()
 		if lvl > curLevel {
 			for i := curLevel; i < lvl; i++ {
@@ -259,20 +245,6 @@ insert:
 			}
 			update[i] = curr
 		}
-		// insert the tombstone after existing versions of the same key so the
-		// newest version (the delete) sorts last at level 0
-		for i := curLevel - 1; i >= 0; i-- {
-			tail := update[i]
-			next := loadForward(tail, i)
-			for next != nil && bytes.Equal(next.key, key) {
-				tail = next
-				next = loadForward(tail, i)
-			}
-			if tail != update[i] {
-				update[i] = tail
-			}
-		}
-
 		lvl := s.randomLevel()
 		if lvl > curLevel {
 			for i := curLevel; i < lvl; i++ {

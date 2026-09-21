@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/akywaa/akwadb/cache"
+	"github.com/akywaa/akwadb/internal/dirlock"
+	"github.com/akywaa/akwadb/internal/encoding"
 	"github.com/akywaa/akwadb/iterator"
 	"github.com/akywaa/akwadb/memtable"
 	"github.com/akywaa/akwadb/server"
@@ -125,11 +127,13 @@ func (e *Engine) resolveValue(raw []byte) ([]byte, error) {
 	}
 
 	e.vlogMu.RLock()
-	return e.vl.ReadValue(vlog.ValuePointer{
+	val, err := e.vl.ReadValue(vlog.ValuePointer{
 		Fid:    vp.Fid,
 		Offset: vp.Offset,
 		Size:   vp.Size,
 	})
+	e.vlogMu.RUnlock()
+	return val, err
 }
 
 func (e *Engine) addDiscard(valBytes []byte) {
@@ -280,7 +284,7 @@ type Engine struct {
 	gcDiscardTs uint64 // max version at start of GC; tombstones above this are preserved
 
 	oracle *Oracle
-	lock   *dirLock
+	lock   *dirlock.DirLock
 
 	writeReq chan *writeReq
 
@@ -386,6 +390,10 @@ func (e *Engine) writer() {
 			e.levelMu[0].RLock()
 			for len(e.levels[0]) >= l0BackpressureThreshold && e.ctx.Err() == nil {
 				e.levelMu[0].RUnlock()
+				select {
+				case e.compactChan <- struct{}{}:
+				default:
+				}
 				e.l0Cond.Wait()
 				e.levelMu[0].RLock()
 			}
@@ -415,15 +423,15 @@ func (e *Engine) writer() {
 				}
 
 				if r.op == opClear {
-					r.errCh <- incrResult{err: e.clearInternal()}
+					err := e.clearInternal()
+					e.oracle.MarkApplied(r.seq)
+					r.errCh <- incrResult{err: err}
 					continue
 				}
 
 				if r.op == opIncr {
 					res := e.processIncr(r, mt)
-					if res.err == nil {
-						e.oracle.SetAppliedTs(r.seq)
-					}
+					e.oracle.MarkApplied(r.seq)
 					r.errCh <- res
 					continue
 				}
@@ -446,6 +454,7 @@ func (e *Engine) writer() {
 							}
 						}
 					}
+					e.oracle.MarkApplied(r.seq)
 					r.errCh <- incrResult{}
 					continue
 				}
@@ -511,22 +520,20 @@ func (e *Engine) writer() {
 								mt.PutVersion(res.kBytes, encodeInlineValue(res.vBytes), res.expAt, r.seq)
 							}
 						}
-						e.oracle.SetAppliedTs(r.seq)
 					}
+					e.oracle.MarkApplied(r.seq)
 					r.errCh <- incrResult{err: batchErr}
 					continue
 				}
 
 				if r.op == wal.OpPut || r.op == wal.OpDelete {
 					err := e.applyEntry(r.op, r.key, r.val, r.expiresAt, r.seq)
-					if err == nil {
-						e.oracle.SetAppliedTs(r.seq)
-					}
+					e.oracle.MarkApplied(r.seq)
 					r.errCh <- incrResult{err: err}
 					continue
 				}
 
-				// unreachable: all op types handled above
+				e.oracle.MarkApplied(r.seq)
 				r.errCh <- incrResult{}
 			}
 
@@ -576,7 +583,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	lock, err := acquireDirLock(opts.DataDir)
+	lock, err := dirlock.AcquireDirLock(opts.DataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +769,6 @@ func (e *Engine) executeFlush(task flushTask) {
 			_ = os.Remove(task.oldWalPath)
 		}
 		e.immMemTable.Store(nil)
-		task.memTable.ReleaseArena()
 		e.memTableMu.Lock()
 		e.l0Cond.Broadcast()
 		e.memTableMu.Unlock()
@@ -791,7 +797,9 @@ func (e *Engine) executeFlush(task flushTask) {
 	e.levels[0] = append(e.levels[0], sst)
 	e.levelMu[0].Unlock()
 	e.immMemTable.Store(nil)
-	task.memTable.ReleaseArena()
+	e.memTableMu.Lock()
+	e.l0Cond.Broadcast()
+	e.memTableMu.Unlock()
 
 	// record in manifest
 	e.appendManifest('A', 0, task.seq, sst.MinKey(), sst.MaxKey())
@@ -1273,8 +1281,22 @@ func (e *Engine) compactionWorker() {
 	for {
 		select {
 		case <-e.compactChan:
-			if err := e.Compact(); err != nil {
-				slog.Error("compaction error", "err", err)
+			for {
+				if e.ctx.Err() != nil {
+					return
+				}
+				if err := e.Compact(); err != nil {
+					slog.Error("compaction error", "err", err)
+					break
+				}
+
+				e.levelMu[0].RLock()
+				needMore := len(e.levels[0]) >= e.opts.CompactionThreshold
+				e.levelMu[0].RUnlock()
+
+				if !needMore {
+					break
+				}
 			}
 		case <-e.ctx.Done():
 			return
@@ -1453,24 +1475,19 @@ func (e *Engine) compactLevel0() error {
 	}
 	e.levelMu[baseLevel].RUnlock()
 
-	var iters []iterator.Iterator
-	var priorities []int
-	for i, t := range overlapsBase {
+	var iters []iterator.VersionedIterator
+	for _, t := range overlapsBase {
 		it := t.NewIterator()
 		it.Seek([]byte(""))
 		iters = append(iters, it)
-		priorities = append(priorities, i)
 	}
-	basePrio := len(overlapsBase)
-	for i, t := range toCompactL0 {
+	for _, t := range toCompactL0 {
 		it := t.NewIterator()
 		it.Seek([]byte(""))
 		iters = append(iters, it)
-		priorities = append(priorities, basePrio+i)
 	}
 
-	merged := iterator.NewMergedIterator(iters, priorities)
-	consolidated := e.drainMergedIterator(merged, iters, baseLevel)
+	consolidated := e.drainMergedIterator(iters, baseLevel)
 
 	newTables := e.writeSSTablesAtLevel(consolidated, baseLevel)
 
@@ -1543,21 +1560,17 @@ func (e *Engine) compactLevel(fromLevel int) error {
 	e.levelMu[toLevel].RUnlock()
 
 	// parallel sub-compaction: split key range and merge in parallel
-	var iters []iterator.Iterator
-	var priorities []int
-	for i, t := range overlaps {
+	var iters []iterator.VersionedIterator
+	for _, t := range overlaps {
 		it := t.NewIterator()
 		it.Seek([]byte(""))
 		iters = append(iters, it)
-		priorities = append(priorities, i)
 	}
-	it := pick.NewIterator()
-	it.Seek([]byte(""))
-	iters = append(iters, it)
-	priorities = append(priorities, len(overlaps))
+	pickIt := pick.NewIterator()
+	pickIt.Seek([]byte(""))
+	iters = append(iters, pickIt)
 
-	merged := iterator.NewMergedIterator(iters, priorities)
-	consolidated := e.drainMergedIterator(merged, iters, toLevel)
+	consolidated := e.drainMergedIterator(iters, toLevel)
 
 	// split consolidated entries into subcompactionSplits chunks and write in parallel
 	eng := e
@@ -1658,56 +1671,88 @@ func (e *Engine) compactLevels() error {
 	return nil
 }
 
-func (e *Engine) drainMergedIterator(merged *iterator.MergedIterator, iters []iterator.Iterator, targetLevel int) []memtable.Entry {
+type compactionVersion struct {
+	key     []byte
+	value   []byte
+	version uint64
+	deleted bool
+	expAt   int64
+}
+
+func (e *Engine) drainMergedIterator(iters []iterator.VersionedIterator, targetLevel int) []memtable.Entry {
 	now := time.Now().Unix()
 	minReadTs := e.oracle.MinReadTs()
 	hasActiveTxns := minReadTs < atomic.LoadUint64(&e.oracle.nextTs)
 	isBottomLevel := targetLevel == MaxLevels-1
 	gcTs := atomic.LoadUint64(&e.gcDiscardTs)
+
+	merged := iterator.NewMergedVersionIterator(iters)
+	defer merged.Close()
+
 	var consolidated []memtable.Entry
 
 	for merged.Valid() {
-
-		if merged.Deleted() || (merged.ExpiresAt() > 0 && now >= merged.ExpiresAt()) {
-			canPurge := isBottomLevel && !hasActiveTxns && gcTs == 0 && !e.keyMayExistBelow(targetLevel, merged.Key())
-			if canPurge {
-				e.addDiscard(merged.Value())
-			} else {
-				k := make([]byte, len(merged.Key()))
-				copy(k, merged.Key())
-				v := make([]byte, len(merged.Value()))
-				copy(v, merged.Value())
-				consolidated = append(consolidated, memtable.Entry{
-					Key:       k,
-					Value:     v,
-					Deleted:   true,
-					ExpiresAt: merged.ExpiresAt(),
-					Version:   merged.Version(),
-				})
-			}
-		} else {
-			k := make([]byte, len(merged.Key()))
-			copy(k, merged.Key())
-			v := make([]byte, len(merged.Value()))
-			copy(v, merged.Value())
-			consolidated = append(consolidated, memtable.Entry{
-				Key:       k,
-				Value:     v,
-				ExpiresAt: merged.ExpiresAt(),
-				Version:   merged.Version(),
+		groupKey := merged.Entry().Key
+		var group []compactionVersion
+		for merged.Valid() && bytes.Equal(merged.Entry().Key, groupKey) {
+			entry := merged.Entry()
+			keyBytes := make([]byte, len(entry.Key))
+			copy(keyBytes, entry.Key)
+			valBytes := make([]byte, len(entry.Value))
+			copy(valBytes, entry.Value)
+			group = append(group, compactionVersion{
+				key:     keyBytes,
+				value:   valBytes,
+				version: entry.Version,
+				deleted: merged.Deleted(),
+				expAt:   merged.ExpiresAt(),
 			})
+			merged.Next()
 		}
-		merged.Next()
+
+		sort.Slice(group, func(i, j int) bool { return group[i].version > group[j].version })
+
+		kept := make([]compactionVersion, 0, len(group))
+		keptOlder := false
+		for _, g := range group {
+			if len(kept) > 0 && kept[len(kept)-1].version == g.version {
+				continue
+			}
+			if g.version > minReadTs {
+				kept = append(kept, g)
+				continue
+			}
+			if !keptOlder {
+				keptOlder = true
+				kept = append(kept, g)
+				continue
+			}
+			e.addDiscard(g.value)
+		}
+
+		if len(kept) == 1 {
+			head := kept[0]
+			dead := head.deleted || (head.expAt > 0 && now >= head.expAt)
+			if dead && isBottomLevel && !hasActiveTxns && gcTs == 0 && !e.keyMayExistBelow(targetLevel, head.key) {
+				e.addDiscard(head.value)
+				continue
+			}
+		}
+
+		for _, g := range kept {
+			entry := memtable.Entry{
+				Key:       g.key,
+				Value:     g.value,
+				ExpiresAt: g.expAt,
+				Version:   g.version,
+			}
+			if g.deleted || (g.expAt > 0 && now >= g.expAt) {
+				entry.Deleted = true
+			}
+			consolidated = append(consolidated, entry)
+		}
 	}
 
-	// Prune versions older than MinReadTs for non-active keys.
-	// The MergedIterator already deduplicates by key (keeping highest priority),
-	// so if the version is needed by an active transaction it will be preserved
-	// because hasActiveTxns is true. This is a safety net for edge cases.
-
-	for _, it := range iters {
-		_ = it.Close()
-	}
 	return consolidated
 }
 
@@ -2256,6 +2301,16 @@ func (e *Engine) BatchApply(entries []server.BatchWriteEntry) error {
 	return res.err
 }
 
+func (e *Engine) enqueueBatchWithVersion(entries []server.BatchWriteEntry, version uint64) chan incrResult {
+	req := &writeReq{
+		batch: entries,
+		seq:   version,
+		errCh: make(chan incrResult, 1),
+	}
+	e.writeReq <- req
+	return req.errCh
+}
+
 // BatchApplyWithVersion applies a batch of writes with an explicit commit version.
 func (e *Engine) BatchApplyWithVersion(entries []server.BatchWriteEntry, version uint64) error {
 	req := &writeReq{
@@ -2640,11 +2695,11 @@ func (e *Engine) SCard(key string) (int64, error) {
 
 func (e *Engine) ZAdd(key string, score float64, member string) (bool, error) {
 	// check if member already exists with a different score
-	oldVal, err := e.getByKey(zValKey(key, member))
+	oldVal, err := e.getByKey(encoding.ZValKey(key, member))
 	var oldScore float64
 	isNew := err != nil
 	if err == nil && len(oldVal) > 0 {
-		oldScore = decodeScore(oldVal)
+		oldScore = encoding.DecodeScore(oldVal)
 	}
 
 	var entries []server.BatchWriteEntry
@@ -2652,15 +2707,15 @@ func (e *Engine) ZAdd(key string, score float64, member string) (bool, error) {
 	// remove old score index if score changed
 	if !isNew && oldScore != score {
 		entries = append(entries, server.BatchWriteEntry{
-			Key:     string(zScoreKey(key, oldScore, member)),
+			Key:     string(encoding.ZScoreKey(key, oldScore, member)),
 			Deleted: true,
 		})
 	}
 
 	// write value key and new score index
 	entries = append(entries,
-		server.BatchWriteEntry{Key: string(zValKey(key, member)), Value: string(encodeScore(score))},
-		server.BatchWriteEntry{Key: string(zScoreKey(key, score, member)), Value: ""},
+		server.BatchWriteEntry{Key: string(encoding.ZValKey(key, member)), Value: string(encoding.EncodeScore(score))},
+		server.BatchWriteEntry{Key: string(encoding.ZScoreKey(key, score, member)), Value: ""},
 	)
 
 	if err := e.submitBatch(entries); err != nil {
@@ -2670,18 +2725,18 @@ func (e *Engine) ZAdd(key string, score float64, member string) (bool, error) {
 }
 
 func (e *Engine) ZScore(key, member string) (float64, bool, error) {
-	val, err := e.getByKey(zValKey(key, member))
+	val, err := e.getByKey(encoding.ZValKey(key, member))
 	if err != nil {
 		return 0, false, err
 	}
 	if len(val) != 8 {
 		return 0, false, nil
 	}
-	return decodeScore(val), true, nil
+	return encoding.DecodeScore(val), true, nil
 }
 
 func (e *Engine) ZRangeByScore(key string, min, max float64) ([]string, error) {
-	seekPrefix := zScorePrefix(key)
+	seekPrefix := encoding.ZScorePrefix(key)
 	merged, iters := e.buildMergedIterator(seekPrefix)
 	defer func() {
 		for _, it := range iters {
@@ -2696,7 +2751,7 @@ func (e *Engine) ZRangeByScore(key string, min, max float64) ([]string, error) {
 			break
 		}
 		rawScore := k[len(seekPrefix) : len(seekPrefix)+8]
-		score := decodeScore(rawScore)
+		score := encoding.DecodeScore(rawScore)
 		if score > max {
 			break
 		}
@@ -2713,19 +2768,19 @@ func (e *Engine) ZRem(key string, members ...string) (int64, error) {
 	var entries []server.BatchWriteEntry
 	var removed int64
 	for _, m := range members {
-		val, err := e.getByKey(zValKey(key, m))
+		val, err := e.getByKey(encoding.ZValKey(key, m))
 		if err != nil {
 			continue
 		}
 		if len(val) == 8 {
-			score := decodeScore(val)
+			score := encoding.DecodeScore(val)
 			entries = append(entries, server.BatchWriteEntry{
-				Key:     string(zScoreKey(key, score, m)),
+				Key:     string(encoding.ZScoreKey(key, score, m)),
 				Deleted: true,
 			})
 		}
 		entries = append(entries, server.BatchWriteEntry{
-			Key:     string(zValKey(key, m)),
+			Key:     string(encoding.ZValKey(key, m)),
 			Deleted: true,
 		})
 		removed++
@@ -2844,7 +2899,7 @@ func (e *Engine) Close() error {
 		_ = e.vlogDiscards.Save(filepath.Join(e.dataDir, "vlog"))
 	}
 	if e.lock != nil {
-		_ = e.lock.release()
+		_ = e.lock.Release()
 	}
 	return firstErr
 }

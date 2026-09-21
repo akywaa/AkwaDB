@@ -4,17 +4,20 @@ package uring
 
 import (
 	"fmt"
-	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
 )
 
 const (
-	IORING_OP_READ      = 22
-	IORING_SETUP_SQPOLL = 1
+	IORING_OP_READ         = 22
+	IORING_SETUP_SQPOLL    = 1
 	IORING_ENTER_GETEVENTS = 1
-	IORING_OFF_SQES    = 0x10000000
+	IORING_OFF_SQES        = 0x10000000
+
+	sysIouringSetup = 425
+	sysIouringEnter = 426
 )
 
 type ioUringParams struct {
@@ -91,7 +94,7 @@ type sqRing struct {
 	sqeMask *uint32
 	sqes   *ioSqe
 	sqeCount uint32
-	array  *uint32
+	array  []uint32
 }
 
 type cqRing struct {
@@ -109,7 +112,7 @@ func newAsyncReader(queueDepth int) (AsyncReader, error) {
 
 	params := &ioUringParams{}
 	ringFd, _, errno := syscall.Syscall6(
-		syscall.SYS_IO_URING_SETUP,
+		sysIouringSetup,
 		uintptr(queueDepth),
 		uintptr(unsafe.Pointer(params)),
 		0, 0, 0, 0,
@@ -152,7 +155,7 @@ func newAsyncReader(queueDepth int) (AsyncReader, error) {
 		mask:    (*uint32)(unsafe.Pointer(&r.sqMem[sqOff.ring_mask])),
 		sqeMask: (*uint32)(unsafe.Pointer(&r.sqMem[sqOff.ring_entries])),
 		sqes:    (*ioSqe)(unsafe.Pointer(&r.sqesMem[0])),
-		array:   (*uint32)(unsafe.Pointer(&r.sqMem[sqOff.array])),
+		array:   unsafe.Slice((*uint32)(unsafe.Pointer(&r.sqMem[sqOff.array])), params.sq_entries),
 	}
 	r.sqRing.sqeCount = params.sq_entries
 
@@ -202,6 +205,9 @@ func (r *linuxAsyncReader) ReadBlocks(fd int, offsets []int64, bufs [][]byte) er
 		return fmt.Errorf("reader closed")
 	}
 
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+
 	sqMask := *r.sqRing.mask
 	tail := *r.sqRing.tail
 
@@ -210,6 +216,7 @@ func (r *linuxAsyncReader) ReadBlocks(fd int, offsets []int64, bufs [][]byte) er
 		sqe := (*ioSqe)(unsafe.Pointer(uintptr(unsafe.Pointer(r.sqRing.sqes)) + uintptr(idx)*unsafe.Sizeof(ioSqe{})))
 		var bufPtr uint64
 		if len(bufs[i]) > 0 {
+			pinner.Pin(&bufs[i][0])
 			bufPtr = uint64(uintptr(unsafe.Pointer(&bufs[i][0])))
 		}
 		*sqe = ioSqe{
@@ -225,7 +232,7 @@ func (r *linuxAsyncReader) ReadBlocks(fd int, offsets []int64, bufs [][]byte) er
 
 	*r.sqRing.tail = tail + uint32(len(offsets))
 	syscall.Syscall6(
-		syscall.SYS_IO_URING_ENTER,
+		sysIouringEnter,
 		uintptr(r.fd),
 		uintptr(len(offsets)),
 		0,
@@ -250,8 +257,8 @@ func (r *linuxAsyncReader) ReadBlocks(fd int, offsets []int64, bufs [][]byte) er
 			head++
 		}
 		*r.cqRing.head = head
-		syscall.Syscall(
-			syscall.SYS_IO_URING_ENTER,
+		syscall.Syscall6(
+			sysIouringEnter,
 			uintptr(r.fd),
 			0, 0,
 			0x01,

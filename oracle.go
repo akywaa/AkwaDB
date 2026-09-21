@@ -68,6 +68,7 @@ type Oracle struct {
 	commitMu  sync.Mutex
 	nextTs    uint64
 	appliedTs uint64
+	awaiting  map[uint64]struct{}
 	history   []committedTxn
 	watermark *WaterMark
 }
@@ -76,8 +77,15 @@ func newOracle() *Oracle {
 	return &Oracle{
 		nextTs:    1,
 		appliedTs: 1,
+		awaiting:  make(map[uint64]struct{}),
 		watermark: newWaterMark(),
 	}
+}
+
+func (o *Oracle) assignTsLocked() uint64 {
+	o.nextTs++
+	o.awaiting[o.nextTs] = struct{}{}
+	return o.nextTs
 }
 
 func (o *Oracle) CommitLock()   { o.commitMu.Lock() }
@@ -97,15 +105,25 @@ func (o *Oracle) NewReadTs() uint64 {
 func (o *Oracle) NewCommitTs() uint64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.nextTs++
-	return o.nextTs
+	return o.assignTsLocked()
 }
 
-func (o *Oracle) SetAppliedTs(ts uint64) {
+func (o *Oracle) MarkApplied(ts uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if ts > o.appliedTs {
-		o.appliedTs = ts
+	if ts <= o.appliedTs {
+		return
+	}
+	delete(o.awaiting, ts)
+	for {
+		next := o.appliedTs + 1
+		if next > o.nextTs {
+			break
+		}
+		if _, pending := o.awaiting[next]; pending {
+			break
+		}
+		o.appliedTs = next
 	}
 }
 
@@ -178,8 +196,7 @@ func (o *Oracle) checkAndCommitInternal(readTs uint64, readFps map[uint64]struct
 		}
 	}
 
-	o.nextTs++
-	commitTs := o.nextTs
+	commitTs := o.assignTsLocked()
 
 	o.history = append(o.history, committedTxn{
 		commitTs: commitTs,

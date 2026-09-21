@@ -43,5 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **MemTable Flush Deduplication**: Switched `executeFlush` to traverse records via `All()` instead of `AllVersions()`, collapsing intermediate in-memory overwrites prior to writing SSTables to drastically reduce disk write amplification.
+- **MemTable Flush Version Retention**: `executeFlush` deliberately keeps traversing records via `AllVersions()` rather than `All()`. Flushing only the latest visible version would drop historical MVCC versions and delete tombstones from SSTables, breaking snapshot reads for long-running transactions.
 - **Memory Arena Recycling**: Enabled explicit recycling of slab buffers into `byteSlabPool` upon SkipList teardown to eliminate unnecessary heap allocation churn.
+
+## [0.1.4] - 2026-09-21
+
+### Fixed
+
+- **ValueLog RLock Leak Deadlock**: Fixed an unreleased `vlogMu.RLock()` in `Engine.resolveValue()`, eliminating engine freezes during concurrent VLog rotations and garbage collection routines.
+- **Compaction Lost Wakeup & Write Stall**: Resolved a 10–12 second write stall by ensuring `compactionWorker` loops until L0 table counts fall below `CompactionThreshold`, and proactively signaling background compaction when throttled by L0 backpressure.
+- **Linux `io_uring` Buffer Memory Pinning**: Pinned user-space block buffers via `runtime.Pinner` during `ReadBlocks` to prevent pointer invalidation under Go runtime garbage collection.
+- **Raft Wire Format Serialization**: Replaced JSON serialization with compact binary encoding (`encodeRaftCommand` / `decodeRaftCommand`) for replicated Raft log entries and state machine commands.
+
+### Changed
+
+- **Project Layout Modularization**: Reorganized internal utilities into dedicated internal packages:
+  - Extracted cross-platform directory locking into `internal/dirlock`.
+  - Moved IEEE 754 lexicographical score encoding into `internal/encoding`.
+- **Test Suite Restructuring**: Relocated integration, stress, and chaos tests out of the repository root into structured test suites (`test/chaos` and `test/stress`) using black-box testing conventions.
