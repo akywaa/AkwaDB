@@ -114,7 +114,7 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 	s.replicasMu.Unlock()
 
 	defer func() {
-		close(rc.sendCh)
+		rc.stopReplica()
 		s.replicasMu.Lock()
 		delete(s.replicas, addr)
 		s.replicasMu.Unlock()
@@ -151,22 +151,37 @@ func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 		return
 	}
 	rc.snapshotActive.Store(false)
-	slog.Info("snapshot sent", "addr", addr)
-
-	// drain goroutine: reads entries from sendCh and writes to the replica
+	slog.Info("snapshot sent", "addr", addr)	// drain goroutine: reads entries from sendCh and writes them to the replica,
+	// flushing once per burst instead of once per entry.
 	go func() {
-		for entry := range rc.sendCh {
-			rc.mu.Lock()
-			if !rc.running {
+		for {
+			select {
+			case <-rc.stopCh:
+				rc.mu.Lock()
+				_ = rc.w.Flush()
 				rc.mu.Unlock()
-				continue
-			}
-			err := writeReplicaEntry(rc.w, entry.op, entry.key, entry.val, entry.expiresAt)
-			rc.mu.Unlock()
-			if err != nil {
-				slog.Error("replica send failed, dropping", "addr", addr, "err", err)
-			rc.running = false
-			rc.stopReplica()
+				return
+			case entry := <-rc.sendCh:
+				rc.mu.Lock()
+				if !rc.running {
+					rc.mu.Unlock()
+					continue
+				}
+				err := writeReplicaEntry(rc.w, entry.op, entry.key, entry.val, entry.expiresAt)
+				if err == nil {
+					err = writeReplicaBurst(rc, 256)
+				}
+				if err == nil {
+					err = rc.w.Flush()
+				}
+				if err != nil {
+					rc.running = false
+				}
+				rc.mu.Unlock()
+				if err != nil {
+					slog.Error("replica send failed, dropping", "addr", addr, "err", err)
+					rc.stopReplica()
+				}
 			}
 		}
 	}()
@@ -274,7 +289,21 @@ func writeReplicaEntry(w *bufio.Writer, op byte, key, val []byte, expiresAt int6
 			return err
 		}
 	}
-	return w.Flush()
+	return nil
+}
+
+func writeReplicaBurst(rc *replicaConn, max int) error {
+	for i := 0; i < max; i++ {
+		select {
+		case entry := <-rc.sendCh:
+			if err := writeReplicaEntry(rc.w, entry.op, entry.key, entry.val, entry.expiresAt); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // --- Replica side ---

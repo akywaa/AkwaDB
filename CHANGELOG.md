@@ -61,3 +61,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Extracted cross-platform directory locking into `internal/dirlock`.
   - Moved IEEE 754 lexicographical score encoding into `internal/encoding`.
 - **Test Suite Restructuring**: Relocated integration, stress, and chaos tests out of the repository root into structured test suites (`test/chaos` and `test/stress`) using black-box testing conventions.
+
+## [0.1.5] - 2026-09-21
+
+### Added
+
+- **RocksDB-Style Write Throttling**: Implemented smooth dynamic write stalling when L0 table count exceeds threshold instead of abrupt hard waits, mitigating tail latency spikes (P99/P99.9) during heavy ingestion.
+- **Dynamic Compaction Scoring**: Introduced size-ratio compaction priority scoring (`compaction score = size(Ln) / target_size(Ln)`), scheduling compactions to levels with the highest overflow.
+- **Batched Replication Pipelining**: Added micro-batching and adaptive buffer flushing for the master-replica replication stream, significantly improving network throughput and replication bandwidth.
+- **Active TTL Key Eviction Sampling**: Implemented a background sampling loop that periodically inspects candidate keys with TTL and eagerly writes tombstones, reclaiming stale disk and memory space ahead of LSM compaction.
+
+### Fixed
+
+- **Transactional WAL Batch Atomicity**: Resolved partial-write anomalies on write pipeline errors by enforcing atomic batch framing/truncation in the WAL, preventing torn or orphaned batch records from being recovered on startup.
+- **Raft Slice Bounds Race Condition**: Eliminated a potential `runtime panic: index out of range` in `sendAppendEntries()` by strictly re-checking log bounds and performing log slicing under `n.mu` synchronization during concurrent log truncation.
+- **Write Request Channel Deadlock**: Decoupled background internal tasks (VLog GC rewrites, internal flushes) from the public `writeReq` queue, preventing deadlock freezes under heavy client backpressure.
+- **Cross-Platform Directory Syncing**: Extracted `syncDir` into OS-specific implementations via build tags (`!windows` and `windows`), fixing unhandled `f.Sync()` filesystem errors on Windows directory handles.
+- **LRU Small-Capacity Dispersion**: Adjusted shard partitioning in `LRUCache` to scale dynamically for small capacities, preventing under-allocation and premature per-shard evictions under non-uniform key distributions.

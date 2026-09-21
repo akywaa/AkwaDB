@@ -63,7 +63,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	opts := akwadb.DefaultOptions(dir)
-	opts.MemTableSize = 256 * 1024 // note - it crashed when set to 64 * 1024. find out later why this is happening and fix it.
+	opts.MemTableSize = 64 * 1024
 
 	opts.CompactionThreshold = 2
 	opts.BlockCacheSize = 2000
