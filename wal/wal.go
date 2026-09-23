@@ -10,6 +10,8 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"github.com/akywaa/akwadb/internal/crypto"
 )
 
 var ErrCorruptedRecord = errors.New("wal: record checksum mismatch or truncated entry")
@@ -26,6 +28,14 @@ const (
 // | Data: Key (KeyLen) ...                  | Data: Value (ValLen) ...                        |
 // +-----------------------------------------+--------------------------------------------------+
 const walHeaderSize = 29
+
+// Encrypted WAL files start with a plaintext header:
+// magic(4) + version(4) + keyID(8) + baseIV(16) = 32 bytes.
+const (
+	walFileMagic    uint32 = 0x57414C46 // "WALF"
+	walFileVersion  uint32 = 1
+	walEncHeaderSize       = 32
+)
 
 type Record struct {
 	Op          byte
@@ -55,6 +65,12 @@ type WAL struct {
 	headerBuf     [walHeaderSize]byte
 	writeQueue    chan writeTask // group commit queue, nil when syncOnWrite=false
 	currentOffset atomic.Int64
+
+	encrypted bool
+	keyID     uint64
+	baseIV    []byte
+	key       []byte
+	fileHdr   int64 // size of the encrypted file header (0 when plaintext)
 }
 
 func Open(path string) (*WAL, error) {
@@ -62,6 +78,12 @@ func Open(path string) (*WAL, error) {
 }
 
 func OpenWithOptions(path string, syncOnWrite bool) (*WAL, error) {
+	return OpenWithOptionsAndRegistry(path, syncOnWrite, nil)
+}
+
+// OpenWithOptionsAndRegistry opens a WAL, encrypting records with the given
+// registry when it is non-nil. Encrypted files carry a plaintext file header.
+func OpenWithOptionsAndRegistry(path string, syncOnWrite bool, reg *crypto.KeyRegistry) (*WAL, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("wal open %s: %w", path, err)
@@ -72,9 +94,65 @@ func OpenWithOptions(path string, syncOnWrite bool) (*WAL, error) {
 		writer:      bufio.NewWriterSize(f, 64*1024),
 		syncOnWrite: syncOnWrite,
 	}
-	if stat, err := f.Stat(); err == nil {
-		w.currentOffset.Store(stat.Size())
+
+	stat, serr := f.Stat()
+	if serr != nil {
+		f.Close()
+		return nil, serr
 	}
+	switch {
+	case stat.Size() == 0 && reg != nil:
+		baseIV, err := crypto.NewBaseIV()
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		keyID, key := reg.ActiveKey()
+		var hdr [walEncHeaderSize]byte
+		binary.BigEndian.PutUint32(hdr[0:4], walFileMagic)
+		binary.BigEndian.PutUint32(hdr[4:8], walFileVersion)
+		binary.BigEndian.PutUint64(hdr[8:16], keyID)
+		copy(hdr[16:32], baseIV)
+		if _, err := w.writer.Write(hdr[:]); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("wal write header: %w", err)
+		}
+		w.encrypted = true
+		w.keyID = keyID
+		w.baseIV = baseIV
+		w.key = key
+		w.fileHdr = walEncHeaderSize
+		w.currentOffset.Store(walEncHeaderSize)
+	case stat.Size() > 0:
+		var magicBuf [8]byte
+		if _, err := f.ReadAt(magicBuf[:], 0); err == nil &&
+			binary.BigEndian.Uint32(magicBuf[0:4]) == walFileMagic &&
+			binary.BigEndian.Uint32(magicBuf[4:8]) == walFileVersion {
+			var hdr [walEncHeaderSize]byte
+			if _, err := f.ReadAt(hdr[:], 0); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("wal read header: %w", err)
+			}
+			if reg == nil {
+				f.Close()
+				return nil, errors.New("wal: file is encrypted but no key registry was provided")
+			}
+			key, err := reg.GetKey(binary.BigEndian.Uint64(hdr[8:16]))
+			if err != nil {
+				f.Close()
+				return nil, err
+			}
+			w.encrypted = true
+			w.keyID = binary.BigEndian.Uint64(hdr[8:16])
+			w.baseIV = append([]byte(nil), hdr[16:32]...)
+			w.key = key
+			w.fileHdr = walEncHeaderSize
+		}
+		w.currentOffset.Store(stat.Size())
+	default:
+		w.currentOffset.Store(0)
+	}
+
 	if syncOnWrite {
 		w.writeQueue = make(chan writeTask, 1024)
 		go w.groupCommitLoop()
@@ -110,7 +188,7 @@ func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version ui
 	startOffset := w.currentOffset.Load()
 	valueOffset := startOffset + int64(walHeaderSize) + int64(len(key))
 
-	if err := w.writeDirect(op, key, val, expiresAt, version); err != nil {
+	if err := w.writeDirect(op, key, val, expiresAt, version, startOffset); err != nil {
 		return 0, err
 	}
 	w.currentOffset.Add(int64(walHeaderSize + len(key) + len(val)))
@@ -118,15 +196,34 @@ func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version ui
 	return valueOffset, w.writer.Flush()
 }
 
-// writeDirect writes a single record into the buffered writer.
-func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uint64) error {
+// writeDirect writes a single record into the buffered writer. When encryption
+// is enabled, the key and value are encrypted at their on-disk offsets.
+func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uint64, startOffset int64) error {
+	encKey := key
+	encVal := val
+	if w.encrypted {
+		keyOffset := startOffset + int64(walHeaderSize)
+		if len(key) > 0 {
+			encKey = append([]byte(nil), key...)
+			if err := crypto.CryptAtOffset(w.key, w.baseIV, keyOffset, encKey); err != nil {
+				return err
+			}
+		}
+		if len(val) > 0 {
+			encVal = append([]byte(nil), val...)
+			if err := crypto.CryptAtOffset(w.key, w.baseIV, keyOffset+int64(len(key)), encVal); err != nil {
+				return err
+			}
+		}
+	}
+
 	crc := crc32.NewIEEE()
 	crc.Write([]byte{op})
 
 	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(key)))
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(encKey)))
 	crc.Write(lenBuf[:])
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(val)))
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(encVal)))
 	crc.Write(lenBuf[:])
 
 	var expBuf [8]byte
@@ -137,12 +234,12 @@ func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uin
 	binary.BigEndian.PutUint64(verBuf[:], version)
 	crc.Write(verBuf[:])
 
-	crc.Write(key)
-	crc.Write(val)
+	crc.Write(encKey)
+	crc.Write(encVal)
 
 	w.headerBuf[0] = op
-	binary.BigEndian.PutUint32(w.headerBuf[1:5], uint32(len(key)))
-	binary.BigEndian.PutUint32(w.headerBuf[5:9], uint32(len(val)))
+	binary.BigEndian.PutUint32(w.headerBuf[1:5], uint32(len(encKey)))
+	binary.BigEndian.PutUint32(w.headerBuf[5:9], uint32(len(encVal)))
 	binary.BigEndian.PutUint64(w.headerBuf[9:17], uint64(expiresAt))
 	binary.BigEndian.PutUint64(w.headerBuf[17:25], version)
 	binary.BigEndian.PutUint32(w.headerBuf[25:29], crc.Sum32())
@@ -150,11 +247,11 @@ func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uin
 	if _, err := w.writer.Write(w.headerBuf[:]); err != nil {
 		return err
 	}
-	if _, err := w.writer.Write(key); err != nil {
+	if _, err := w.writer.Write(encKey); err != nil {
 		return err
 	}
-	if len(val) > 0 {
-		if _, err := w.writer.Write(val); err != nil {
+	if len(encVal) > 0 {
+		if _, err := w.writer.Write(encVal); err != nil {
 			return err
 		}
 	}
@@ -191,7 +288,7 @@ func (w *WAL) groupCommitLoop() {
 			startOffset := w.currentOffset.Load()
 			valueOffset := startOffset + int64(walHeaderSize) + int64(len(t.key))
 
-			if err := w.writeDirect(t.op, t.key, t.val, t.expiresAt, t.version); err != nil {
+			if err := w.writeDirect(t.op, t.key, t.val, t.expiresAt, t.version, startOffset); err != nil {
 				writeErr = err
 				batch[i].offsetCh <- 0
 				continue
@@ -257,12 +354,16 @@ func (w *WAL) Recover() ([]Record, error) {
 	if err := w.writer.Flush(); err != nil {
 		return nil, err
 	}
-	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+	start := int64(0)
+	if w.fileHdr > 0 {
+		start = w.fileHdr
+	}
+	if _, err := w.file.Seek(start, io.SeekStart); err != nil {
 		return nil, err
 	}
 
 	var records []Record
-	var totalRead int64
+	var totalRead = start
 	var hdr [walHeaderSize]byte
 
 	for {
@@ -309,7 +410,20 @@ func (w *WAL) Recover() ([]Record, error) {
 			break
 		}
 
-		valueOffset := totalRead + int64(walHeaderSize) + int64(kLen)
+		keyOffset := totalRead + int64(walHeaderSize)
+		valueOffset := keyOffset + int64(kLen)
+		if w.encrypted {
+			if len(key) > 0 {
+				if err := crypto.CryptAtOffset(w.key, w.baseIV, keyOffset, key); err != nil {
+					break
+				}
+			}
+			if len(val) > 0 {
+				if err := crypto.CryptAtOffset(w.key, w.baseIV, valueOffset, val); err != nil {
+					break
+				}
+			}
+		}
 		totalRead += int64(walHeaderSize) + int64(kLen) + int64(vLen)
 		records = append(records, Record{
 			Op:          op,
@@ -335,8 +449,15 @@ func (w *WAL) ReadValue(offset uint64, size uint32) ([]byte, error) {
 		return nil, nil
 	}
 	buf := make([]byte, size)
-	_, err := w.file.ReadAt(buf, int64(offset))
-	return buf, err
+	if _, err := w.file.ReadAt(buf, int64(offset)); err != nil {
+		return nil, err
+	}
+	if w.encrypted {
+		if err := crypto.CryptAtOffset(w.key, w.baseIV, int64(offset), buf); err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
 }
 
 func (w *WAL) Close() error {

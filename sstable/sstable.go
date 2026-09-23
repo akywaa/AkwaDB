@@ -3,6 +3,8 @@ package sstable
 import (
 	"github.com/akywaa/akwadb/bloom"
 	"github.com/akywaa/akwadb/cache"
+	"github.com/akywaa/akwadb/internal/crypto"
+	"github.com/akywaa/akwadb/internal/encoding"
 	"github.com/akywaa/akwadb/memtable"
 	"bytes"
 	"encoding/binary"
@@ -11,10 +13,12 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/exp/mmap"
 )
 
@@ -29,7 +33,27 @@ const (
 const (
 	compressNone   byte = 0
 	compressSnappy byte = 1
+	compressZSTD   byte = 2
 )
+
+var (
+	zstdEncoder, _ = zstd.NewWriter(nil)
+	zstdDecoder, _ = zstd.NewReader(nil)
+)
+
+func compressionTypeForLevel(level int) byte {
+	if level >= 2 {
+		return compressZSTD
+	}
+	return compressSnappy
+}
+
+func compressBlock(data []byte, level int) ([]byte, byte) {
+	if compressionTypeForLevel(level) == compressZSTD {
+		return zstdEncoder.EncodeAll(data, nil), compressZSTD
+	}
+	return s2.Encode(nil, data), compressSnappy
+}
 
 type RecordHeader struct {
 	KeyLen    uint32
@@ -67,13 +91,39 @@ type sparseIndexEntry struct {
 	Size   uint32
 }
 
+type cacheKey struct {
+	ptr  uintptr
+	off  int64
+}
+
+func (s *SSTable) blockCacheKey(blockOffset int64) string {
+	return s.filename + ":" + strconv.FormatInt(blockOffset, 10)
+}
+
+func (s *SSTable) indexCacheKey() string  { return "index:" + s.filename }
+func (s *SSTable) filterCacheKey() string { return "filter:" + s.filename }
+func (s *SSTable) prefixCacheKey() string { return "prefix:" + s.filename }
+
 type SSTable struct {
 	filename string
 	file     *os.File
 	mm       *mmap.ReaderAt
-	indexData []byte // flat index buffer (read directly from mmap, zero-alloc)
-	numBlocks uint32
-	filter   *bloom.Filter
+
+	// Index and bloom filter live in the shared cache so that cold tables do
+	// not pin them in RAM. Only offsets/lengths are kept on the struct.
+	indexOff   int64
+	indexLen   int64
+	numBlocks  uint32
+	filterOff  int64
+	filterLen  int64
+	filterBits uint32
+	filterK    uint8
+
+	prefixOff  int64
+	prefixLen  int64
+	prefixBits uint32
+	prefixK    uint8
+
 	cache    cache.Cache
 	refs     int32
 	mu       sync.Mutex
@@ -81,9 +131,71 @@ type SSTable struct {
 	compress byte
 	removePending bool // defer os.Remove until refs=0 for Windows compat
 
+	encrypted bool
+	keyID     uint64
+	blockKey  []byte
+
 	minKey []byte
 	maxKey []byte
 	level  int
+
+	tombstoneRatio float64
+}
+
+// getIndexData returns the flat index, loading it into the shared cache on miss.
+func (s *SSTable) getIndexData() []byte {
+	if s.indexLen <= 0 {
+		return nil
+	}
+	if s.cache != nil {
+		if raw, ok := s.cache.Get(s.indexCacheKey()); ok {
+			return raw
+		}
+	}
+	raw := make([]byte, s.indexLen)
+	if s.mm != nil {
+		if _, err := s.mm.ReadAt(raw, s.indexOff); err != nil {
+			return nil
+		}
+	} else if s.file != nil {
+		if _, err := s.file.ReadAt(raw, s.indexOff); err != nil {
+			return nil
+		}
+	} else {
+		return nil
+	}
+	if s.cache != nil {
+		s.cache.Put(s.indexCacheKey(), raw)
+	}
+	return raw
+}
+
+// getFilter returns the bloom filter, loading it into the shared cache on miss.
+func (s *SSTable) getFilter() *bloom.Filter {
+	if s.filterLen <= 0 {
+		return nil
+	}
+	if s.cache != nil {
+		if raw, ok := s.cache.Get(s.filterCacheKey()); ok {
+			return bloom.NewFilterFromBytes(raw, s.filterBits, s.filterK)
+		}
+	}
+	raw := make([]byte, s.filterLen)
+	if s.mm != nil {
+		if _, err := s.mm.ReadAt(raw, s.filterOff); err != nil {
+			return nil
+		}
+	} else if s.file != nil {
+		if _, err := s.file.ReadAt(raw, s.filterOff); err != nil {
+			return nil
+		}
+	} else {
+		return nil
+	}
+	if s.cache != nil {
+		s.cache.Put(s.filterCacheKey(), raw)
+	}
+	return bloom.NewFilterFromBytes(raw, s.filterBits, s.filterK)
 }
 
 func (s *SSTable) MinKey() []byte   { return s.minKey }
@@ -91,18 +203,64 @@ func (s *SSTable) MaxKey() []byte   { return s.maxKey }
 func (s *SSTable) Level() int       { return s.level }
 func (s *SSTable) SetLevel(lvl int) { s.level = lvl }
 
+func (s *SSTable) TombstoneRatio() float64 { return s.tombstoneRatio }
+
+func (s *SSTable) MayContainPrefix(prefix []byte) bool {
+	f := s.getPrefixFilter()
+	if f == nil {
+		return true
+	}
+	return f.MayContain(prefix)
+}
+
+// getPrefixFilter returns the composite-key prefix filter, loading it into the
+// shared cache on miss.
+func (s *SSTable) getPrefixFilter() *bloom.Filter {
+	if s.prefixLen <= 0 {
+		return nil
+	}
+	if s.cache != nil {
+		if raw, ok := s.cache.Get(s.prefixCacheKey()); ok {
+			return bloom.NewFilterFromBytes(raw, s.prefixBits, s.prefixK)
+		}
+	}
+	raw := make([]byte, s.prefixLen)
+	if s.mm != nil {
+		if _, err := s.mm.ReadAt(raw, s.prefixOff); err != nil {
+			return nil
+		}
+	} else if s.file != nil {
+		if _, err := s.file.ReadAt(raw, s.prefixOff); err != nil {
+			return nil
+		}
+	} else {
+		return nil
+	}
+	if s.cache != nil {
+		s.cache.Put(s.prefixCacheKey(), raw)
+	}
+	return bloom.NewFilterFromBytes(raw, s.prefixBits, s.prefixK)
+}
+
 // getEntryAt reads index entry i directly from the flat buffer without allocations.
 func (s *SSTable) getEntryAt(i int) (key []byte, offset int64, size uint32) {
 	if i < 0 || i >= int(s.numBlocks) {
 		return nil, 0, 0
 	}
+	idx := s.getIndexData()
+	if idx == nil {
+		return nil, 0, 0
+	}
 	tableStart := 4
-	entryRelOffset := binary.BigEndian.Uint32(s.indexData[tableStart+i*4 : tableStart+(i+1)*4])
+	entryRelOffset := binary.BigEndian.Uint32(idx[tableStart+i*4 : tableStart+(i+1)*4])
 	dataStart := 4 + int(s.numBlocks)*4 + int(entryRelOffset)
-	keyLen := binary.BigEndian.Uint16(s.indexData[dataStart : dataStart+2])
-	offset = int64(binary.BigEndian.Uint64(s.indexData[dataStart+2 : dataStart+10]))
-	size = binary.BigEndian.Uint32(s.indexData[dataStart+10 : dataStart+14])
-	key = s.indexData[dataStart+14 : dataStart+14+int(keyLen)]
+	if dataStart+14 > len(idx) {
+		return nil, 0, 0
+	}
+	keyLen := binary.BigEndian.Uint16(idx[dataStart : dataStart+2])
+	offset = int64(binary.BigEndian.Uint64(idx[dataStart+2 : dataStart+10]))
+	size = binary.BigEndian.Uint32(idx[dataStart+10 : dataStart+14])
+	key = idx[dataStart+14 : dataStart+14+int(keyLen)]
 	return
 }
 
@@ -112,10 +270,20 @@ func (s *SSTable) getKeyAt(i int) []byte {
 }
 
 func Create(filename string, entries []memtable.Entry, blockCache cache.Cache) (*SSTable, error) {
-	return CreateAtLevel(filename, entries, blockCache, 0)
+	return createAtLevel(filename, entries, blockCache, 0, nil)
 }
 
 func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.Cache, level int) (*SSTable, error) {
+	return createAtLevel(filename, entries, blockCache, level, nil)
+}
+
+// CreateAtLevelWithRegistry creates an SSTable whose blocks are encrypted with
+// AES-GCM using the active key of reg.
+func CreateAtLevelWithRegistry(filename string, entries []memtable.Entry, blockCache cache.Cache, level int, reg *crypto.KeyRegistry) (*SSTable, error) {
+	return createAtLevel(filename, entries, blockCache, level, reg)
+}
+
+func createAtLevel(filename string, entries []memtable.Entry, blockCache cache.Cache, level int, reg *crypto.KeyRegistry) (*SSTable, error) {
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
 	if err != nil {
 		return nil, err
@@ -129,8 +297,11 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 	var firstKeyInBlock []byte
 	var blockEntryOffsets []uint32
 
+	var createErr error
+	var sstKeyID uint64
+
 	flushCurrentBlock := func() {
-		if currentBlock.Len() == 0 {
+		if currentBlock.Len() == 0 || createErr != nil {
 			return
 		}
 
@@ -149,29 +320,42 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 
 		blockData := currentBlock.Bytes()
 
-		compressed := s2.Encode(nil, blockData)
-		if len(compressed) >= len(blockData) {
-			compressed = blockData
+		compressed, _ := compressBlock(blockData, level)
+
+		blockPayload := compressed
+		if reg != nil {
+			keyID, sealed, err := reg.SealBlock(compressed)
+			if err != nil {
+				createErr = err
+				return
+			}
+			sstKeyID = keyID
+			blockPayload = sealed
 		}
 
-		crc := crc32.ChecksumIEEE(compressed)
+		// CRC covers the on-disk bytes (encrypt-then-checksum).
+		crc := crc32.ChecksumIEEE(blockPayload)
 		var crcBuf [4]byte
 		binary.BigEndian.PutUint32(crcBuf[:], crc)
 
-		blockSize := uint32(len(compressed) + 4)
+		blockSize := uint32(len(blockPayload) + 4)
 		index = append(index, sparseIndexEntry{
 			Key:    firstKeyInBlock,
 			Offset: currentOffset,
 			Size:   blockSize,
 		})
 
-		file.Write(compressed)
+		file.Write(blockPayload)
 		file.Write(crcBuf[:])
 		currentOffset += int64(blockSize)
 		currentBlock.Reset()
 		firstKeyInBlock = nil
 		blockEntryOffsets = blockEntryOffsets[:0]
 	}
+
+	prefixFilter := bloom.NewFilterSized(len(entries), 10)
+	nowUnix := time.Now().Unix()
+	tombstoneCount := 0
 
 	entryCount := 0
 	var prevKey []byte
@@ -181,6 +365,10 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 		}
 		prevKey = entry.Key
 		keys = append(keys, entry.Key)
+		prefixFilter.Add(encoding.ExtractPrefix(entry.Key))
+		if entry.Deleted || (entry.ExpiresAt > 0 && nowUnix >= entry.ExpiresAt) {
+			tombstoneCount++
+		}
 
 		if firstKeyInBlock == nil {
 			firstKeyInBlock = entry.Key
@@ -215,6 +403,11 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 		entryCount++
 	}
 	flushCurrentBlock()
+	if createErr != nil {
+		file.Close()
+		_ = os.Remove(filename)
+		return nil, createErr
+	}
 
 	indexStartOffset := currentOffset
 
@@ -259,6 +452,14 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 	file.Write(filter.Bytes())
 	currentOffset += int64(len(filterHeader)) + int64(len(filter.Bytes()))
 
+	prefixStartOffset := currentOffset
+	prefixFilterHeader := make([]byte, 5)
+	prefixFilterHeader[0] = prefixFilter.K()
+	binary.BigEndian.PutUint32(prefixFilterHeader[1:5], prefixFilter.Bits())
+	file.Write(prefixFilterHeader)
+	file.Write(prefixFilter.Bytes())
+	currentOffset += int64(len(prefixFilterHeader)) + int64(len(prefixFilter.Bytes()))
+
 	var minKey, maxKey []byte
 	if len(entries) > 0 {
 		minKey = append([]byte(nil), entries[0].Key...)
@@ -278,32 +479,69 @@ func CreateAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 	file.Write(maxKey)
 	currentOffset += int64(len(mkHdr)) + int64(len(maxKey))
 
-	// footer: [indexOff(8)][bloomOff(8)][compress(1)][minKeyOff(8)][reserved(7)]
+	// footer: [indexOff(8)][bloomOff(8)][compress(1)][minKeyOff(8)][keyID(4)][flags(1)][reserved(2)]
 	footerBuf := make([]byte, 32)
 	binary.BigEndian.PutUint64(footerBuf[0:8], uint64(indexStartOffset))
 	binary.BigEndian.PutUint64(footerBuf[8:16], uint64(bloomStartOffset))
-	footerBuf[16] = compressSnappy
+	footerBuf[16] = compressionTypeForLevel(level)
 	binary.BigEndian.PutUint64(footerBuf[17:25], uint64(minKeyOffsetStart))
+	if reg != nil && sstKeyID != 0 {
+		binary.BigEndian.PutUint32(footerBuf[25:29], uint32(sstKeyID))
+		footerBuf[29] = 1
+	}
+	tombstoneRatio := 0.0
+	if len(entries) > 0 {
+		tombstoneRatio = float64(tombstoneCount) / float64(len(entries))
+	}
+	binary.BigEndian.PutUint16(footerBuf[30:32], uint16(tombstoneRatio*10000))
 	file.Write(footerBuf)
 
 	file.Sync()
 
 	sst := &SSTable{
-		filename:  filename,
-		file:      file,
-		indexData: indexData,
-		numBlocks: numBlocks,
-		filter:    filter,
-		cache:     blockCache,
-		level:     level,
-		compress:  compressSnappy,
-		minKey:    minKey,
-		maxKey:    maxKey,
+		filename:       filename,
+		file:           file,
+		indexOff:       indexStartOffset,
+		indexLen:       int64(len(indexData)),
+		numBlocks:      numBlocks,
+		filterOff:      bloomStartOffset + 5,
+		filterLen:      int64(len(filter.Bytes())),
+		filterBits:     filter.Bits(),
+		filterK:        filter.K(),
+		prefixOff:      prefixStartOffset + 5,
+		prefixLen:      int64(len(prefixFilter.Bytes())),
+		prefixBits:     prefixFilter.Bits(),
+		prefixK:        prefixFilter.K(),
+		cache:          blockCache,
+		level:          level,
+		compress:       compressionTypeForLevel(level),
+		encrypted:      reg != nil && sstKeyID != 0,
+		keyID:          sstKeyID,
+		minKey:         minKey,
+		maxKey:         maxKey,
+		tombstoneRatio: tombstoneRatio,
+	}
+	if blockCache != nil {
+		blockCache.Put(sst.indexCacheKey(), indexData)
+		blockCache.Put(sst.filterCacheKey(), filter.Bytes())
+		blockCache.Put(sst.prefixCacheKey(), prefixFilter.Bytes())
+	}
+	if sst.encrypted {
+		_, sst.blockKey = reg.ActiveKey()
 	}
 	return sst, nil
 }
 
 func Open(filename string, blockCache cache.Cache) (*SSTable, error) {
+	return open(filename, blockCache, nil)
+}
+
+// OpenWithRegistry opens an SSTable, using reg to decrypt encrypted blocks.
+func OpenWithRegistry(filename string, blockCache cache.Cache, reg *crypto.KeyRegistry) (*SSTable, error) {
+	return open(filename, blockCache, reg)
+}
+
+func open(filename string, blockCache cache.Cache, reg *crypto.KeyRegistry) (*SSTable, error) {
 	file, err := os.OpenFile(filename, os.O_RDONLY, 0666)
 	if err != nil {
 		return nil, err
@@ -335,46 +573,100 @@ func Open(filename string, blockCache cache.Cache) (*SSTable, error) {
 	bloomStartOffset := int64(binary.BigEndian.Uint64(footerBuf[8:16]))
 	compressType := footerBuf[16]
 	minKeyOffset := int64(binary.BigEndian.Uint64(footerBuf[17:25]))
+	keyID := uint64(binary.BigEndian.Uint32(footerBuf[25:29]))
+	encrypted := footerBuf[29] == 1
 
-	// read flat index as a single contiguous buffer
+	var blockKey []byte
+	if encrypted {
+		if reg == nil {
+			mm.Close()
+			file.Close()
+			return nil, fmt.Errorf("sstable: %s is encrypted but no key registry was provided", filename)
+		}
+		blockKey, err = reg.GetKey(keyID)
+		if err != nil {
+			mm.Close()
+			file.Close()
+			return nil, err
+		}
+	}
+
+	// Index and filter bytes stay on disk until first use; only metadata is kept.
 	indexLen := bloomStartOffset - indexStartOffset
-	indexData := make([]byte, indexLen)
-	if _, err := mm.ReadAt(indexData, indexStartOffset); err != nil {
+	var numBuf [4]byte
+	if _, err := mm.ReadAt(numBuf[:], indexStartOffset); err != nil {
 		mm.Close()
 		file.Close()
 		return nil, err
 	}
-	numBlocks := binary.BigEndian.Uint32(indexData[0:4])
+	numBlocks := binary.BigEndian.Uint32(numBuf[:])
 
-	// read bloom filter
-	var filter *bloom.Filter
+	var filterOff, filterLen int64
+	var filterBits uint32
+	var filterK uint8
 	if bloomStartOffset+5 <= int64(fileSize) {
 		var kByte [1]byte
 		if _, err := mm.ReadAt(kByte[:], bloomStartOffset); err == nil {
 			var bitsBuf [4]byte
 			if _, err := mm.ReadAt(bitsBuf[:], bloomStartOffset+1); err == nil {
-				k := kByte[0]
-				bits := binary.BigEndian.Uint32(bitsBuf[:])
-				bitmapLen := minKeyOffset - (bloomStartOffset + 5)
-				if bitmapLen > 0 {
-					bitmap := make([]byte, bitmapLen)
-					if _, err := mm.ReadAt(bitmap, bloomStartOffset+5); err == nil {
-						filter = bloom.NewFilterFromBytes(bitmap, bits, k)
+				filterK = kByte[0]
+				filterBits = binary.BigEndian.Uint32(bitsBuf[:])
+				if l := minKeyOffset - (bloomStartOffset + 5); l > 0 {
+					filterOff = bloomStartOffset + 5
+					filterLen = int64(filterBits / 8)
+					if filterLen <= 0 || filterLen > l {
+						filterLen = l
 					}
 				}
 			}
 		}
 	}
 
+	var prefixOff, prefixLen int64
+	var prefixBits uint32
+	var prefixK uint8
+	if filterLen > 0 {
+		pOff := filterOff + filterLen
+		if pOff+5 <= minKeyOffset {
+			var kByte [1]byte
+			if _, err := mm.ReadAt(kByte[:], pOff); err == nil {
+				var bitsBuf [4]byte
+				if _, err := mm.ReadAt(bitsBuf[:], pOff+1); err == nil {
+					pl := int64(binary.BigEndian.Uint32(bitsBuf[:]) / 8)
+					if pl > 0 && pOff+5+pl <= minKeyOffset {
+						prefixOff = pOff + 5
+						prefixLen = pl
+						prefixBits = binary.BigEndian.Uint32(bitsBuf[:])
+						prefixK = kByte[0]
+					}
+				}
+			}
+		}
+	}
+
+	tombstoneRatio := float64(binary.BigEndian.Uint16(footerBuf[30:32])) / 10000
+
 	sst := &SSTable{
-		filename:  filename,
-		file:      file,
-		mm:        mm,
-		indexData: indexData,
-		numBlocks: numBlocks,
-		filter:    filter,
-		cache:     blockCache,
-		compress:  compressType,
+		filename:       filename,
+		file:           file,
+		mm:             mm,
+		indexOff:       indexStartOffset,
+		indexLen:       indexLen,
+		numBlocks:      numBlocks,
+		filterOff:      filterOff,
+		filterLen:      filterLen,
+		filterBits:     filterBits,
+		filterK:        filterK,
+		prefixOff:      prefixOff,
+		prefixLen:      prefixLen,
+		prefixBits:     prefixBits,
+		prefixK:        prefixK,
+		cache:          blockCache,
+		compress:       compressType,
+		encrypted:      encrypted,
+		keyID:          keyID,
+		blockKey:       blockKey,
+		tombstoneRatio: tombstoneRatio,
 	}
 	if numBlocks > 0 {
 		sst.minKey = sst.getKeyAt(0)
@@ -425,7 +717,7 @@ func (s *SSTable) Get(key []byte) ([]byte, bool, bool, int64, uint64, error) {
 	s.IncrRef()
 	defer s.DecrRef()
 
-	if s.filter != nil && !s.filter.MayContain(key) {
+	if f := s.getFilter(); f != nil && !f.MayContain(key) {
 		return nil, false, false, 0, 0, nil
 	}
 
@@ -473,16 +765,9 @@ func (s *SSTable) Get(key []byte) ([]byte, bool, bool, int64, uint64, error) {
 		}
 	}
 
-	blockContent, ok := verifyBlockCRC(blockData)
-	if !ok {
-		return nil, false, false, 0, 0, ErrBlockCorrupted
-	}
-
-	if s.compress == compressSnappy {
-		decompressed, err := s2.Decode(nil, blockContent)
-		if err == nil {
-			blockContent = decompressed
-		}
+	blockContent, err := s.decodeBlock(blockData)
+	if err != nil {
+		return nil, false, false, 0, 0, err
 	}
 
 	val, found, deleted, exp, err := scanBlockForKey(blockContent, key)
@@ -557,6 +842,33 @@ func verifyBlockCRC(data []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return blockContent, true
+}
+
+// decodeBlock verifies the on-disk checksum, decrypts (when needed) and
+// decompresses a raw block read from disk.
+func (s *SSTable) decodeBlock(raw []byte) ([]byte, error) {
+	content, ok := verifyBlockCRC(raw)
+	if !ok {
+		return nil, ErrBlockCorrupted
+	}
+	if s.encrypted {
+		decrypted, err := crypto.OpenBlockWithKey(s.blockKey, content)
+		if err != nil {
+			return nil, err
+		}
+		content = decrypted
+	}
+	switch s.compress {
+	case compressSnappy:
+		if decompressed, err := s2.Decode(nil, content); err == nil {
+			content = decompressed
+		}
+	case compressZSTD:
+		if decompressed, err := zstdDecoder.DecodeAll(content, nil); err == nil {
+			content = decompressed
+		}
+	}
+	return content, nil
 }
 
 type blockRestarts struct {
@@ -715,7 +1027,7 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 			break
 		}
 		if bytes.Equal(k, targetKey) {
-			if hdr.Version > bestVersion {
+			if !found || hdr.Version > bestVersion {
 				bestVal = v
 				bestDeleted = hdr.Deleted
 				bestExp = hdr.ExpiresAt
@@ -868,7 +1180,7 @@ func (s *SSTable) GetByVersion(key []byte, maxVersion uint64) ([]byte, bool, boo
 	s.IncrRef()
 	defer s.DecrRef()
 
-	if s.filter != nil && !s.filter.MayContain(key) {
+	if f := s.getFilter(); f != nil && !f.MayContain(key) {
 		return nil, false, false, 0, 0, nil
 	}
 	if s.numBlocks == 0 {
@@ -915,16 +1227,9 @@ func (s *SSTable) GetByVersion(key []byte, maxVersion uint64) ([]byte, bool, boo
 		}
 	}
 
-	blockContent, ok := verifyBlockCRC(blockData)
-	if !ok {
-		return nil, false, false, 0, 0, ErrBlockCorrupted
-	}
-
-	if s.compress == compressSnappy {
-		decompressed, err := s2.Decode(nil, blockContent)
-		if err == nil {
-			blockContent = decompressed
-		}
+	blockContent, err := s.decodeBlock(blockData)
+	if err != nil {
+		return nil, false, false, 0, 0, err
 	}
 
 	return scanBlockForKeyVersion(blockContent, key, maxVersion)
@@ -940,15 +1245,9 @@ func (s *SSTable) ReadAll() ([]memtable.Entry, error) {
 			return nil, err
 		}
 
-		blockContent, ok := verifyBlockCRC(raw)
-		if !ok {
+		blockContent, err := s.decodeBlock(raw)
+		if err != nil {
 			continue
-		}
-
-		if s.compress == compressSnappy {
-			if decompressed, derr := s2.Decode(nil, blockContent); derr == nil {
-				blockContent = decompressed
-			}
 		}
 
 		reader := bytes.NewReader(blockContent)
@@ -1007,7 +1306,7 @@ func (it *SSTableIterator) loadBlock(idx int) bool {
 		return false
 	}
 	_, blockOffset, blockSize := it.sst.getEntryAt(idx)
-	cacheKey := fmt.Sprintf("%s:%d", it.sst.filename, blockOffset)
+	cacheKey := it.sst.blockCacheKey(blockOffset)
 
 	var data []byte
 	if it.sst.cache != nil {
@@ -1027,15 +1326,9 @@ func (it *SSTableIterator) loadBlock(idx int) bool {
 		}
 	}
 
-	blockContent, ok := verifyBlockCRC(data)
-	if !ok {
+	blockContent, err := it.sst.decodeBlock(data)
+	if err != nil {
 		return false
-	}
-
-	if it.sst.compress == compressSnappy {
-		if decompressed, derr := s2.Decode(nil, blockContent); derr == nil {
-			blockContent = decompressed
-		}
 	}
 
 	it.blockData = blockContent

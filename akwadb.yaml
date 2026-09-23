@@ -7,3 +7,8 @@ compaction_threshold: 4
 block_cache_size: 1000
 max_disk_bytes: 10737418240  # 10 GB
 repl_backlog_size: 10000
+
+# Optional at-rest encryption. encryption_key is a hex-encoded AES key
+# (32 bytes = 64 hex chars). When set, a KEYREGISTRY file is created in data_dir.
+# encryption_key: ""
+# encryption_key_path: ""

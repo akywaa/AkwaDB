@@ -322,6 +322,10 @@ func (m *memoryBackend) CurrentVersion() uint64 {
 	return 0
 }
 
+func (m *memoryBackend) PutWithOptions(key, val string, opts WriteOptions) error {
+	return m.Put(key, val)
+}
+
 func (m *memoryBackend) BatchApply(entries []BatchWriteEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

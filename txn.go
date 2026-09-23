@@ -124,6 +124,29 @@ func (tx *Tx) Delete(key []byte) error {
 	return nil
 }
 
+func (e *Engine) NewTransactionAt(readTs uint64, readOnly bool) *Tx {
+	return &Tx{
+		db:       e,
+		readOnly: readOnly,
+		readTs:   readTs,
+		writes:   make(map[string]txEntry),
+		readSet:  make(map[string]struct{}),
+	}
+}
+
+func (tx *Tx) batchEntries() []server.BatchWriteEntry {
+	entries := make([]server.BatchWriteEntry, 0, len(tx.writes))
+	for k, entry := range tx.writes {
+		entries = append(entries, server.BatchWriteEntry{
+			Key:       k,
+			Value:     string(entry.value),
+			ExpiresAt: entry.expiresAt,
+			Deleted:   entry.deleted,
+		})
+	}
+	return entries
+}
+
 func (tx *Tx) commit() error {
 	if tx.closed || tx.readOnly {
 		return nil
@@ -143,20 +166,35 @@ func (tx *Tx) commit() error {
 		return err
 	}
 
-	entries := make([]server.BatchWriteEntry, 0, len(tx.writes))
-	for k, entry := range tx.writes {
-		entries = append(entries, server.BatchWriteEntry{
-			Key:       k,
-			Value:     string(entry.value),
-			ExpiresAt: entry.expiresAt,
-			Deleted:   entry.deleted,
-		})
-	}
-
-	errCh := tx.db.enqueueBatchWithVersion(entries, commitTs)
+	errCh := tx.db.enqueueBatchWithVersion(tx.batchEntries(), commitTs)
 	tx.db.oracle.CommitUnlock()
 
 	return (<-errCh).err
+}
+
+func (tx *Tx) CommitAt(commitTs uint64) error {
+	if tx.closed {
+		return ErrTxnClosed
+	}
+	if tx.readOnly {
+		tx.closed = true
+		tx.db.oracle.Done(tx.readTs)
+		return nil
+	}
+	tx.closed = true
+	defer tx.db.oracle.Done(tx.readTs)
+
+	if len(tx.writes) == 0 {
+		return nil
+	}
+
+	entries := tx.batchEntries()
+	tx.writes = nil
+	return tx.db.BatchApplyWithVersion(entries, commitTs)
+}
+
+func (tx *Tx) Rollback() {
+	tx.rollback()
 }
 
 func (tx *Tx) rollback() {

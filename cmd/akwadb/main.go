@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -9,10 +10,12 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/akywaa/akwadb"
 	"github.com/akywaa/akwadb/config"
+	"github.com/akywaa/akwadb/internal/crypto"
 	"github.com/akywaa/akwadb/server"
 	"github.com/spf13/viper"
 )
@@ -43,6 +46,12 @@ func main() {
 		if v.GetInt("memtable_mb") > 0 {
 			cfg.MemTableMB = v.GetInt("memtable_mb")
 		}
+		if v.GetString("encryption_key") != "" {
+			cfg.EncryptionKey = v.GetString("encryption_key")
+		}
+		if v.GetString("encryption_key_path") != "" {
+			cfg.EncryptionKeyPath = v.GetString("encryption_key_path")
+		}
 	}
 	if *addrFlag != "" {
 		cfg.ListenAddr = *addrFlag
@@ -59,6 +68,29 @@ func main() {
 	opts.CompactionThreshold = cfg.CompactionThreshold
 	opts.BlockCacheSize = cfg.BlockCacheSize
 	opts.MaxDiskBytes = cfg.MaxDiskBytes
+
+	keyHex := cfg.EncryptionKey
+	if keyHex == "" && cfg.EncryptionKeyPath != "" {
+		keyData, err := os.ReadFile(cfg.EncryptionKeyPath)
+		if err != nil {
+			slog.Error("failed to read encryption key file", "path", cfg.EncryptionKeyPath, "err", err)
+			os.Exit(1)
+		}
+		keyHex = strings.TrimSpace(string(keyData))
+	}
+	if keyHex != "" {
+		keyBytes, err := hex.DecodeString(keyHex)
+		if err != nil {
+			slog.Error("encryption_key must be hex-encoded", "err", err)
+			os.Exit(1)
+		}
+		reg, err := crypto.OpenKeyRegistry(cfg.DataDir, keyBytes)
+		if err != nil {
+			slog.Error("failed to open key registry", "err", err)
+			os.Exit(1)
+		}
+		opts.KeyRegistry = reg
+	}
 
 	engine, err := akwadb.OpenEngineWithOpts(opts)
 	if err != nil {

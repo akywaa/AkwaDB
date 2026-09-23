@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/akywaa/akwadb/cache"
+	"github.com/akywaa/akwadb/internal/crypto"
 	"github.com/akywaa/akwadb/internal/dirlock"
 	"github.com/akywaa/akwadb/internal/encoding"
 	"github.com/akywaa/akwadb/internal/fsutil"
+	"github.com/akywaa/akwadb/internal/vlogthreshold"
 	"github.com/akywaa/akwadb/iterator"
 	"github.com/akywaa/akwadb/memtable"
 	"github.com/akywaa/akwadb/server"
@@ -23,6 +25,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +35,7 @@ import (
 )
 
 var ErrKeyNotFound = errors.New("key not found")
+var ErrNoRewrite = errors.New("vlog: no segments eligible for GC")
 
 const (
 	valPtrSize = 16
@@ -180,7 +184,9 @@ const levelSizeRatio = 10         // each level is 10x larger than the one above
 const l0BackpressureThreshold = 8 // start throttling writers at this L0 count
 const keyLockStripes = 256
 const l0StopThreshold = 16
-const subcompactionSplits = 4     // number of parallel key-range splits per compaction
+const subcompactionSplits = 4      // number of parallel key-range splits per compaction
+const tombstoneCompactionRatio = 0.40
+const maxWriterGoroutines = 8
 
 const (
 	CacheBackendLRU     = 0
@@ -196,6 +202,12 @@ type Options struct {
 	LevelSizeRatio      int // dynamic level size ratio (default 10)
 	ValueThreshold      int // values smaller than this are stored inline (default 128)
 	CacheBackend        int // CacheBackendLRU (default) or CacheBackendTinyLFU
+	KeyRegistry         *crypto.KeyRegistry // nil disables at-rest encryption
+
+	// AdaptiveValueThreshold lets the engine raise ValueThreshold based on the
+	// observed value-size distribution, up to ValueThresholdMax.
+	AdaptiveValueThreshold bool
+	ValueThresholdMax      int
 }
 
 func (o Options) levelRatio() int {
@@ -211,8 +223,10 @@ func DefaultOptions(dataDir string) Options {
 		MemTableSize:        4 * 1024 * 1024,
 		CompactionThreshold: 4,
 		BlockCacheSize:      1000,
-		ValueThreshold:      defaultValueThreshold,
-		CacheBackend:        CacheBackendTinyLFU,
+		ValueThreshold:         defaultValueThreshold,
+		CacheBackend:           CacheBackendTinyLFU,
+		AdaptiveValueThreshold: true,
+		ValueThresholdMax:      1 << 20,
 	}
 }
 
@@ -236,6 +250,8 @@ type writeReq struct {
 	seq        uint64
 	expectedVp ValuePointer
 	batch      []server.BatchWriteEntry // atomic batch writes
+	skipWAL    bool
+	syncWAL    bool
 	errCh      chan incrResult
 }
 
@@ -249,7 +265,7 @@ type Engine struct {
 	metrics     metricsCollector
 	memTable    atomic.Pointer[memtable.SkipList]
 	immMemTable atomic.Pointer[memtable.SkipList]
-	memTableMu  sync.Mutex
+	memTableMu  sync.RWMutex
 
 	levels [MaxLevels][]*sstable.SSTable
 
@@ -266,6 +282,7 @@ type Engine struct {
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
 	opts          Options
+	threshold     *vlogthreshold.AdaptiveThreshold
 
 	manifest   *os.File
 	manifestMu sync.Mutex
@@ -283,7 +300,9 @@ type Engine struct {
 
 	l0Cond *sync.Cond // backpressure: writers sleep when L0 is full
 
-	keyLocks [keyLockStripes]sync.Mutex
+	keyLocks    [keyLockStripes]sync.Mutex
+	incrMu      [keyLockStripes]sync.Mutex
+	walAppendMu sync.Mutex
 
 	expiries sync.Map
 	expireMu sync.Mutex
@@ -305,10 +324,8 @@ func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList) incrResult {
 	}
 	newVal := cur + r.delta
 	newBytes := []byte(strconv.FormatInt(newVal, 10))
-	threshold := e.opts.ValueThreshold
-	if threshold <= 0 {
-		threshold = defaultValueThreshold
-	}
+	threshold := e.valueThreshold()
+	e.recordValueSize(len(newBytes))
 	if len(newBytes) < threshold {
 		_, werr := e.wal.WriteVersion(wal.OpPut, r.key, newBytes, 0, r.seq)
 		if werr != nil {
@@ -340,6 +357,24 @@ func (e *Engine) immutableMemTable() *memtable.SkipList {
 
 func (e *Engine) getSnapshot() (active, immutable *memtable.SkipList) {
 	return e.memTable.Load(), e.immMemTable.Load()
+}
+
+// valueThreshold returns the current inline/VLog cutoff, adaptive when enabled.
+func (e *Engine) valueThreshold() int {
+	if e.threshold != nil {
+		return e.threshold.Get()
+	}
+	t := e.opts.ValueThreshold
+	if t <= 0 {
+		t = defaultValueThreshold
+	}
+	return t
+}
+
+func (e *Engine) recordValueSize(n int) {
+	if e.threshold != nil {
+		e.threshold.Record(n)
+	}
 }
 
 func (e *Engine) calcLevelLimits() ([MaxLevels]int64, int) {
@@ -411,6 +446,9 @@ func (e *Engine) throttleL0() {
 	}
 }
 
+// writer is one of several pipelined write workers. Go channels hand each
+// request to exactly one worker, so the WAL append, the memtable apply and the
+// timestamp bookkeeping of independent requests genuinely run in parallel.
 func (e *Engine) writer() {
 	defer e.wg.Done()
 	var batch []*writeReq
@@ -442,169 +480,269 @@ func (e *Engine) writer() {
 			copy(sorted, batch)
 			sort.Slice(sorted, func(i, j int) bool { return sorted[i].seq < sorted[j].seq })
 
-			mt := e.activeMemTable()
 			for _, r := range sorted {
-				if r.seq == 0 {
-					r.seq = e.oracle.NewCommitTs()
-					atomic.StoreUint64(&e.nextSeq, r.seq)
-				}
-
-				if r.op == opClear {
-					err := e.clearInternal()
-					e.oracle.MarkApplied(r.seq)
-					r.errCh <- incrResult{err: err}
-					continue
-				}
-
-				if r.op == opIncr {
-					res := e.processIncr(r, mt)
-					e.oracle.MarkApplied(r.seq)
-					r.errCh <- res
-					continue
-				}
-
-				if r.op == opGCRewrite {
-					curVal, err := e.getWithoutLock(r.key)
-					if err == nil && isValuePointer(curVal) {
-						curVp := decodeValuePointer(curVal)
-						if curVp.Fid == r.expectedVp.Fid {
-							// rewrite live value into new VLog segment
-							vvp, verr := e.vl.Write(&vlog.ValueEntry{
-								Op:        vlog.OpPut,
-								Key:       r.key,
-								Value:     r.val,
-								ExpiresAt: r.expiresAt,
-							})
-							if verr == nil {
-								_, _ = e.wal.WriteVersion(wal.OpPut, r.key, encodeWalValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
-								mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
-								e.trackExpiry(r.key, r.expiresAt)
-							}
-						}
-					}
-					e.oracle.MarkApplied(r.seq)
-					r.errCh <- incrResult{}
-					continue
-				}
-
-				if len(r.batch) > 0 {
-					threshold := e.opts.ValueThreshold
-					if threshold <= 0 {
-						threshold = defaultValueThreshold
-					}
-					type batchResult struct {
-						kBytes  []byte
-						vBytes  []byte
-						vp      ValuePointer
-						isPtr   bool
-						deleted bool
-						expAt   int64
-					}
-					var results []batchResult
-					var batchErr error
-					walStart := e.wal.Offset()
-					for _, entry := range r.batch {
-						kBytes := []byte(entry.Key)
-						if entry.Deleted {
-							_, werr := e.wal.WriteVersion(wal.OpDelete, kBytes, nil, 0, r.seq)
-							if werr != nil {
-								batchErr = werr
-								break
-							}
-							results = append(results, batchResult{kBytes: kBytes, deleted: true})
-						} else {
-							vBytes := []byte(entry.Value)
-							if len(vBytes) < threshold {
-								// small value: write to WAL
-								_, werr := e.wal.WriteVersion(wal.OpPut, kBytes, vBytes, entry.ExpiresAt, r.seq)
-								if werr != nil {
-									batchErr = werr
-									break
-								}
-								results = append(results, batchResult{kBytes: kBytes, vBytes: vBytes, expAt: entry.ExpiresAt})
-							} else {
-								// large value: write to VLog
-								vvp, verr := e.vl.Write(&vlog.ValueEntry{
-									Op:        vlog.OpPut,
-									Key:       kBytes,
-									Value:     vBytes,
-									ExpiresAt: entry.ExpiresAt,
-								})
-								if verr != nil {
-									batchErr = verr
-									break
-								}
-								_, _ = e.wal.WriteVersion(wal.OpPut, kBytes, encodeWalValuePointer(vpFromVlog(vvp)), entry.ExpiresAt, r.seq)
-								results = append(results, batchResult{kBytes: kBytes, vp: vpFromVlog(vvp), isPtr: true, expAt: entry.ExpiresAt})
-							}
-						}
-					}
-					if batchErr == nil {
-						for _, res := range results {
-							if res.deleted {
-								mt.DeleteVersion(res.kBytes, r.seq)
-							} else if res.isPtr {
-								mt.PutVersion(res.kBytes, encodeValuePointer(res.vp), res.expAt, r.seq)
-								e.trackExpiry(res.kBytes, res.expAt)
-							} else {
-								mt.PutVersion(res.kBytes, encodeInlineValue(res.vBytes), res.expAt, r.seq)
-								e.trackExpiry(res.kBytes, res.expAt)
-							}
-						}
-					} else if terr := e.wal.TruncateTo(walStart); terr != nil {
-						slog.Error("wal rollback failed", "err", terr)
-					}
-					e.oracle.MarkApplied(r.seq)
-					r.errCh <- incrResult{err: batchErr}
-					continue
-				}
-
-				if r.op == wal.OpPut || r.op == wal.OpDelete {
-					err := e.applyEntry(r.op, r.key, r.val, r.expiresAt, r.seq)
-					e.oracle.MarkApplied(r.seq)
-					r.errCh <- incrResult{err: err}
-					continue
-				}
-
-				e.oracle.MarkApplied(r.seq)
-				r.errCh <- incrResult{}
+				r.errCh <- e.dispatch(r)
 			}
 
-			// flush backpressure: wait if immutable memtable is still being flushed
-			e.memTableMu.Lock()
-			if e.activeMemTable().SizeInBytes() >= e.opts.MemTableSize {
-				if e.immutableMemTable() != nil {
-					// wait for flush to complete before continuing writes
-					for e.immutableMemTable() != nil && e.ctx.Err() == nil {
-						e.l0Cond.Wait()
-					}
-				} else if task, err := e.triggerFlushLocked(); err == nil {
-					select {
-					case e.flushChan <- *task:
-					case <-e.ctx.Done():
-					}
-				}
-			}
-			e.memTableMu.Unlock()
+			e.flushBackpressure()
 
 			if e.OnWrite != nil {
-				for _, r := range batch {
-					if r.op == wal.OpPut || r.op == wal.OpDelete {
-						e.OnWrite(r.op, r.key, r.val, r.expiresAt)
-					}
-					for _, entry := range r.batch {
-						op := wal.OpPut
-						if entry.Deleted {
-							op = wal.OpDelete
-						}
-						e.OnWrite(op, []byte(entry.Key), []byte(entry.Value), entry.ExpiresAt)
-					}
-				}
+				e.notifyWrites(batch)
 			}
 		case <-e.ctx.Done():
 			return
 		}
 	}
+}
+
+// dispatch applies a single request. The active memtable is pinned under a read
+// lock for the duration so a concurrent flush cannot turn it into an immutable
+// table under the writer's feet.
+func (e *Engine) dispatch(r *writeReq) incrResult {
+	if r.op == opIncr {
+		return e.dispatchIncr(r)
+	}
+	if r.seq == 0 {
+		r.seq = e.oracle.NewCommitTs()
+		bumpUint64(&e.nextSeq, r.seq)
+	}
+
+	switch {
+	case r.op == opClear:
+		err := e.clearInternal()
+		e.oracle.MarkApplied(r.seq)
+		return incrResult{err: err}
+
+	case r.op == opFlush:
+		err := e.forceFlush()
+		e.oracle.MarkApplied(r.seq)
+		return incrResult{err: err}
+
+	case len(r.batch) > 0:
+		e.memTableMu.RLock()
+		e.walAppendMu.Lock()
+		err := e.applyBatch(r)
+		e.walAppendMu.Unlock()
+		e.memTableMu.RUnlock()
+		e.oracle.MarkApplied(r.seq)
+		return incrResult{err: err}
+
+	case r.op == opGCRewrite:
+		e.memTableMu.RLock()
+		e.walAppendMu.Lock()
+		err := e.gcRewrite(r)
+		e.walAppendMu.Unlock()
+		e.memTableMu.RUnlock()
+		e.oracle.MarkApplied(r.seq)
+		return incrResult{err: err}
+
+	case r.op == wal.OpPut || r.op == wal.OpDelete:
+		e.memTableMu.RLock()
+		e.walAppendMu.Lock()
+		err := e.applyEntryOpts(r.op, r.key, r.val, r.expiresAt, r.seq, r.skipWAL)
+		if r.syncWAL && err == nil {
+			err = e.wal.FlushAndSync()
+		}
+		e.walAppendMu.Unlock()
+		e.memTableMu.RUnlock()
+		e.oracle.MarkApplied(r.seq)
+		return incrResult{err: err}
+	}
+
+	e.oracle.MarkApplied(r.seq)
+	return incrResult{}
+}
+
+// dispatchIncr serializes read-modify-write on a key and assigns the commit
+// timestamp inside that critical section, so a later increment always reads a
+// version at or above the one written by its predecessor.
+func (e *Engine) dispatchIncr(r *writeReq) incrResult {
+	stripe := e.keyStripe(r.key)
+	e.incrMu[stripe].Lock()
+	if r.seq == 0 {
+		r.seq = e.oracle.NewCommitTs()
+		bumpUint64(&e.nextSeq, r.seq)
+	}
+	e.memTableMu.RLock()
+	e.walAppendMu.Lock()
+	res := e.processIncr(r, e.activeMemTable())
+	e.walAppendMu.Unlock()
+	e.memTableMu.RUnlock()
+	e.incrMu[stripe].Unlock()
+	e.oracle.MarkApplied(r.seq)
+	return res
+}
+
+type batchResult struct {
+	kBytes  []byte
+	vBytes  []byte
+	vp      ValuePointer
+	isPtr   bool
+	deleted bool
+	expAt   int64
+}
+
+// applyBatch appends every entry of an atomic batch to the WAL first and only
+// then publishes all of them to the memtable, so readers never observe a
+// partially applied batch.
+func (e *Engine) applyBatch(r *writeReq) error {
+	mt := e.activeMemTable()
+	threshold := e.valueThreshold()
+	results := make([]batchResult, 0, len(r.batch))
+	var batchErr error
+	walStart := e.wal.Offset()
+
+	for _, entry := range r.batch {
+		kBytes := []byte(entry.Key)
+		if entry.Deleted {
+			_, werr := e.wal.WriteVersion(wal.OpDelete, kBytes, nil, 0, r.seq)
+			if werr != nil {
+				batchErr = werr
+				break
+			}
+			results = append(results, batchResult{kBytes: kBytes, deleted: true})
+			continue
+		}
+
+		vBytes := []byte(entry.Value)
+		e.recordValueSize(len(vBytes))
+		if len(vBytes) < threshold {
+			_, werr := e.wal.WriteVersion(wal.OpPut, kBytes, vBytes, entry.ExpiresAt, r.seq)
+			if werr != nil {
+				batchErr = werr
+				break
+			}
+			results = append(results, batchResult{kBytes: kBytes, vBytes: vBytes, expAt: entry.ExpiresAt})
+			continue
+		}
+
+		vvp, verr := e.vl.Write(&vlog.ValueEntry{
+			Op:        vlog.OpPut,
+			Key:       kBytes,
+			Value:     vBytes,
+			ExpiresAt: entry.ExpiresAt,
+		})
+		if verr != nil {
+			batchErr = verr
+			break
+		}
+		_, _ = e.wal.WriteVersion(wal.OpPut, kBytes, encodeWalValuePointer(vpFromVlog(vvp)), entry.ExpiresAt, r.seq)
+		results = append(results, batchResult{kBytes: kBytes, vp: vpFromVlog(vvp), isPtr: true, expAt: entry.ExpiresAt})
+	}
+
+	if batchErr != nil {
+		if terr := e.wal.TruncateTo(walStart); terr != nil {
+			slog.Error("wal rollback failed", "err", terr)
+		}
+		return batchErr
+	}
+
+	for _, res := range results {
+		switch {
+		case res.deleted:
+			mt.DeleteVersion(res.kBytes, r.seq)
+		case res.isPtr:
+			mt.PutVersion(res.kBytes, encodeValuePointer(res.vp), res.expAt, r.seq)
+			e.trackExpiry(res.kBytes, res.expAt)
+		default:
+			mt.PutVersion(res.kBytes, encodeInlineValue(res.vBytes), res.expAt, r.seq)
+			e.trackExpiry(res.kBytes, res.expAt)
+		}
+	}
+	return nil
+}
+
+// gcRewrite relocates a live value out of a segment being garbage collected.
+func (e *Engine) gcRewrite(r *writeReq) error {
+	mt := e.activeMemTable()
+	curVal, err := e.getWithoutLock(r.key)
+	if err != nil || !isValuePointer(curVal) {
+		return nil
+	}
+	if decodeValuePointer(curVal).Fid != r.expectedVp.Fid {
+		return nil
+	}
+
+	vvp, verr := e.vl.Write(&vlog.ValueEntry{
+		Op:        vlog.OpPut,
+		Key:       r.key,
+		Value:     r.val,
+		ExpiresAt: r.expiresAt,
+	})
+	if verr != nil {
+		return verr
+	}
+	_, _ = e.wal.WriteVersion(wal.OpPut, r.key, encodeWalValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
+	mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), r.expiresAt, r.seq)
+	e.trackExpiry(r.key, r.expiresAt)
+	return nil
+}
+
+func (e *Engine) flushBackpressure() {
+	e.memTableMu.Lock()
+	defer e.memTableMu.Unlock()
+
+	if e.activeMemTable().SizeInBytes() < e.opts.MemTableSize {
+		return
+	}
+	if e.immutableMemTable() != nil {
+		for e.immutableMemTable() != nil && e.ctx.Err() == nil {
+			e.l0Cond.Wait()
+		}
+		return
+	}
+	if task, err := e.triggerFlushLocked(); err == nil {
+		select {
+		case e.flushChan <- *task:
+		case <-e.ctx.Done():
+		}
+	}
+}
+
+func (e *Engine) notifyWrites(batch []*writeReq) {
+	for _, r := range batch {
+		if r.op == wal.OpPut || r.op == wal.OpDelete {
+			e.OnWrite(r.op, r.key, r.val, r.expiresAt)
+		}
+		for _, entry := range r.batch {
+			op := wal.OpPut
+			if entry.Deleted {
+				op = wal.OpDelete
+			}
+			e.OnWrite(op, []byte(entry.Key), []byte(entry.Value), entry.ExpiresAt)
+		}
+	}
+}
+
+func (e *Engine) keyStripe(key []byte) int {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h = (h ^ uint32(key[i])) * 16777619
+	}
+	return int(h % keyLockStripes)
+}
+
+func bumpUint64(addr *uint64, v uint64) {
+	for {
+		cur := atomic.LoadUint64(addr)
+		if v <= cur {
+			return
+		}
+		if atomic.CompareAndSwapUint64(addr, cur, v) {
+			return
+		}
+	}
+}
+
+func writerCount() int {
+	n := runtime.GOMAXPROCS(0)
+	if n > maxWriterGoroutines {
+		n = maxWriterGoroutines
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func OpenEngine(dataDir string) (*Engine, error) {
@@ -622,7 +760,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	}
 
 	walPath := filepath.Join(opts.DataDir, "wal.log")
-	w, err := wal.OpenWithOptions(walPath, true)
+	w, err := wal.OpenWithOptionsAndRegistry(walPath, true, opts.KeyRegistry)
 	if err != nil {
 		return nil, fmt.Errorf("open active wal: %w", err)
 	}
@@ -659,10 +797,21 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	e.lock = lock
 	e.memTable.Store(memtable.NewSkipList())
 	e.loadDiscardStats()
+	if opts.AdaptiveValueThreshold {
+		minT := opts.ValueThreshold
+		if minT <= 0 {
+			minT = defaultValueThreshold
+		}
+		maxT := opts.ValueThresholdMax
+		if maxT < minT {
+			maxT = minT
+		}
+		e.threshold = vlogthreshold.NewAdaptive(0.75, int64(minT), int64(maxT))
+	}
 
 	// open or create vlog
 	vlogDir := filepath.Join(opts.DataDir, "vlog")
-	e.vl, err = vlog.Open(vlogDir)
+	e.vl, err = vlog.OpenWithRegistry(vlogDir, opts.KeyRegistry)
 	if err != nil {
 		w.Close()
 		cancel()
@@ -708,6 +857,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	if maxSeq > 0 {
 		e.oracle.Bump(maxSeq)
 	}
+	e.activeMemTable().SeedVersion(atomic.LoadUint64(&e.oracle.nextTs))
 
 	// read manifest to figure out which level each table belongs to
 	manifestLevels := e.readManifest(mf)
@@ -715,7 +865,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 
 	// load tables into their correct levels
 	for seq, path := range sstBySeq {
-		sst, err := sstable.Open(path, blockCache)
+		sst, err := sstable.OpenWithRegistry(path, blockCache, opts.KeyRegistry)
 		if err != nil {
 			slog.Warn("skipping corrupt sstable", "file", path, "err", err)
 			continue
@@ -771,11 +921,14 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 		}
 	}
 
-	e.wg.Add(4)
+	e.wg.Add(3)
 	go e.flushWorker()
 	go e.compactionWorker()
 	go e.maintenanceWorker()
-	go e.writer()
+	for i := 0; i < writerCount(); i++ {
+		e.wg.Add(1)
+		go e.writer()
+	}
 
 	return e, nil
 }
@@ -827,7 +980,7 @@ func (e *Engine) executeFlush(task flushTask) {
 			ExpiresAt: ve.ExpiresAt,
 		}
 	}
-	sst, err := sstable.CreateAtLevel(sstName, entries, e.blockCache, 0)
+	sst, err := sstable.CreateAtLevelWithRegistry(sstName, entries, e.blockCache, 0, e.opts.KeyRegistry)
 	if err != nil {
 		slog.Error("flush error", "seq", task.seq, "err", err)
 		return
@@ -874,7 +1027,9 @@ func (e *Engine) executeFlush(task flushTask) {
 func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 	old := e.activeMemTable()
 	e.immMemTable.Store(old)
-	e.memTable.Store(memtable.NewSkipList())
+	newMem := memtable.NewSkipList()
+	newMem.SeedVersion(old.CurrentVersion())
+	e.memTable.Store(newMem)
 
 	seq := atomic.AddUint64(&e.nextSeq, 1)
 	oldWalPath := filepath.Join(e.dataDir, fmt.Sprintf("wal_flush_%06d.log", seq))
@@ -889,8 +1044,8 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 		return nil, fmt.Errorf("rotate active wal: %w", err)
 	}
 
-	reopenedOldWal, _ := wal.Open(oldWalPath)
-	newWal, err := wal.Open(activeWalPath)
+	reopenedOldWal, _ := wal.OpenWithOptionsAndRegistry(oldWalPath, false, e.opts.KeyRegistry)
+	newWal, err := wal.OpenWithOptionsAndRegistry(activeWalPath, false, e.opts.KeyRegistry)
 	if err != nil {
 		e.walMu.Unlock()
 		return nil, fmt.Errorf("create new wal: %w", err)
@@ -918,7 +1073,15 @@ func (e *Engine) Put(key, val string) error {
 	return e.PutEx(key, val, 0)
 }
 
+func (e *Engine) PutWithOptions(key, val string, opts server.WriteOptions) error {
+	return e.PutExWithOptions(key, val, 0, opts)
+}
+
 func (e *Engine) PutEx(key, val string, ttlSeconds int64) error {
+	return e.PutExWithOptions(key, val, ttlSeconds, server.WriteOptions{})
+}
+
+func (e *Engine) PutExWithOptions(key, val string, ttlSeconds int64, opts server.WriteOptions) error {
 	var expiresAt int64
 	if ttlSeconds > 0 {
 		expiresAt = time.Now().Unix() + ttlSeconds
@@ -932,6 +1095,8 @@ func (e *Engine) PutEx(key, val string, ttlSeconds int64) error {
 		key:       kBytes,
 		val:       vBytes,
 		expiresAt: expiresAt,
+		skipWAL:   opts.SkipWAL,
+		syncWAL:   opts.Sync,
 		errCh:     make(chan incrResult, 1),
 	}
 	e.writeReq <- req
@@ -1162,22 +1327,37 @@ func (e *Engine) getByKey(kBytes []byte) ([]byte, error) {
 	return e.getWithoutLock(kBytes)
 }
 
+// applyEntryOpts writes a single entry, optionally bypassing the WAL and VLog
+// so that ephemeral writes land only in the memory table.
+func (e *Engine) applyEntryOpts(op byte, key, val []byte, expiresAt int64, seq uint64, skipWAL bool) error {
+	if !skipWAL {
+		return e.applyEntry(op, key, val, expiresAt, seq)
+	}
+	mt := e.activeMemTable()
+	if op == wal.OpDelete {
+		mt.DeleteVersion(key, seq)
+		return nil
+	}
+	e.recordValueSize(len(val))
+	mt.PutVersion(key, encodeInlineValue(val), expiresAt, seq)
+	e.trackExpiry(key, expiresAt)
+	return nil
+}
+
 // applyEntry writes a single entry to WAL/VLog + memtable.
 // Safe for concurrent use: WAL has group commit, memtable is lock-free.
 func (e *Engine) applyEntry(op byte, key, val []byte, expiresAt int64, seq uint64) error {
 	mt := e.activeMemTable()
-	threshold := e.opts.ValueThreshold
-	if threshold <= 0 {
-		threshold = defaultValueThreshold
-	}
+	threshold := e.valueThreshold()
 	if op == wal.OpDelete {
 		_, werr := e.wal.WriteVersion(wal.OpDelete, key, nil, 0, seq)
 		if werr != nil {
 			return werr
 		}
-		mt.Delete(key)
+		mt.DeleteVersion(key, seq)
 		return nil
 	}
+	e.recordValueSize(len(val))
 	if len(val) < threshold {
 		_, werr := e.wal.WriteVersion(wal.OpPut, key, val, expiresAt, seq)
 		if werr != nil {
@@ -1221,7 +1401,7 @@ func (e *Engine) submitBatch(entries []server.BatchWriteEntry) error {
 
 func (e *Engine) getByPrefix(prefix []byte) map[string][]byte {
 	result := make(map[string][]byte)
-	merged, iters := e.buildMergedIterator(prefix)
+	merged, iters := e.buildMergedIteratorFiltered(prefix, prefixFilterKey(prefix))
 	defer func() {
 		for _, it := range iters {
 			_ = it.Close()
@@ -1429,7 +1609,7 @@ func (e *Engine) maintenanceWorker() {
 			if maxDiscard > 16*1024*1024 {
 				go func(fid uint32, disc int64) {
 					slog.Info("starting vlog GC via discard stats", "fid", fid, "discarded_bytes", disc)
-					if err := e.RunValueLogGC(fid); err != nil {
+					if err := e.runValueLogGCInternal(fid); err != nil {
 						slog.Error("vlog GC failed", "fid", fid, "err", err)
 					}
 				}(bestFid, maxDiscard)
@@ -1517,7 +1697,35 @@ func (e *Engine) totalLevelSize(lvl int) int64 {
 	return total
 }
 
+// tombstoneVictim returns the level and table with the highest tombstone ratio
+// above tombstoneCompactionRatio, prioritizing tables that waste the most read
+// work (deepest level first).
+func (e *Engine) tombstoneVictim() (int, *sstable.SSTable) {
+	for lvl := MaxLevels - 2; lvl >= 0; lvl-- {
+		e.levelMu[lvl].RLock()
+		var victim *sstable.SSTable
+		for _, t := range e.levels[lvl] {
+			if t.TombstoneRatio() > tombstoneCompactionRatio {
+				victim = t
+				break
+			}
+		}
+		e.levelMu[lvl].RUnlock()
+		if victim != nil {
+			return lvl, victim
+		}
+	}
+	return -1, nil
+}
+
 func (e *Engine) Compact() error {
+	if lvl, victim := e.tombstoneVictim(); victim != nil {
+		if lvl == 0 {
+			return e.compactLevel0()
+		}
+		return e.compactLevelTable(lvl, victim)
+	}
+
 	threshold := e.opts.CompactionThreshold
 	if threshold < 1 {
 		threshold = 1
@@ -1648,16 +1856,23 @@ func (e *Engine) compactLevel(fromLevel int) error {
 		return nil
 	}
 
-	toLevel := fromLevel + 1
-
-	// grab source tables
-	e.levelMu[fromLevel].Lock()
+	e.levelMu[fromLevel].RLock()
 	if len(e.levels[fromLevel]) == 0 {
-		e.levelMu[fromLevel].Unlock()
+		e.levelMu[fromLevel].RUnlock()
 		return nil
 	}
 	pick := e.levels[fromLevel][0]
-	e.levelMu[fromLevel].Unlock()
+	e.levelMu[fromLevel].RUnlock()
+
+	return e.compactLevelTable(fromLevel, pick)
+}
+
+func (e *Engine) compactLevelTable(fromLevel int, pick *sstable.SSTable) error {
+	if fromLevel >= MaxLevels-1 {
+		return nil
+	}
+
+	toLevel := fromLevel + 1
 
 	// find overlapping tables in target level
 	var overlaps []*sstable.SSTable
@@ -1886,7 +2101,7 @@ func (e *Engine) writeSSTablesAtLevel(entries []memtable.Entry, level int) []*ss
 
 		seq := atomic.AddUint64(&e.nextSeq, 1)
 		sstName := filepath.Join(e.dataDir, fmt.Sprintf("%06d.sst", seq))
-		sst, err := sstable.CreateAtLevel(sstName, batch, e.blockCache, level)
+		sst, err := sstable.CreateAtLevelWithRegistry(sstName, batch, e.blockCache, level, e.opts.KeyRegistry)
 		if err != nil {
 			slog.Error("error creating sstable", "level", level, "err", err)
 			continue
@@ -2050,6 +2265,12 @@ func (e *Engine) readManifest(mf *os.File) map[uint64]int {
 
 // builds a merged iterator across all levels + memtables
 func (e *Engine) buildMergedIterator(seekKey []byte) (*iterator.MergedIterator, []iterator.Iterator) {
+	return e.buildMergedIteratorFiltered(seekKey, nil)
+}
+
+// buildMergedIteratorFiltered additionally skips SSTables whose prefix bloom
+// filter proves that no key under prefixCheck can be present.
+func (e *Engine) buildMergedIteratorFiltered(seekKey, prefixCheck []byte) (*iterator.MergedIterator, []iterator.Iterator) {
 	var iters []iterator.Iterator
 	var priorities []int
 
@@ -2074,6 +2295,9 @@ func (e *Engine) buildMergedIterator(seekKey []byte) (*iterator.MergedIterator, 
 		copy(snapshot, e.levels[lvl])
 		e.levelMu[lvl].RUnlock()
 		for i := len(snapshot) - 1; i >= 0; i-- {
+			if prefixCheck != nil && !snapshot[i].MayContainPrefix(prefixCheck) {
+				continue
+			}
 			it := snapshot[i].NewIterator()
 			it.Seek(seekKey)
 			iters = append(iters, it)
@@ -2083,6 +2307,16 @@ func (e *Engine) buildMergedIterator(seekKey []byte) (*iterator.MergedIterator, 
 	}
 
 	return iterator.NewMergedIteratorWithDiscard(iters, priorities, e.addDiscard), iters
+}
+
+// prefixFilterKey returns the composite-key prefix that the SSTable prefix
+// bloom filter was built from, or nil when prefix filtering is not applicable.
+func prefixFilterKey(prefix []byte) []byte {
+	p := encoding.ExtractPrefix(prefix)
+	if len(p) < len(prefix) && prefix[len(p)] == 0 {
+		return p
+	}
+	return nil
 }
 
 func (e *Engine) ScanKeys(pattern string) ([]string, error) {
@@ -2351,6 +2585,7 @@ func (e *Engine) StreamSnapshot(fn func(op byte, key, val []byte, expiresAt int6
 }
 
 const opClear byte = 130
+const opFlush byte = 131
 
 func (e *Engine) Clear() error {
 	// Send through the write channel so the writer goroutine handles
@@ -2386,7 +2621,7 @@ func (e *Engine) clearInternal() error {
 	_ = e.wal.Close()
 	walPath := filepath.Join(e.dataDir, "wal.log")
 	_ = os.Remove(walPath)
-	newWal, err := wal.Open(walPath)
+	newWal, err := wal.OpenWithOptionsAndRegistry(walPath, false, e.opts.KeyRegistry)
 	if err != nil {
 		return err
 	}
@@ -2487,7 +2722,39 @@ func (e *Engine) compactManifest() error {
 	return nil
 }
 
-func (e *Engine) RunValueLogGC(targetFid uint32) error {
+func (e *Engine) RunValueLogGC(discardRatio float64) error {
+	e.discardMu.Lock()
+	var bestFid uint32
+	var maxStale int64
+	for fid, stale := range e.discardStats {
+		if stale > maxStale {
+			maxStale = stale
+			bestFid = fid
+		}
+	}
+	e.discardMu.Unlock()
+
+	if bestFid == 0 || maxStale == 0 {
+		return ErrNoRewrite
+	}
+
+	path := filepath.Join(e.dataDir, "vlog", fmt.Sprintf("vlog_%06d.log", bestFid))
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if fi.Size() == 0 {
+		return ErrNoRewrite
+	}
+
+	if float64(maxStale)/float64(fi.Size()) < discardRatio {
+		return ErrNoRewrite
+	}
+
+	return e.runValueLogGCInternal(bestFid)
+}
+
+func (e *Engine) runValueLogGCInternal(targetFid uint32) error {
 	gcTs := atomic.LoadUint64(&e.oracle.nextTs)
 	atomic.StoreUint64(&e.gcDiscardTs, gcTs)
 

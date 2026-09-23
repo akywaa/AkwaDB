@@ -15,6 +15,10 @@ type Config struct {
 	BlockCacheSize     int   `mapstructure:"block_cache_size"`
 	MaxDiskBytes       int64 `mapstructure:"max_disk_bytes"`
 	ReplBacklogSize    int   `mapstructure:"repl_backlog_size"`
+
+	// EncryptionKey is a hex-encoded master key (32 bytes / 64 hex chars for AES-256).
+	EncryptionKey     string `mapstructure:"encryption_key"`
+	EncryptionKeyPath string `mapstructure:"encryption_key_path"`
 }
 
 func Default() *Config {
@@ -44,6 +48,8 @@ func Load(path string) *Config {
 	v.SetDefault("block_cache_size", cfg.BlockCacheSize)
 	v.SetDefault("max_disk_bytes", cfg.MaxDiskBytes)
 	v.SetDefault("repl_backlog_size", cfg.ReplBacklogSize)
+	v.SetDefault("encryption_key", "")
+	v.SetDefault("encryption_key_path", "")
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {

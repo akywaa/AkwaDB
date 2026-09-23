@@ -68,8 +68,8 @@ func TestSkipList_TTL(t *testing.T) {
 	sl.Put([]byte("valid"), []byte("val"), now+100)
 	sl.Put([]byte("expired"), []byte("val"), now-1)
 
-	if _, found, _, _ := sl.Get([]byte("expired")); found {
-		t.Error("expired key must not be found on Get")
+	if _, found, deleted, _ := sl.Get([]byte("expired")); !found || !deleted {
+		t.Error("expired key must be reported as a tombstone on Get")
 	}
 
 	entries := sl.All()

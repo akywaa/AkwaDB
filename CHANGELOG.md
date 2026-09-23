@@ -94,3 +94,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Cursor-Based Zero-Allocation SkipList Iterator**: Replaced full slice-copy snapshots (`s.All()`) inside `SkipList.NewIterator()` with a lazy, lock-free cursor iterating directly over level-0 forward pointers (`fwd[0]`). This completely eliminates $O(N)$ heap allocations and GC pause spikes on collection and prefix operations (`SADD`, `HGETALL`, `SMEMBERS`, `SCAN`).
 - **Memory Arena Safety**: Hardened `byteSlab` lifecycle management to prevent use-after-free and buffer race conditions when slabs are recycled under active read iterators.
+
+## [0.1.7] - 2026-09-23
+
+### Added
+
+- **Enterprise Encryption at Rest (TDE)**: Integrated native, zero-Cgo envelope encryption (`internal/crypto`):
+  - Centralized `KeyRegistry` managing encrypted 256-bit Data Encryption Keys (DEKs) authenticated via a Master Key (KEK).
+  - SSTable 4KB blocks protected via hardware-accelerated AES-256-GCM authenticated encryption (AEAD).
+  - Value Log (VLog) and WAL random-offset data streaming secured via AES-CTR, computing block counters dynamically (`Counter = baseIV + offset/16`) to preserve sub-millisecond point-lookup reads without full-segment decryption.
+  - Native AES-NI hardware acceleration using Go standard library `crypto/aes` (3–6 GB/s per core).
+- **Dynamic Adaptive VLog Thresholding**: Introduced `AdaptiveThreshold` sliding-window percentile evaluation (`internal/vlogthreshold`), continuously profiling payload size distributions. Replaced the static 128-byte cutoff with dynamic inline boundaries (75th percentile), preventing pointer metadata bloat on sub-kilobyte payloads.
+- **Level-Aware SSTable Compression**: Block codecs are now selected by destination level — S2/Snappy for hot L0–L1 tables and ZSTD for cold L2+ tables — reducing the on-disk footprint of deep levels by 30–50%. The chosen codec travels in the SSTable footer and is resolved transparently during block reads.
+- **Garbage-Ratio Value Log GC**: `Engine.RunValueLogGC` now takes a `discardRatio` (0.0–1.0), automatically picks the most polluted VLog segment, and returns the new `ErrNoRewrite` when no segment exceeds the threshold, replacing the previous API that required callers to supply a concrete segment `fid`.
+- **Managed Transaction Timestamps**: Added `Engine.NewTransactionAt(readTs, readOnly)` and `Tx.CommitAt(commitTs)` so distributed deployments can drive MVCC snapshot reads and commits from an external clock (HLC/TSO) instead of the local Oracle. `Tx.Rollback()` releases managed transactions that are abandoned before commit.
+
+### Fixed
+
+- **SSTable Block Search Miss on Version Zero**: `scanBlockForKeyBinary` now flags the first matching record as found (`!found || hdr.Version > bestVersion`) instead of requiring a strictly greater version, so records stored without an explicit MVCC version are no longer dropped for blocks that contain multiple restart points.
+
+---
+
+## [0.1.8] - 2026-09-23
+
+### Added
+
+- **Prefix Bloom Filters**: SSTables now persist a second bloom filter keyed on the composite-key prefix (`type\x00key`), recorded in the footer and resolved lazily on read. Prefix range scans (`HGETALL`, `HKEYS`, `HLEN`, `SMEMBERS`, `ZRANGEBYSCORE`) skip tables whose prefix filter proves the key range absent, avoiding data block reads on levels that cannot contain a match.
+- **Instant Hardlink Checkpoints**: `Engine.CreateCheckpoint(backupDir)` force-flushes the active MemTable through the writer pipeline, then hardlinks SSTables, closed VLog segments and the MANIFEST into the backup directory while copying only the append-only WAL and active VLog segment. Backup time is independent of database size and writers are never blocked.
+- **SST Ingestion (Bulk Loading)**: `Engine.Ingest(sstPaths)` validates ingested tables (value-log pointer rejection, self-overlap and per-level overlap checks), moves them into the data directory, assigns fresh sequence numbers and registers them in the MANIFEST via `os.Rename`, bypassing WAL, MemTable and compaction.
+- **Tombstone-Driven Compaction**: SSTables persist their dead-key ratio as basis points in the footer (`TombstoneRatio()`), and `Engine.Compact()` force-schedules any table above `tombstoneCompactionRatio` (40%) ahead of the size-ratio scoring so delete/TTL graveyards are reclaimed promptly.
+- **SkipWAL (Hybrid Ephemeral) Mode**: Added `server.WriteOptions` and `Engine.PutWithOptions` / `PutExWithOptions`. `SkipWAL` stores values inline in the MemTable without touching the WAL or ValueLog, and the RESP `SET key val [SKIPWAL|SYNC]` syntax exposes it to clients.
+- **Pipelined Concurrent Writers**: The single writer goroutine was replaced by a pool of writers sharing the request channel, each draining its own micro-batch. Independent writes now assign commit timestamps, append to the WAL and apply to the lock-free MemTable in parallel, while `INCR` is serialized per key stripe and a WAL append lock keeps atomic batch rollback correct.
+
+### Changed
+
+- **Unified Two-Level Index & Bloom Filter Caching**: Upgraded SSTable memory budgeting by moving flat block indexes and Bloom filter bitmaps out of static process RAM and into a shared, cost-aware Ristretto / LRU cache hierarchy. Bound memory consumption remains deterministic even when scaling past 10,000 active SSTables.
+
+### Fixed
+
+- **Post-Flush Read Visibility**: The MemTable version horizon was reset whenever a MemTable was flushed, so plain reads (`GET`, `ScanKeys`) stopped seeing already-flushed entries because they resolved at version `0`. Fresh MemTables now inherit the previous table's version counter (`SkipList.SeedVersion`), and recovery seeds it from the recovered timestamp horizon.
+- **Single-Key Delete Versioning**: `applyEntry` now writes deletes with the request commit timestamp (`DeleteVersion`) instead of relying on the MemTable auto-increment, matching the atomic batch path so snapshot reads observe tombstones consistently.
