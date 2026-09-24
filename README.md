@@ -31,14 +31,13 @@ Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provi
 
 ```mermaid
 flowchart TD
-    %% Styling
     classDef client fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
     classDef memory fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff;
     classDef disk fill:#059669,stroke:#047857,stroke-width:2px,color:#fff;
     classDef engine fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc;
     classDef crypto fill:#b45309,stroke:#d97706,stroke-width:2px,color:#fff;
 
-    Client["fa:fa-terminal Redis Client / SDK (RESP)"]:::client
+    Client["Redis Client / SDK (RESP)"]:::client
 
     subgraph Srv ["AkwaDB Server Layer"]
         RESP["RESP Parser & Router"]:::engine
@@ -48,12 +47,12 @@ flowchart TD
 
     subgraph Memory ["In-Memory Write Pipeline"]
         Writers["Pipelined Writers (Worker Pool)"]:::memory
-        MemTable["Lock-Free SkipList\n(64KB Slab Bump Arena + Fixed Tower)"]:::memory
-        WAL["Write-Ahead Log (WAL)\n(Group Commit + AES-CTR)"]:::disk
+        MemTable["Lock-Free SkipList<br/>(64KB Slab Bump Arena + Fixed Tower)"]:::memory
+        WAL["Write-Ahead Log (WAL)<br/>(Group Commit + AES-CTR)"]:::disk
     end
 
-    subgraph WiscKey ["WiscKey Value Separation (Adaptive Threshold)"]
-        Router{"Payload Size ≥ Threshold?"}:::crypto
+    subgraph WiscKey ["WiscKey Value Separation"]
+        Router{"Payload Size vs Threshold"}:::crypto
     end
 
     subgraph Storage ["Flash Storage Engine (LSM & VLog)"]
@@ -63,14 +62,13 @@ flowchart TD
             L1["L1: Hot Tables (S2/Snappy)"]:::disk
             L2["L2+: Cold Tables (ZSTD)"]:::disk
         end
-        VLog["Segmented Value Log (VLog)\n(AES-CTR Encrypted Segments)"]:::disk
-        Cache["Two-Level Block Cache\n(LRU / TinyLFU / Prefix Bloom)"]:::memory
+        VLog["Segmented Value Log (VLog)<br/>(AES-CTR Encrypted Segments)"]:::disk
+        Cache["Two-Level Block Cache<br/>(LRU / TinyLFU / Prefix Bloom)"]:::memory
     end
 
     subgraph Background ["Autonomous Background Workers"]
-        Compaction["Compaction Worker\n(Size-Ratio + Tombstones)"]:::engine
-        VLogGC["Value Log GC\n(Discard-Ratio Prioritized)"]:::engine
-        TTL["TTL Expiry Sweep"]:::engine
+        Compaction["Compaction Worker<br/>(Size-Ratio + Tombstones)"]:::engine
+        VLogGC["Value Log GC<br/>(Discard-Ratio Prioritized)"]:::engine
     end
 
     Client -->|TCP Wire| RESP
@@ -81,15 +79,17 @@ flowchart TD
     Writers --> WAL
     Writers --> Router
 
-    Router -->|< Threshold (Inline)| MemTable
-    Router -->|≥ Threshold (Large)| VLog
-    VLog -.->|ValuePointer (16B)| MemTable
+    Router -->|Small: Inline| MemTable
+    Router -->|Large: Pointer| VLog
+    VLog -.->|ValuePointer 16B| MemTable
 
     MemTable -->|Async Flush| L0
-    L0 --> L1 --> L2
+    L0 --> L1
+    L1 --> L2
 
-    Cache <--> LSM
-    Compaction --> LSM
+    Cache <--> L0
+    Cache <--> L1
+    Compaction --> L0
     VLogGC --> VLog
 ```
 
