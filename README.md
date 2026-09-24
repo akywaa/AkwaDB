@@ -9,7 +9,7 @@
 
 **AkwaDB** is a high-performance, flash-optimized persistent key-value storage engine engineered in pure Go. It combines a multi-level LSM-tree with WiscKey key-value separation, Serializable Snapshot Isolation (SSI / MVCC), enterprise at-rest encryption (TDE), and drop-in Redis (RESP) protocol compatibility.
 
-Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provides rich native data structures (Strings, Hashes, Lists, Sets, ZSets, Bitmaps) backed by a flash-optimized storage engine with native Linux `io_uring` support, zero-allocation memory arenas, and distributed Raft consensus — compiled as a single zero-Cgo static binary.
+Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provides rich native data structures (Strings, Hashes, Lists, Sets, ZSets, Bitmaps) backed by a flash-optimized storage engine with native Linux `io_uring` support, zero-allocation memory arenas, and distributed Raft consensus - compiled as a single zero-Cgo static binary.
 
 ---
 
@@ -29,35 +29,68 @@ Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provi
 
 ## Core Architecture
 
-```
-                                  +-----------------------+
-                                  |   Redis Client / CLI  |
-                                  +-----------+-----------+
-                                              | RESP Wire
-                                              v
-+---------------------------------------------------------------------------------+
-| AkwaDB Server Engine                                                            |
-|                                                                                 |
-|  [ RESP Streaming Parser ] ----> [ Concurrency Oracle & SSI Watermark ]         |
-|                                                  |                              |
-|           +--------------------------------------+--------------------+         |
-|           | (<128B Values & Pointers)                                 | (Large) |
-|           v                                                           v         |
-|  +---------------------------+                             +------------------+ |
-|  | MemTable (Lock-free Skip) |                             | Value Log (VLog) | |
-|  | * 64KB Slab Bump Arena    |                             | * Standalone Segs| |
-|  | * Fixed Inline Tower      |                             | * Discard GC     | |
-|  +-------------+-------------+                             +--------+---------+ |
-|                | Flush (L0)                                         ^           |
-|                v                                                    |           |
-|  +---------------------------+                                      |           |
-|  | Leveled LSM Storage       |                                      |           |
-|  | * Block Restarts (4KB)    | -------------------------------------+ (Pointers)|
-|  | * S2 / Snappy Compression |                                                  |
-|  | * Dual-Hash Bloom Filter  |                                                  |
-|  | * Linux io_uring Worker   |                                                  |
-|  +---------------------------+                                                  |
-+---------------------------------------------------------------------------------+
+```mermaid
+flowchart TD
+    %% Styling
+    classDef client fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+    classDef memory fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff;
+    classDef disk fill:#059669,stroke:#047857,stroke-width:2px,color:#fff;
+    classDef engine fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc;
+    classDef crypto fill:#b45309,stroke:#d97706,stroke-width:2px,color:#fff;
+
+    Client["fa:fa-terminal Redis Client / SDK (RESP)"]:::client
+
+    subgraph Srv ["AkwaDB Server Layer"]
+        RESP["RESP Parser & Router"]:::engine
+        Raft["HashiCorp Raft Consensus"]:::engine
+        Oracle["Concurrency Oracle (SSI / MVCC)"]:::engine
+    end
+
+    subgraph Memory ["In-Memory Write Pipeline"]
+        Writers["Pipelined Writers (Worker Pool)"]:::memory
+        MemTable["Lock-Free SkipList\n(64KB Slab Bump Arena + Fixed Tower)"]:::memory
+        WAL["Write-Ahead Log (WAL)\n(Group Commit + AES-CTR)"]:::disk
+    end
+
+    subgraph WiscKey ["WiscKey Value Separation (Adaptive Threshold)"]
+        Router{"Payload Size ≥ Threshold?"}:::crypto
+    end
+
+    subgraph Storage ["Flash Storage Engine (LSM & VLog)"]
+        direction TB
+        subgraph LSM ["Multi-Level LSM Tree"]
+            L0["L0: SSTables (Flush Target)"]:::disk
+            L1["L1: Hot Tables (S2/Snappy)"]:::disk
+            L2["L2+: Cold Tables (ZSTD)"]:::disk
+        end
+        VLog["Segmented Value Log (VLog)\n(AES-CTR Encrypted Segments)"]:::disk
+        Cache["Two-Level Block Cache\n(LRU / TinyLFU / Prefix Bloom)"]:::memory
+    end
+
+    subgraph Background ["Autonomous Background Workers"]
+        Compaction["Compaction Worker\n(Size-Ratio + Tombstones)"]:::engine
+        VLogGC["Value Log GC\n(Discard-Ratio Prioritized)"]:::engine
+        TTL["TTL Expiry Sweep"]:::engine
+    end
+
+    Client -->|TCP Wire| RESP
+    RESP --> Raft
+    RESP --> Oracle
+    RESP --> Writers
+
+    Writers --> WAL
+    Writers --> Router
+
+    Router -->|< Threshold (Inline)| MemTable
+    Router -->|≥ Threshold (Large)| VLog
+    VLog -.->|ValuePointer (16B)| MemTable
+
+    MemTable -->|Async Flush| L0
+    L0 --> L1 --> L2
+
+    Cache <--> LSM
+    Compaction --> LSM
+    VLogGC --> VLog
 ```
 
 ### Storage Subsystems
@@ -65,7 +98,7 @@ Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provi
 * **Key-Value Separation (WiscKey Architecture)**: Small values (< 128 bytes) reside inline inside LSM SSTables to preserve sequential scan performance. Payloads exceeding the threshold are written sequentially into segmented Value Logs (`vlog_*.log`), returning 16-byte references (`ValuePointer`). Write amplification during compaction drops by up to 10x.
 * **Low-Overhead MemTable**: Implemented as a lock-free SkipList featuring an embedded pointer array (`fwd [16]unsafe.Pointer`) directly within the `Node` struct. Eliminates slice allocation overhead, enforces CPU cacheline locality, and draws memory from reusable `sync.Pool` byte slabs.
 * **Two-Level Block Indexing & Block Restarts**: SSTable data blocks (4KB) store prefix restart intervals (`restartInterval = 16`), allowing binary searches within uncompressed blocks prior to linear fallback scanning.
-* **Level-Aware Block Compression**: Block codecs are selected per LSM level — S2/Snappy for hot L0–L1 tables and ZSTD for cold L2+ tables — trading a small CPU cost on deep levels for 30–50% smaller on-disk footprint. The codec is recorded in the SSTable footer and resolved transparently on read.
+* **Level-Aware Block Compression**: Block codecs are selected per LSM level - S2/Snappy for hot L0–L1 tables and ZSTD for cold L2+ tables - trading a small CPU cost on deep levels for 30–50% smaller on-disk footprint. The codec is recorded in the SSTable footer and resolved transparently on read.
 * **Prefix Bloom Filters**: Every SSTable also carries a compact second bloom filter keyed on the composite-key prefix (`type\x00key`). Hash, set and sorted-set range scans (`HGETALL`, `SMEMBERS`, `ZRANGEBYSCORE`) can therefore skip any table that provably holds no key under the requested prefix, without touching a single data block.
 * **Instant Checkpoints**: `CreateCheckpoint` flushes the active MemTable and then hardlinks every immutable SSTable, closed VLog segment and the MANIFEST into the backup directory, copying only the actively appended WAL and VLog segment. Backup cost is independent of database size and never blocks writers.
 * **SST Ingestion (Bulk Loading)**: `Ingest` adopts externally built SSTables directly into an LSM level after validating key-range overlap and rejecting value-log pointers, so bulk migrations bypass the WAL, MemTable and compaction pipeline entirely.
