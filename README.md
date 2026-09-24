@@ -1,11 +1,23 @@
-# AkwaDB
+<p align="center">
+  <img src="assets/icon.png" alt="AkwaDB Logo" width="120" height="120">
+</p>
 
-[![Go Version](https://img.shields.io/badge/go-1.26.5-007d9c?style=flat-square&logo=go&logoColor=white)](https://golang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Protocol](https://img.shields.io/badge/protocol-RESP%20(Redis)-d82c20?style=flat-square&logo=redis&logoColor=white)](https://redis.io)
-[![I/O Engine](https://img.shields.io/badge/async_I%2FO-Linux_io__uring-333333?style=flat-square&logo=linux&logoColor=white)](https://kernel.org)
-[![Isolation](https://img.shields.io/badge/isolation-SSI_%2F_MVCC-green?style=flat-square)]()
-[![Pure Go](https://img.shields.io/badge/dependencies-zero--Cgo-success?style=flat-square)]()
+<h1 align="center">AkwaDB</h1>
+
+<p align="center">
+  <strong>High-performance, flash-optimized persistent key-value storage engine in pure Go.</strong>
+</p>
+
+<p align="center">
+  <a href="https://golang.org"><img src="https://img.shields.io/badge/go-1.26.5-007d9c?style=flat-square&logo=go&logoColor=white" alt="Go Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
+  <a href="https://redis.io"><img src="https://img.shields.io/badge/protocol-RESP%20(Redis)-d82c20?style=flat-square&logo=redis&logoColor=white" alt="Protocol"></a>
+  <a href="https://kernel.org"><img src="https://img.shields.io/badge/async_I%2FO-Linux_io__uring-333333?style=flat-square&logo=linux&logoColor=white" alt="I/O Engine"></a>
+  <img src="https://img.shields.io/badge/isolation-SSI_%2F_MVCC-green?style=flat-square" alt="Isolation">
+  <img src="https://img.shields.io/badge/dependencies-zero--Cgo-success?style=flat-square" alt="Pure Go">
+</p>
+
+<br>
 
 **AkwaDB** is a high-performance, flash-optimized persistent key-value storage engine engineered in pure Go. It combines a multi-level LSM-tree with WiscKey key-value separation, Serializable Snapshot Isolation (SSI / MVCC), enterprise at-rest encryption (TDE), and drop-in Redis (RESP) protocol compatibility.
 
