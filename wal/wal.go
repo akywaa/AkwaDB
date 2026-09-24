@@ -32,9 +32,9 @@ const walHeaderSize = 29
 // Encrypted WAL files start with a plaintext header:
 // magic(4) + version(4) + keyID(8) + baseIV(16) = 32 bytes.
 const (
-	walFileMagic    uint32 = 0x57414C46 // "WALF"
-	walFileVersion  uint32 = 1
-	walEncHeaderSize       = 32
+	walFileMagic     uint32 = 0x57414C46 // "WALF"
+	walFileVersion   uint32 = 1
+	walEncHeaderSize        = 32
 )
 
 type Record struct {
@@ -71,6 +71,8 @@ type WAL struct {
 	baseIV    []byte
 	key       []byte
 	fileHdr   int64 // size of the encrypted file header (0 when plaintext)
+
+	wg sync.WaitGroup // tracks the group commit goroutine
 }
 
 func Open(path string) (*WAL, error) {
@@ -155,6 +157,7 @@ func OpenWithOptionsAndRegistry(path string, syncOnWrite bool, reg *crypto.KeyRe
 
 	if syncOnWrite {
 		w.writeQueue = make(chan writeTask, 1024)
+		w.wg.Add(1)
 		go w.groupCommitLoop()
 	}
 	return w, nil
@@ -260,6 +263,7 @@ func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uin
 
 // groupCommitLoop drains the write queue in batches and fsyncs once per batch.
 func (w *WAL) groupCommitLoop() {
+	defer w.wg.Done()
 	var batch []writeTask
 	for {
 		task, ok := <-w.writeQueue
@@ -268,7 +272,7 @@ func (w *WAL) groupCommitLoop() {
 		}
 		batch = append(batch[:0], task)
 
-		drain:
+	drain:
 		for len(batch) < 256 {
 			select {
 			case t := <-w.writeQueue:
@@ -462,13 +466,21 @@ func (w *WAL) ReadValue(offset uint64, size uint32) ([]byte, error) {
 
 func (w *WAL) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.writer != nil {
 		_ = w.writer.Flush()
 	}
 	if w.writeQueue != nil {
 		close(w.writeQueue)
+		w.writeQueue = nil
 	}
+	w.mu.Unlock()
+
+	// Wait for the group commit goroutine to drain the queue and exit before
+	// closing the file out from under it.
+	w.wg.Wait()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.file != nil {
 		return w.file.Close()
 	}

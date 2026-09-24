@@ -35,8 +35,16 @@ func CryptAtOffset(key, baseIV []byte, offset int64, data []byte) error {
 	iv := make([]byte, aes.BlockSize)
 	copy(iv, baseIV)
 	blockNum := uint64(offset / aes.BlockSize)
+	// Advance the counter as a full 128-bit big-endian integer, exactly like
+	// cipher.NewCTR does per block. Adding only to the low 64 bits would drop
+	// the carry and desynchronize the keystream near 2^64.
 	low := binary.BigEndian.Uint64(iv[8:16])
-	binary.BigEndian.PutUint64(iv[8:16], low+blockNum)
+	sum := low + blockNum
+	binary.BigEndian.PutUint64(iv[8:16], sum)
+	if sum < low {
+		high := binary.BigEndian.Uint64(iv[0:8])
+		binary.BigEndian.PutUint64(iv[0:8], high+1)
+	}
 
 	stream := cipher.NewCTR(block, iv)
 	if rem := int(offset % aes.BlockSize); rem > 0 {

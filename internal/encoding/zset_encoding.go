@@ -8,6 +8,9 @@ import (
 // EncodeScore converts float64 to bytes that sort lexicographically in the same
 // order as the numeric values (including negatives).
 func EncodeScore(score float64) []byte {
+	if score == 0 {
+		score = 0
+	}
 	bits := math.Float64bits(score)
 	if score >= 0 {
 		bits ^= (1 << 63)

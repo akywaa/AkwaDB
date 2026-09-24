@@ -123,19 +123,13 @@ func (s *SkipList) findSpliceForLevel(curr *Node, key []byte, level int, update 
 	return curr
 }
 
-// PutVersion inserts or replaces a key with an explicit version number.
-// Lock-free: uses CAS for level extension and node linking.
-// If version is 0, an auto-incrementing version is assigned.
 func (s *SkipList) PutVersion(key, val []byte, expiresAt int64, version uint64) {
 	if version == 0 {
 		version = atomic.AddUint64(&s.versionCounter, 1)
 	} else {
 		for {
 			cur := atomic.LoadUint64(&s.versionCounter)
-			if version <= cur {
-				break
-			}
-			if atomic.CompareAndSwapUint64(&s.versionCounter, cur, version) {
+			if version <= cur || atomic.CompareAndSwapUint64(&s.versionCounter, cur, version) {
 				break
 			}
 		}
@@ -144,58 +138,41 @@ func (s *SkipList) PutVersion(key, val []byte, expiresAt int64, version uint64) 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	pUpd := updatePool.Get().(*[]*Node)
-	update := *pUpd
-	defer returnUpdatePool(pUpd)
+	var update [inlineTowerSize]*Node
+	curr := s.head
+	curLevel := int(s.level.Load())
 
-insert:
-	for {
-		curLevel := int(s.level.Load())
-		for i := 0; i < curLevel; i++ {
-			update[i] = nil
+	for i := curLevel - 1; i >= 0; i-- {
+		next := loadForward(curr, i)
+		for next != nil && bytes.Compare(next.key, key) < 0 {
+			curr = next
+			next = loadForward(curr, i)
 		}
-
-		curr := s.head
-		for i := curLevel - 1; i >= 0; i-- {
-			next := loadForward(curr, i)
-			for next != nil && bytes.Compare(next.key, key) < 0 {
-				curr = next
-				next = loadForward(curr, i)
-			}
-			update[i] = curr
-		}
-		lvl := s.randomLevel()
-		if lvl > curLevel {
-			for i := curLevel; i < lvl; i++ {
-				update[i] = s.head
-			}
-			if !s.level.CompareAndSwap(int32(curLevel), int32(lvl)) {
-				continue insert
-			}
-		}
-
-		newNode := &Node{
-			key:       s.bytes.alloc(key),
-			value:     s.bytes.alloc(val),
-			expiresAt: expiresAt,
-			version:   version,
-		}
-
-		for i := 0; i < lvl; i++ {
-			for {
-				next := atomic.LoadPointer(&update[i].fwd[i])
-				atomic.StorePointer(&newNode.fwd[i], next)
-				if atomic.CompareAndSwapPointer(&update[i].fwd[i], next, unsafe.Pointer(newNode)) {
-					break
-				}
-				s.findSpliceForLevel(update[i], key, i, update)
-			}
-		}
-
-		nodeOverhead := int64(unsafe.Sizeof(Node{}))
-		s.sizeBytes.Add(int64(len(key)) + int64(len(val)) + nodeOverhead)
-		return
+		update[i] = curr
 	}
+
+	lvl := s.randomLevel()
+	if lvl > curLevel {
+		for i := curLevel; i < lvl; i++ {
+			update[i] = s.head
+		}
+		s.level.Store(int32(lvl))
+	}
+
+	newNode := &Node{
+		key:       s.bytes.alloc(key),
+		value:     s.bytes.alloc(val),
+		expiresAt: expiresAt,
+		version:   version,
+	}
+
+	for i := 0; i < lvl; i++ {
+		newNode.fwd[i] = atomic.LoadPointer(&update[i].fwd[i])
+		atomic.StorePointer(&update[i].fwd[i], unsafe.Pointer(newNode))
+	}
+
+	nodeOverhead := int64(unsafe.Sizeof(Node{}))
+	s.sizeBytes.Add(int64(len(key)) + int64(len(val)) + nodeOverhead)
 }
 
 // Put is the convenience wrapper used by most callers.
@@ -213,10 +190,7 @@ func (s *SkipList) DeleteVersion(key []byte, version uint64) {
 	} else {
 		for {
 			cur := atomic.LoadUint64(&s.versionCounter)
-			if version <= cur {
-				break
-			}
-			if atomic.CompareAndSwapUint64(&s.versionCounter, cur, version) {
+			if version <= cur || atomic.CompareAndSwapUint64(&s.versionCounter, cur, version) {
 				break
 			}
 		}
@@ -225,57 +199,40 @@ func (s *SkipList) DeleteVersion(key []byte, version uint64) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	pUpd := updatePool.Get().(*[]*Node)
-	update := *pUpd
-	defer returnUpdatePool(pUpd)
+	var update [inlineTowerSize]*Node
+	curr := s.head
+	curLevel := int(s.level.Load())
 
-insert:
-	for {
-		curLevel := int(s.level.Load())
-		for i := 0; i < curLevel; i++ {
-			update[i] = nil
+	for i := curLevel - 1; i >= 0; i-- {
+		next := loadForward(curr, i)
+		for next != nil && bytes.Compare(next.key, key) < 0 {
+			curr = next
+			next = loadForward(curr, i)
 		}
-
-		curr := s.head
-		for i := curLevel - 1; i >= 0; i-- {
-			next := loadForward(curr, i)
-			for next != nil && bytes.Compare(next.key, key) < 0 {
-				curr = next
-				next = loadForward(curr, i)
-			}
-			update[i] = curr
-		}
-		lvl := s.randomLevel()
-		if lvl > curLevel {
-			for i := curLevel; i < lvl; i++ {
-				update[i] = s.head
-			}
-			if !s.level.CompareAndSwap(int32(curLevel), int32(lvl)) {
-				continue insert
-			}
-		}
-
-		newNode := &Node{
-			key:     s.bytes.alloc(key),
-			version: version,
-		}
-		newNode.deleted.Store(true)
-
-		for i := 0; i < lvl; i++ {
-			for {
-				next := atomic.LoadPointer(&update[i].fwd[i])
-				atomic.StorePointer(&newNode.fwd[i], next)
-				if atomic.CompareAndSwapPointer(&update[i].fwd[i], next, unsafe.Pointer(newNode)) {
-					break
-				}
-				s.findSpliceForLevel(update[i], key, i, update)
-			}
-		}
-
-		nodeOverhead := int64(unsafe.Sizeof(Node{}))
-		s.sizeBytes.Add(nodeOverhead)
-		return
+		update[i] = curr
 	}
+
+	lvl := s.randomLevel()
+	if lvl > curLevel {
+		for i := curLevel; i < lvl; i++ {
+			update[i] = s.head
+		}
+		s.level.Store(int32(lvl))
+	}
+
+	newNode := &Node{
+		key:     s.bytes.alloc(key),
+		version: version,
+	}
+	newNode.deleted.Store(true)
+
+	for i := 0; i < lvl; i++ {
+		newNode.fwd[i] = atomic.LoadPointer(&update[i].fwd[i])
+		atomic.StorePointer(&update[i].fwd[i], unsafe.Pointer(newNode))
+	}
+
+	nodeOverhead := int64(unsafe.Sizeof(Node{}))
+	s.sizeBytes.Add(nodeOverhead)
 }
 
 func (s *SkipList) Get(key []byte) ([]byte, bool, bool, int64) {
@@ -340,7 +297,7 @@ func (s *SkipList) GetWithVersion(key []byte) ([]byte, bool, bool, int64, uint64
 			return nil, true, true, 0, best.version
 		}
 		if best.expiresAt > 0 && time.Now().Unix() >= best.expiresAt {
-			return nil, false, false, 0, best.version
+			return nil, true, true, 0, best.version
 		}
 		return best.value, true, false, best.expiresAt, best.version
 	}
@@ -505,18 +462,24 @@ func (s *SkipList) AllVersions() []VersionEntry {
 func (s *SkipList) AllVersionsAt(maxVersion uint64) []VersionEntry {
 	var entries []VersionEntry
 	curr := loadForward(s.head, 0)
-	for curr != nil {
-		if curr.version <= maxVersion {
-			entries = append(entries, VersionEntry{
-				Key:       curr.key,
-				Value:     curr.value,
-				Version:   curr.version,
-				Deleted:   curr.deleted.Load(),
-				ExpiresAt: curr.expiresAt,
-			})
-		}
-		curr = loadForward(curr, 0)
+	for curr != nil {			if curr.version <= maxVersion {
+				entries = append(entries, VersionEntry{
+					Key:       curr.key,
+					Value:     curr.value,
+					Version:   curr.version,
+					Deleted:   curr.deleted.Load(),
+					ExpiresAt: curr.expiresAt,
+				})
+			}
+			curr = loadForward(curr, 0)
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		cmp := bytes.Compare(entries[i].Key, entries[j].Key)
+		if cmp != 0 {
+			return cmp < 0
+		}
+		return entries[i].Version > entries[j].Version
+	})
 	return entries
 }
 

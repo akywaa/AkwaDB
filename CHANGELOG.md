@@ -134,3 +134,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Post-Flush Read Visibility**: The MemTable version horizon was reset whenever a MemTable was flushed, so plain reads (`GET`, `ScanKeys`) stopped seeing already-flushed entries because they resolved at version `0`. Fresh MemTables now inherit the previous table's version counter (`SkipList.SeedVersion`), and recovery seeds it from the recovered timestamp horizon.
 - **Single-Key Delete Versioning**: `applyEntry` now writes deletes with the request commit timestamp (`DeleteVersion`) instead of relying on the MemTable auto-increment, matching the atomic batch path so snapshot reads observe tombstones consistently.
+
+## [0.1.9] - 2026-09-24
+
+### Changed
+
+- **Industrial Raft Consensus Engine**: Replaced experimental hand-rolled Raft with industry-standard `github.com/hashicorp/raft` backed by BoltDB log/stable storage (`hashicorp/raft-boltdb/v2`). Cluster membership changes (`Join`), log compaction, and leader election leases are now fully managed by the battle-tested HashiCorp implementation.
+- **Zero-Allocation Streaming Raft Snapshots**: Wired `Engine.StreamSnapshot` directly into `raft.FSMSnapshot.Persist`. State machine snapshots now stream sequentially to disk and over the wire with $O(1)$ RAM footprint, preventing out-of-memory aborts during catch-up replication of large datasets.
+- **MemTable SWMR Refactoring**: Cleaned up `SkipList.PutVersion` and `SkipList.DeleteVersion` into a deterministic Single-Writer Multiple-Reader (SWMR) model. Eliminated redundant CAS loops and splice retries inside the write mutex, while preserving fully lock-free concurrent reads via `atomic.LoadPointer`.
+- **Portable Concurrent Block Reader**: Replaced unsafe Linux-specific `io_uring` direct syscall mappings with a high-throughput parallel `file.ReadAt` reader. Eliminates kernel ABI divergence risks and `runtime.Pinner` lifecycle management while achieving consistent NVMe read performance across Linux, macOS, and Windows.
+
+### Removed
+
+- Removed custom wire RPC protocols (`writeMessage`, `readMessage`, `peerConn`) and home-grown disk log compaction from the `cluster` package in favor of HashiCorp TCP transport and FileSnapshotStore.
+- Removed OS build tags and unsafe memory mappings in `uring/uring_linux.go` and `uring/uring_fallback.go`.

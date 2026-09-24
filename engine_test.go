@@ -138,7 +138,7 @@ func TestEngine_MGetMSet(t *testing.T) {
 
 	e.MSet(map[string]string{"a": "1", "b": "2", "c": "3"})
 
-	vals, err := e.MGet([]string{"a", "b", "c", "d"})
+	vals, present, err := e.MGet([]string{"a", "b", "c", "d"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +146,12 @@ func TestEngine_MGetMSet(t *testing.T) {
 	for i, v := range vals {
 		if v != expected[i] {
 			t.Errorf("MGet[%d] = %q, want %q", i, v, expected[i])
+		}
+	}
+	wantPresent := []bool{true, true, true, false}
+	for i, p := range present {
+		if p != wantPresent[i] {
+			t.Errorf("MGet present[%d] = %v, want %v", i, p, wantPresent[i])
 		}
 	}
 }

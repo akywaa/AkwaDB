@@ -184,7 +184,7 @@ const levelSizeRatio = 10         // each level is 10x larger than the one above
 const l0BackpressureThreshold = 8 // start throttling writers at this L0 count
 const keyLockStripes = 256
 const l0StopThreshold = 16
-const subcompactionSplits = 4      // number of parallel key-range splits per compaction
+const subcompactionSplits = 4 // number of parallel key-range splits per compaction
 const tombstoneCompactionRatio = 0.40
 const maxWriterGoroutines = 8
 
@@ -199,9 +199,9 @@ type Options struct {
 	CompactionThreshold int
 	BlockCacheSize      int
 	MaxDiskBytes        int64
-	LevelSizeRatio      int // dynamic level size ratio (default 10)
-	ValueThreshold      int // values smaller than this are stored inline (default 128)
-	CacheBackend        int // CacheBackendLRU (default) or CacheBackendTinyLFU
+	LevelSizeRatio      int                 // dynamic level size ratio (default 10)
+	ValueThreshold      int                 // values smaller than this are stored inline (default 128)
+	CacheBackend        int                 // CacheBackendLRU (default) or CacheBackendTinyLFU
 	KeyRegistry         *crypto.KeyRegistry // nil disables at-rest encryption
 
 	// AdaptiveValueThreshold lets the engine raise ValueThreshold based on the
@@ -219,10 +219,10 @@ func (o Options) levelRatio() int {
 
 func DefaultOptions(dataDir string) Options {
 	return Options{
-		DataDir:             dataDir,
-		MemTableSize:        4 * 1024 * 1024,
-		CompactionThreshold: 4,
-		BlockCacheSize:      1000,
+		DataDir:                dataDir,
+		MemTableSize:           4 * 1024 * 1024,
+		CompactionThreshold:    4,
+		BlockCacheSize:         1000,
 		ValueThreshold:         defaultValueThreshold,
 		CacheBackend:           CacheBackendTinyLFU,
 		AdaptiveValueThreshold: true,
@@ -250,9 +250,15 @@ type writeReq struct {
 	seq        uint64
 	expectedVp ValuePointer
 	batch      []server.BatchWriteEntry // atomic batch writes
-	skipWAL    bool
-	syncWAL    bool
-	errCh      chan incrResult
+	skipWAL     bool
+	syncWAL     bool
+	checkExists bool
+	errCh       chan incrResult
+}
+
+type gcRewriteEntry struct {
+	entry  vlog.ValueEntry
+	offset int64
 }
 
 type incrResult struct {
@@ -269,20 +275,20 @@ type Engine struct {
 
 	levels [MaxLevels][]*sstable.SSTable
 
-	wal           *wal.WAL
-	walMu         sync.RWMutex // guards wal pointer during rotation
-	vl            *vlog.ValueLog
-	vlogMu        sync.RWMutex
-	dataDir       string
-	nextSeq       uint64
-	blockCache    cache.Cache
-	flushChan     chan flushTask
-	compactChan   chan struct{}
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
-	opts          Options
-	threshold     *vlogthreshold.AdaptiveThreshold
+	wal         *wal.WAL
+	walMu       sync.RWMutex // guards wal pointer during rotation
+	vl          *vlog.ValueLog
+	vlogMu      sync.RWMutex
+	dataDir     string
+	nextSeq     uint64
+	blockCache  cache.Cache
+	flushChan   chan flushTask
+	compactChan chan struct{}
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	opts        Options
+	threshold   *vlogthreshold.AdaptiveThreshold
 
 	manifest   *os.File
 	manifestMu sync.Mutex
@@ -461,8 +467,9 @@ func (e *Engine) writer() {
 
 			e.throttleL0()
 
-			if e.ctx.Err() != nil {
-				return
+			if err := e.ctx.Err(); err != nil {
+				req.errCh <- incrResult{err: err}
+				continue
 			}
 
 			batch = append(batch[:0], req)
@@ -490,7 +497,18 @@ func (e *Engine) writer() {
 				e.notifyWrites(batch)
 			}
 		case <-e.ctx.Done():
-			return
+			err := e.ctx.Err()
+			for {
+				select {
+				case r, ok := <-e.writeReq:
+					if !ok {
+						return
+					}
+					r.errCh <- incrResult{err: err}
+				default:
+					return
+				}
+			}
 		}
 	}
 }
@@ -539,13 +557,23 @@ func (e *Engine) dispatch(r *writeReq) incrResult {
 	case r.op == wal.OpPut || r.op == wal.OpDelete:
 		e.memTableMu.RLock()
 		e.walAppendMu.Lock()
-		err := e.applyEntryOpts(r.op, r.key, r.val, r.expiresAt, r.seq, r.skipWAL)
-		if r.syncWAL && err == nil {
-			err = e.wal.FlushAndSync()
+		existed := true
+		if r.checkExists {
+			existed = e.existsWithoutLock(r.key)
+		}
+		var err error
+		if existed {
+			err = e.applyEntryOpts(r.op, r.key, r.val, r.expiresAt, r.seq, r.skipWAL)
+			if r.syncWAL && err == nil {
+				err = e.wal.FlushAndSync()
+			}
 		}
 		e.walAppendMu.Unlock()
 		e.memTableMu.RUnlock()
 		e.oracle.MarkApplied(r.seq)
+		if existed {
+			return incrResult{val: 1, err: err}
+		}
 		return incrResult{err: err}
 	}
 
@@ -659,7 +687,8 @@ func (e *Engine) gcRewrite(r *writeReq) error {
 	if err != nil || !isValuePointer(curVal) {
 		return nil
 	}
-	if decodeValuePointer(curVal).Fid != r.expectedVp.Fid {
+	vp := decodeValuePointer(curVal)
+	if vp.Fid != r.expectedVp.Fid || vp.Offset != r.expectedVp.Offset {
 		return nil
 	}
 
@@ -857,7 +886,7 @@ func OpenEngineWithOpts(opts Options) (*Engine, error) {
 	if maxSeq > 0 {
 		e.oracle.Bump(maxSeq)
 	}
-	e.activeMemTable().SeedVersion(atomic.LoadUint64(&e.oracle.nextTs))
+	e.activeMemTable().SeedVersion(e.oracle.NextTs())
 
 	// read manifest to figure out which level each table belongs to
 	manifestLevels := e.readManifest(mf)
@@ -956,16 +985,26 @@ func (e *Engine) flushWorker() {
 }
 
 func (e *Engine) executeFlush(task flushTask) {
+	// Return the flushed MemTable's slabs to the pool once it is detached, so
+	// repeated flushes do not leak the byte slabs of every retired table.
+	defer task.memTable.ReleaseArena()
+
+	// Always release the immutable MemTable and wake any writers blocked on
+	// backpressure, even when the flush fails. Otherwise a transient I/O error
+	// would leave immMemTable set forever and stall the whole engine.
+	defer func() {
+		e.immMemTable.Store(nil)
+		e.memTableMu.Lock()
+		e.l0Cond.Broadcast()
+		e.memTableMu.Unlock()
+	}()
+
 	allVersions := task.memTable.AllVersions()
 	if len(allVersions) == 0 {
 		if task.oldWal != nil {
 			task.oldWal.Close()
 			_ = os.Remove(task.oldWalPath)
 		}
-		e.immMemTable.Store(nil)
-		e.memTableMu.Lock()
-		e.l0Cond.Broadcast()
-		e.memTableMu.Unlock()
 		return
 	}
 
@@ -990,10 +1029,6 @@ func (e *Engine) executeFlush(task flushTask) {
 	e.levelMu[0].Lock()
 	e.levels[0] = append(e.levels[0], sst)
 	e.levelMu[0].Unlock()
-	e.immMemTable.Store(nil)
-	e.memTableMu.Lock()
-	e.l0Cond.Broadcast()
-	e.memTableMu.Unlock()
 
 	// record in manifest
 	e.appendManifest('A', 0, task.seq, sst.MinKey(), sst.MaxKey())
@@ -1169,7 +1204,6 @@ func (e *Engine) getByAt(kBytes []byte, maxVersion uint64) (string, error) {
 	return "", ErrKeyNotFound
 }
 
-
 // GetByVersion returns the value for key whose version <= maxVersion.
 // Used by transactions to read a consistent snapshot.
 func (e *Engine) GetByVersion(key string, maxVersion uint64) (string, error) {
@@ -1275,17 +1309,47 @@ func (e *Engine) Delete(key string) (bool, error) {
 	kBytes := []byte(key)
 
 	req := &writeReq{
-		op:    wal.OpDelete,
-		key:   kBytes,
-		errCh: make(chan incrResult, 1),
+		op:          wal.OpDelete,
+		key:         kBytes,
+		checkExists: true,
+		errCh:       make(chan incrResult, 1),
 	}
 	e.writeReq <- req
 	res := <-req.errCh
 	if res.err != nil {
 		return false, res.err
 	}
+	if res.val == 0 {
+		return false, nil
+	}
 	e.metrics.incDel()
 	return true, nil
+}
+
+func (e *Engine) existsWithoutLock(kBytes []byte) bool {
+	mt, imm := e.getSnapshot()
+
+	if _, found, deleted, _ := mt.Get(kBytes); found {
+		return !deleted
+	}
+	if imm != nil {
+		if _, found, deleted, _ := imm.Get(kBytes); found {
+			return !deleted
+		}
+	}
+	for lvl := 0; lvl < MaxLevels; lvl++ {
+		e.levelMu[lvl].RLock()
+		snapshot := make([]*sstable.SSTable, len(e.levels[lvl]))
+		copy(snapshot, e.levels[lvl])
+		e.levelMu[lvl].RUnlock()
+		for i := len(snapshot) - 1; i >= 0; i-- {
+			_, found, deleted, _, _, err := snapshot[i].Get(kBytes)
+			if err == nil && found {
+				return !deleted
+			}
+		}
+	}
+	return false
 }
 
 func (e *Engine) getWithoutLock(kBytes []byte) ([]byte, error) {
@@ -1595,10 +1659,14 @@ func (e *Engine) maintenanceWorker() {
 				e.evictIfNeeded()
 			}
 		case <-gcTicker.C:
+			activeVlogFid := e.vl.ActiveFid()
 			e.discardMu.Lock()
 			var bestFid uint32
 			var maxDiscard int64
 			for fid, discBytes := range e.discardStats {
+				if fid == activeVlogFid {
+					continue
+				}
 				if discBytes > maxDiscard {
 					maxDiscard = discBytes
 					bestFid = fid
@@ -1982,7 +2050,7 @@ func (e *Engine) compactLevelTable(fromLevel int, pick *sstable.SSTable) error {
 	}
 
 	e.metrics.incCompaction()
-	return nil
+	return nil
 }
 
 type compactionVersion struct {
@@ -1996,7 +2064,7 @@ type compactionVersion struct {
 func (e *Engine) drainMergedIterator(iters []iterator.VersionedIterator, targetLevel int) []memtable.Entry {
 	now := time.Now().Unix()
 	minReadTs := e.oracle.MinReadTs()
-	hasActiveTxns := minReadTs < atomic.LoadUint64(&e.oracle.nextTs)
+	hasActiveTxns := minReadTs < e.oracle.NextTs()
 	isBottomLevel := targetLevel == MaxLevels-1
 	gcTs := atomic.LoadUint64(&e.gcDiscardTs)
 
@@ -2130,7 +2198,7 @@ func (e *Engine) removeFromLevel(lvl int, remove []*sstable.SSTable) {
 	}
 	e.levels[lvl] = remaining
 	e.levelMu[lvl].Unlock()
-	if lvl == 0 {
+	if lvl == 0 {
 		e.memTableMu.Lock()
 		e.l0Cond.Broadcast()
 		e.memTableMu.Unlock()
@@ -2463,24 +2531,28 @@ func (e *Engine) IncrBy(key string, delta int64) (int64, error) {
 	return res.val, nil
 }
 
-func (e *Engine) MGet(keys []string) ([]string, error) {
+func (e *Engine) MGet(keys []string) ([]string, []bool, error) {
 	res := make([]string, len(keys))
+	present := make([]bool, len(keys))
 	for i, k := range keys {
 		val, err := e.Get(k)
 		if err == nil {
 			res[i] = val
+			present[i] = true
 		}
 	}
-	return res, nil
+	return res, present, nil
 }
 
 func (e *Engine) MSet(kvs map[string]string) error {
+	entries := make([]server.BatchWriteEntry, 0, len(kvs))
 	for k, v := range kvs {
-		if err := e.Put(k, v); err != nil {
-			return err
-		}
+		entries = append(entries, server.BatchWriteEntry{Key: k, Value: v})
 	}
-	return nil
+	if len(entries) == 0 {
+		return nil
+	}
+	return e.submitBatch(entries)
 }
 
 func (e *Engine) SnapshotEntries() []server.SnapshotEntry {
@@ -2618,10 +2690,37 @@ func (e *Engine) clearInternal() error {
 		e.levelMu[lvl].Unlock()
 	}
 
+	// Rewrite the manifest so a restart does not try to reopen SSTables that
+	// were just removed.
+	if err := e.compactManifest(); err != nil {
+		return err
+	}
+
+	// Drop stale VLog segments and reset discard accounting.
+	activeFid := e.vl.ActiveFid()
+	vlogDir := filepath.Join(e.dataDir, "vlog")
+	if dirEntries, derr := os.ReadDir(vlogDir); derr == nil {
+		for _, ent := range dirEntries {
+			if ent.IsDir() {
+				continue
+			}
+			fid, ok := vlogFid(ent.Name())
+			if !ok || fid == activeFid {
+				continue
+			}
+			_ = e.vl.DeleteSegment(fid)
+			_ = os.Remove(filepath.Join(vlogDir, ent.Name()))
+		}
+	}
+	e.discardMu.Lock()
+	e.discardStats = make(map[uint32]int64)
+	e.discardMu.Unlock()
+	_ = os.Remove(discardPath(e.dataDir))
+
 	_ = e.wal.Close()
 	walPath := filepath.Join(e.dataDir, "wal.log")
 	_ = os.Remove(walPath)
-	newWal, err := wal.OpenWithOptionsAndRegistry(walPath, false, e.opts.KeyRegistry)
+	newWal, err := wal.OpenWithOptionsAndRegistry(walPath, true, e.opts.KeyRegistry)
 	if err != nil {
 		return err
 	}
@@ -2723,10 +2822,14 @@ func (e *Engine) compactManifest() error {
 }
 
 func (e *Engine) RunValueLogGC(discardRatio float64) error {
+	activeFid := e.vl.ActiveFid()
 	e.discardMu.Lock()
 	var bestFid uint32
 	var maxStale int64
 	for fid, stale := range e.discardStats {
+		if fid == activeFid {
+			continue
+		}
 		if stale > maxStale {
 			maxStale = stale
 			bestFid = fid
@@ -2755,32 +2858,32 @@ func (e *Engine) RunValueLogGC(discardRatio float64) error {
 }
 
 func (e *Engine) runValueLogGCInternal(targetFid uint32) error {
-	gcTs := atomic.LoadUint64(&e.oracle.nextTs)
+	gcTs := e.oracle.NextTs()
 	atomic.StoreUint64(&e.gcDiscardTs, gcTs)
 
 	// Replay live entries from the target VLog segment into the current WAL/VLog.
-	var entriesToRewrite []vlog.ValueEntry
+	var entriesToRewrite []gcRewriteEntry
 	err := e.vl.Recover(targetFid, func(entry vlog.ValueEntry, valueOffset int64) error {
 		if entry.Op == vlog.OpDelete || len(entry.Value) == 0 {
 			return nil
 		}
-		entriesToRewrite = append(entriesToRewrite, entry)
+		entriesToRewrite = append(entriesToRewrite, gcRewriteEntry{entry: entry, offset: valueOffset})
 		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to read vlog %d: %w", targetFid, err)
 	}
 
-	for _, entry := range entriesToRewrite {
+	for _, item := range entriesToRewrite {
 		req := &writeReq{
 			op:        opGCRewrite,
-			key:       entry.Key,
-			val:       entry.Value,
-			expiresAt: entry.ExpiresAt,
+			key:       item.entry.Key,
+			val:       item.entry.Value,
+			expiresAt: item.entry.ExpiresAt,
 			expectedVp: ValuePointer{
 				Fid:    targetFid,
-				Offset: 0, // offset check is skipped for VLog GC
-				Size:   uint32(len(entry.Value)),
+				Offset: uint64(item.offset),
+				Size:   uint32(len(item.entry.Value)),
 			},
 			errCh: make(chan incrResult, 1),
 		}
@@ -2796,9 +2899,9 @@ func (e *Engine) runValueLogGCInternal(targetFid uint32) error {
 	}
 
 	// Remove the segment from VLog and discard stats.
-	e.vlogMu.Lock()
+	e.discardMu.Lock()
 	delete(e.discardStats, targetFid)
-	e.vlogMu.Unlock()
+	e.discardMu.Unlock()
 	e.vlogDiscards.Delete(targetFid)
 
 	return e.vl.DeleteSegment(targetFid)
@@ -2999,16 +3102,20 @@ func (e *Engine) SAdd(key string, members []string) (int64, error) {
 	mu := e.lockKey(key)
 	defer mu.Unlock()
 
-	prefix := []byte("t\x00" + key + "\x00")
-	existing := e.getByPrefix(prefix)
-
 	var entries []server.BatchWriteEntry
 	var added int64
+	seen := make(map[string]struct{}, len(members))
 	for _, m := range members {
-		if _, exists := existing["t\x00"+key+"\x00"+m]; !exists {
-			entries = append(entries, server.BatchWriteEntry{Key: string(setMemberKey(key, m)), Value: ""})
-			added++
+		if _, dup := seen[m]; dup {
+			continue
 		}
+		seen[m] = struct{}{}
+		kBytes := setMemberKey(key, m)
+		if _, err := e.getByKey(kBytes); err == nil {
+			continue
+		}
+		entries = append(entries, server.BatchWriteEntry{Key: string(kBytes), Value: ""})
+		added++
 	}
 	if len(entries) > 0 {
 		if err := e.submitBatch(entries); err != nil {
@@ -3121,7 +3228,8 @@ func (e *Engine) ZScore(key, member string) (float64, bool, error) {
 
 func (e *Engine) ZRangeByScore(key string, min, max float64) ([]string, error) {
 	seekPrefix := encoding.ZScorePrefix(key)
-	merged, iters := e.buildMergedIterator(seekPrefix)
+	seekKey := encoding.ZScoreKey(key, min, "")
+	merged, iters := e.buildMergedIterator(seekKey)
 	defer func() {
 		for _, it := range iters {
 			_ = it.Close()
@@ -3131,8 +3239,16 @@ func (e *Engine) ZRangeByScore(key string, min, max float64) ([]string, error) {
 	var members []string
 	for merged.Valid() {
 		k := merged.Key()
-		if !bytes.HasPrefix(k, seekPrefix) || merged.Deleted() {
+		if !bytes.HasPrefix(k, seekPrefix) {
 			break
+		}
+		if len(k) < len(seekPrefix)+9 {
+			merged.Next()
+			continue
+		}
+		if merged.Deleted() {
+			merged.Next()
+			continue
 		}
 		rawScore := k[len(seekPrefix) : len(seekPrefix)+8]
 		score := encoding.DecodeScore(rawScore)
@@ -3140,7 +3256,7 @@ func (e *Engine) ZRangeByScore(key string, min, max float64) ([]string, error) {
 			break
 		}
 		if score >= min {
-			member := string(k[len(seekPrefix)+9:]) // skip \x00 separator
+			member := string(k[len(seekPrefix)+9:])
 			members = append(members, member)
 		}
 		merged.Next()
@@ -3185,6 +3301,9 @@ func (e *Engine) ZRem(key string, members ...string) (int64, error) {
 // ==========================================
 
 func (e *Engine) SetBit(key string, offset int64, val int) (int, error) {
+	if offset < 0 {
+		return 0, errors.New("ERR bit offset is not an integer or out of range")
+	}
 	mu := e.lockKey(key)
 	defer mu.Unlock()
 
@@ -3221,6 +3340,9 @@ func (e *Engine) SetBit(key string, offset int64, val int) (int, error) {
 }
 
 func (e *Engine) GetBit(key string, offset int64) (int, error) {
+	if offset < 0 {
+		return 0, errors.New("ERR bit offset is not an integer or out of range")
+	}
 	old, err := e.Get(key)
 	if err != nil {
 		return 0, err
