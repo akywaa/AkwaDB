@@ -373,18 +373,18 @@ func (s *segment) closeForWrite() error {
 		return nil
 	}
 	s.writeClosed = true
+	var flushErr error
 	if s.writer != nil {
-		if err := s.writer.Flush(); err != nil {
-			return err
-		}
+		flushErr = s.writer.Flush()
 		s.writer = nil
 	}
 	if s.file != nil {
-		err := s.file.Close()
+		if err := s.file.Close(); flushErr == nil {
+			flushErr = err
+		}
 		s.file = nil
-		return err
 	}
-	return nil
+	return flushErr
 }
 
 // ValueLog manages VLog segments and provides the main API.
@@ -648,11 +648,15 @@ func (ds *DiscardStats) Load(dir string) {
 func (vl *ValueLog) Recover(fid uint32, fn func(entry ValueEntry, valueOffset int64) error) error {
 	vl.mu.Lock()
 	seg, ok := vl.segments[fid]
+	if ok {
+		seg.IncrRef()
+	}
 	vl.mu.Unlock()
 
 	if !ok {
 		return fmt.Errorf("%w: fid=%d", ErrSegmentNotFound, fid)
 	}
+	defer seg.DecrRef()
 
 	// Flush the writer so recovery sees all data.
 	seg.mu.Lock()

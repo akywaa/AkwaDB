@@ -27,7 +27,7 @@ func (w *WaterMark) Begin(readTs uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.active[readTs]++
-	if w.minTs == 0 || readTs < w.minTs {
+	if len(w.active) == 1 || readTs < w.minTs {
 		w.minTs = readTs
 	}
 }
@@ -89,6 +89,17 @@ func (o *Oracle) assignTsLocked() uint64 {
 	o.nextTs++
 	o.awaiting[o.nextTs] = struct{}{}
 	return o.nextTs
+}
+
+func (o *Oracle) ReserveVersion(ts uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if ts > o.nextTs {
+		o.nextTs = ts
+	}
+	if ts > o.appliedTs {
+		o.awaiting[ts] = struct{}{}
+	}
 }
 
 func (o *Oracle) CommitLock()   { o.commitMu.Lock() }

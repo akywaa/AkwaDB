@@ -30,7 +30,7 @@ func (t *TinyLFUCache) Get(key string) ([]byte, bool) {
 }
 
 func (t *TinyLFUCache) Put(key string, value []byte) {
-	t.cache.Set(key, value, int64(len(value)))
+	t.cache.Set(key, value, 1)
 }
 
 func (t *TinyLFUCache) Close() {

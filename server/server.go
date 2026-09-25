@@ -144,6 +144,7 @@ type ClusterNode interface {
 	IsLeader() bool
 	LeaderAddr() string
 	ApplyWrite(entries []BatchWriteEntry) error
+	ApplyWriteVersion(entries []BatchWriteEntry, version uint64) error
 	ApplyCommand(op string, args []string) (interface{}, error)
 }
 
@@ -596,7 +597,7 @@ func ExecuteReplicatedCommand(db DB, op string, args []string) interface{} {
 		if err != nil || (val != 0 && val != 1) {
 			return errors.New("ERR bit must be 0 or 1")
 		}
-		old, err := db.SetBit(strKey(args[0]), offset, val)
+		old, err := db.SetBit(args[0], offset, val)
 		if err != nil {
 			return err
 		}
@@ -840,6 +841,7 @@ func (s *Server) registerCommands() {
 	s.handlers["MGET"] = s.cmdMGet
 	s.handlers["MSET"] = s.cmdMSet
 	s.handlers["SCAN"] = s.cmdScan
+	s.handlers["KEYS"] = s.cmdKeys
 	s.handlers["HSET"] = s.cmdHSet
 	s.handlers["HGET"] = s.cmdHGet
 	s.handlers["HDEL"] = s.cmdHDel
@@ -1001,7 +1003,7 @@ func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 	}
 	var applyErr error
 	if srv.clusterNode != nil {
-		applyErr = srv.clusterNode.ApplyWrite(entries)
+		applyErr = srv.clusterNode.ApplyWriteVersion(entries, commitTs)
 	} else {
 		applyErr = srv.db.BatchApplyWithVersion(entries, commitTs)
 	}
@@ -1464,17 +1466,76 @@ func (s *Server) cmdMSet(srv *Server, cl *client, args []string) error {
 }
 
 func (s *Server) cmdScan(srv *Server, cl *client, args []string) error {
-	pat := "*"
-	if len(args) >= 1 {
-		pat = args[0]
+	if len(args) < 1 {
+		srv.writeError(cl, "ERR wrong number of arguments for 'scan' command")
+		return nil
+	}
+	cursor, err := strconv.ParseUint(args[0], 10, 64)
+	if err != nil {
+		srv.writeError(cl, "ERR invalid cursor")
+		return nil
+	}
+	pattern := "*"
+	count := 10
+	for i := 1; i < len(args); i += 2 {
+		if i+1 >= len(args) {
+			srv.writeError(cl, "ERR syntax error")
+			return nil
+		}
+		switch strings.ToUpper(args[i]) {
+		case "MATCH":
+			pattern = args[i+1]
+		case "COUNT":
+			c, cerr := strconv.Atoi(args[i+1])
+			if cerr != nil || c <= 0 {
+				srv.writeError(cl, "ERR syntax error")
+				return nil
+			}
+			count = c
+		default:
+			srv.writeError(cl, "ERR syntax error")
+			return nil
+		}
 	}
 
-	keys, err := srv.db.ScanAllKeys(pat)
+	keys, err := srv.db.ScanAllKeys(pattern)
 	if err != nil {
 		srv.writeError(cl, err.Error())
 		return nil
 	}
 
+	if cursor > uint64(len(keys)) {
+		cursor = uint64(len(keys))
+	}
+	start := int(cursor)
+	if count > len(keys)-start {
+		count = len(keys) - start
+	}
+	end := start + count
+	var next uint64
+	if end < len(keys) {
+		next = uint64(end)
+	}
+
+	srv.writeArrayHeader(cl, 2)
+	srv.writeBulkString(cl, strconv.FormatUint(next, 10))
+	srv.writeArrayHeader(cl, end-start)
+	for _, k := range keys[start:end] {
+		srv.writeBulkString(cl, k)
+	}
+	return nil
+}
+
+func (s *Server) cmdKeys(srv *Server, cl *client, args []string) error {
+	if len(args) != 1 {
+		srv.writeError(cl, "ERR wrong number of arguments for 'keys' command")
+		return nil
+	}
+	keys, err := srv.db.ScanAllKeys(args[0])
+	if err != nil {
+		srv.writeError(cl, err.Error())
+		return nil
+	}
 	srv.writeArrayHeader(cl, len(keys))
 	for _, k := range keys {
 		srv.writeBulkString(cl, k)
@@ -1984,7 +2045,7 @@ func (s *Server) cmdSetBit(srv *Server, cl *client, args []string) error {
 		}
 		return nil
 	}
-	old, err := srv.db.SetBit(strKey(args[0]), offset, val)
+	old, err := srv.db.SetBit(args[0], offset, val)
 	if err != nil {
 		srv.writeError(cl, err.Error())
 	} else {
@@ -2003,7 +2064,7 @@ func (s *Server) cmdGetBit(srv *Server, cl *client, args []string) error {
 		srv.writeError(cl, "ERR bit offset is not an integer or out of range")
 		return nil
 	}
-	bit, err := srv.db.GetBit(strKey(args[0]), offset)
+	bit, err := srv.db.GetBit(args[0], offset)
 	if err != nil {
 		srv.writeError(cl, err.Error())
 	} else {
@@ -2017,7 +2078,7 @@ func (s *Server) cmdBitCount(srv *Server, cl *client, args []string) error {
 		srv.writeError(cl, "ERR wrong number of arguments for 'bitcount' command")
 		return nil
 	}
-	n, err := srv.db.BitCount(strKey(args[0]))
+	n, err := srv.db.BitCount(args[0])
 	if err != nil {
 		srv.writeError(cl, err.Error())
 	} else {

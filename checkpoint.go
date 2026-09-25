@@ -111,6 +111,9 @@ func (e *Engine) forceFlush() error {
 	select {
 	case e.flushChan <- *task:
 	case <-e.ctx.Done():
+		if task.oldWalPath != "" {
+			e.removeOrArchive(task.oldWalPath)
+		}
 		return e.ctx.Err()
 	}
 

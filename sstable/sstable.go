@@ -265,14 +265,20 @@ func (s *SSTable) getEntryAt(i int) (key []byte, offset int64, size uint32) {
 		return nil, 0, 0
 	}
 	tableStart := 4
+	if len(idx) < tableStart+int(s.numBlocks)*4 {
+		return nil, 0, 0
+	}
 	entryRelOffset := binary.BigEndian.Uint32(idx[tableStart+i*4 : tableStart+(i+1)*4])
 	dataStart := 4 + int(s.numBlocks)*4 + int(entryRelOffset)
-	if dataStart+14 > len(idx) {
+	if dataStart < 0 || dataStart+14 > len(idx) {
 		return nil, 0, 0
 	}
 	keyLen := binary.BigEndian.Uint16(idx[dataStart : dataStart+2])
 	offset = int64(binary.BigEndian.Uint64(idx[dataStart+2 : dataStart+10]))
 	size = binary.BigEndian.Uint32(idx[dataStart+10 : dataStart+14])
+	if dataStart+14+int(keyLen) > len(idx) {
+		return nil, 0, 0
+	}
 	key = idx[dataStart+14 : dataStart+14+int(keyLen)]
 	return
 }
@@ -436,6 +442,11 @@ func createAtLevel(filename string, entries []memtable.Entry, blockCache cache.C
 	entriesBuf := new(bytes.Buffer)
 
 	for i, idx := range index {
+		if len(idx.Key) > 65535 {
+			file.Close()
+			_ = os.Remove(filename)
+			return nil, fmt.Errorf("sstable: index key length %d exceeds uint16 limit", len(idx.Key))
+		}
 		binary.BigEndian.PutUint32(offsetsTable[i*4:(i+1)*4], uint32(entriesBuf.Len()))
 
 		var entryHdr [14]byte
@@ -800,7 +811,7 @@ func (s *SSTable) DecrRef() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refs--
-	if s.refs <= 0 && s.closed {
+	if s.refs <= 0 && (s.closed || s.removePending) {
 		return s.closeLocked()
 	}
 	return nil
@@ -820,8 +831,9 @@ func (s *SSTable) Close() error {
 func (s *SSTable) MarkRemove() {
 	s.mu.Lock()
 	s.removePending = true
+	s.closed = true
 	if s.refs <= 0 {
-		s.closeLocked()
+		_ = s.closeLocked()
 	}
 	s.mu.Unlock()
 }
@@ -872,13 +884,17 @@ func (s *SSTable) decodeBlock(raw []byte) ([]byte, error) {
 	}
 	switch s.compress {
 	case compressSnappy:
-		if decompressed, err := s2.Decode(nil, content); err == nil {
-			content = decompressed
+		decompressed, err := s2.Decode(nil, content)
+		if err != nil {
+			return nil, ErrBlockCorrupted
 		}
+		content = decompressed
 	case compressZSTD:
-		if decompressed, err := zstdDecoder.DecodeAll(content, nil); err == nil {
-			content = decompressed
+		decompressed, err := zstdDecoder.DecodeAll(content, nil)
+		if err != nil {
+			return nil, ErrBlockCorrupted
 		}
+		content = decompressed
 	}
 	return content, nil
 }
@@ -1011,7 +1027,7 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) < 0 {
+		if bytes.Compare(curKey, targetKey) <= 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {
@@ -1019,26 +1035,10 @@ func scanBlockForKeyBinary(br *blockRestarts, targetKey []byte) ([]byte, bool, b
 		}
 	}
 
-	startOff := 0
-	if restartIdx >= 0 {
-		startOff = int(br.offsets[restartIdx])
-	}
-	if startOff == 0 && n > 0 {
-		firstOff := int(br.offsets[0])
-		if firstOff+recordHeaderSize <= len(br.data) {
-			var firstHdr RecordHeader
-			firstHdr.Decode(br.data[firstOff:])
-			firstKey := br.data[firstOff+recordHeaderSize : firstOff+recordHeaderSize+int(firstHdr.KeyLen)]
-			if bytes.Compare(firstKey, targetKey) == 0 {
-				restartIdx = 0
-
-			}
-		}
-	}
 	if restartIdx == -1 {
 		return nil, false, false, 0, 0, nil
 	}
-	startOff = int(br.offsets[restartIdx])
+	startOff := int(br.offsets[restartIdx])
 	endOff := len(br.data)
 
 	var bestVal []byte
@@ -1151,7 +1151,7 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		var midHdr RecordHeader
 		midHdr.Decode(br.data[off:])
 		curKey := br.data[off+recordHeaderSize : off+recordHeaderSize+int(midHdr.KeyLen)]
-		if bytes.Compare(curKey, targetKey) < 0 {
+		if bytes.Compare(curKey, targetKey) <= 0 {
 			restartIdx = mid
 			lo = mid + 1
 		} else {
@@ -1159,10 +1159,10 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		}
 	}
 
-	startOff := 0
-	if restartIdx >= 0 {
-		startOff = int(br.offsets[restartIdx])
+	if restartIdx == -1 {
+		return nil, false, false, 0, 0, nil
 	}
+	startOff := int(br.offsets[restartIdx])
 	endOff := len(br.data)
 
 	var bestVal []byte
