@@ -1132,7 +1132,7 @@ func scanBlockForKeyVersionLinear(blockContent []byte, targetKey []byte, maxVers
 		return nil, false, false, 0, 0, nil
 	}
 	if bestExp > 0 && time.Now().Unix() >= bestExp {
-		return nil, true, true, 0, 0, nil
+		return nil, true, true, 0, bestVer, nil
 	}
 	return bestVal, true, bestDel, bestExp, bestVer, nil
 }
@@ -1196,7 +1196,7 @@ func scanBlockForKeyVersionBinary(br *blockRestarts, targetKey []byte, maxVersio
 		return nil, false, false, 0, 0, nil
 	}
 	if bestExp > 0 && time.Now().Unix() >= bestExp {
-		return nil, true, true, 0, 0, nil
+		return nil, true, true, 0, bestVer, nil
 	}
 	return bestVal, true, bestDel, bestExp, bestVer, nil
 }

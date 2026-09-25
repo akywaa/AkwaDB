@@ -87,6 +87,15 @@ func (m *memoryBackend) Delete(key string) (bool, error) {
 	return ok, nil
 }
 
+func (m *memoryBackend) GetDel(key string) (string, error) {
+	val, err := m.Get(key)
+	if err != nil {
+		return "", err
+	}
+	_, _ = m.Delete(key)
+	return val, nil
+}
+
 func (m *memoryBackend) TTL(key string) (int64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -134,6 +143,74 @@ func (m *memoryBackend) ScanKeys(pattern string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+func (m *memoryBackend) ScanAllKeys(pattern string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	seen := make(map[string]struct{})
+	var out []string
+	now := time.Now().Unix()
+	for k := range m.kv {
+		if exp, ok := m.ttls[k]; ok && exp > 0 && now >= exp {
+			continue
+		}
+		name := storageLogicalKey(k)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		if matched, _ := filepath.Match(pattern, name); matched || pattern == "*" {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func storageLogicalKey(k string) string {
+	if len(k) < 2 || k[1] != 0 {
+		return k
+	}
+	switch k[0] {
+	case 's':
+		return k[2:]
+	case 'h', 't', 'l', 'z', 'b':
+		rest := k[2:]
+		if i := strings.IndexByte(rest, 0); i >= 0 {
+			return rest[:i]
+		}
+	}
+	return ""
+}
+
+func (m *memoryBackend) DeleteCollection(key string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var deleted int64
+	for k := range m.kv {
+		if isCollectionStorageKey(k, key) {
+			delete(m.kv, k)
+			delete(m.ttls, k)
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
+func isCollectionStorageKey(k, key string) bool {
+	if len(k) < 2 || k[1] != 0 {
+		return false
+	}
+	switch k[0] {
+	case 'h', 't', 'l', 'z', 'b':
+	default:
+		return false
+	}
+	return strings.HasPrefix(k[2:], key+"\x00")
 }
 
 func (m *memoryBackend) HSet(hash, field, val string) (bool, error) {
@@ -368,6 +445,7 @@ func (m *memoryBackend) LRange(key string, start, stop int64) ([]string, error) 
 
 func (m *memoryBackend) SAdd(key string, members []string) (int64, error) { return int64(len(members)), nil }
 func (m *memoryBackend) SMembers(key string) ([]string, error)            { return nil, nil }
+func (m *memoryBackend) SInter(keys []string) ([]string, error)           { return nil, nil }
 func (m *memoryBackend) SIsMember(key, member string) (bool, error)       { return false, nil }
 func (m *memoryBackend) SRem(key string, members []string) (int64, error) { return 0, nil }
 func (m *memoryBackend) SCard(key string) (int64, error)                  { return 0, nil }
@@ -378,6 +456,33 @@ func (m *memoryBackend) ZRem(key string, members ...string) (int64, error)      
 func (m *memoryBackend) SetBit(key string, offset int64, val int) (int, error)       { return 0, nil }
 func (m *memoryBackend) GetBit(key string, offset int64) (int, error)               { return 0, nil }
 func (m *memoryBackend) BitCount(key string) (int64, error)                         { return 0, nil }
+func (m *memoryBackend) DeleteBitmap(key string) error                              { return nil }
+
+func TestReplBacklog_SinceRejectsFutureSeq(t *testing.T) {
+	rb := NewReplBacklog(4)
+	rb.Push(replEntry{op: 1, key: []byte("a")})
+
+	if _, ok := rb.Since(100); ok {
+		t.Fatal("Since accepted a sequence number from the future")
+	}
+	if entries, ok := rb.Since(1); !ok || len(entries) != 0 {
+		t.Fatalf("Since(1) = %d entries, ok=%v; want 0, true", len(entries), ok)
+	}
+}
+
+func TestReplBacklog_PushAssignsSeq(t *testing.T) {
+	rb := NewReplBacklog(4)
+	if s := rb.Push(replEntry{op: 1, key: []byte("a")}); s != 1 {
+		t.Fatalf("Push seq = %d, want 1", s)
+	}
+	if s := rb.Push(replEntry{op: 1, key: []byte("b")}); s != 2 {
+		t.Fatalf("Push seq = %d, want 2", s)
+	}
+	entries, ok := rb.Since(1)
+	if !ok || len(entries) != 1 || entries[0].seq != 2 {
+		t.Fatalf("Since(1) = %v, ok=%v; want one entry with seq 2", entries, ok)
+	}
+}
 
 func spawnTestServer(t *testing.T, db DB) (*redis.Client, func()) {
 	t.Helper()

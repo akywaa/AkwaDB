@@ -81,17 +81,55 @@ func DecodeValuePointer(b []byte) ValuePointer {
 // segment wraps a single VLog file with buffered writing.
 type segment struct {
 	fid     uint32
+	path    string
 	file    *os.File
 	writer  *bufio.Writer
 	offset  atomic.Int64 // current write offset
-	maxSize int64
-	closed  bool
-	mu      sync.Mutex
+	maxSize    int64
+	closed     bool
+	writeClosed bool
+	mu         sync.Mutex
+
+	refs          atomic.Int32
+	removePending atomic.Bool
+	removed       atomic.Bool
 
 	encrypted bool
 	keyID     uint64
 	baseIV    []byte
 	key       []byte
+}
+
+// IncrRef pins the segment so it cannot be closed or removed while an in-flight
+// read is using its file handle.
+func (s *segment) IncrRef() {
+	s.refs.Add(1)
+}
+
+// DecrRef releases a read reference and performs a deferred removal when the
+// segment was marked for deletion while the last reader was still active.
+func (s *segment) DecrRef() {
+	if s.refs.Add(-1) == 0 && s.removePending.Load() {
+		_ = s.removeFile()
+	}
+}
+
+func (s *segment) markRemove() error {
+	s.removePending.Store(true)
+	if s.refs.Load() > 0 {
+		return nil
+	}
+	return s.removeFile()
+}
+
+func (s *segment) removeFile() error {
+	if !s.removed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := s.close(); err != nil {
+		return err
+	}
+	return os.Remove(s.path)
 }
 
 func openSegment(path string, fid uint32, maxSize int64, reg *crypto.KeyRegistry) (*segment, error) {
@@ -107,6 +145,7 @@ func openSegment(path string, fid uint32, maxSize int64, reg *crypto.KeyRegistry
 
 	s := &segment{
 		fid:     fid,
+		path:    path,
 		file:    f,
 		writer:  bufio.NewWriterSize(f, 64*1024),
 		maxSize: maxSize,
@@ -184,7 +223,7 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed {
+	if s.closed || s.writeClosed {
 		return 0, fmt.Errorf("vlog: segment %d is closed", s.fid)
 	}
 
@@ -252,12 +291,18 @@ func (s *segment) writeEntry(e *ValueEntry) (valueOffset int64, err error) {
 func (s *segment) flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.writer == nil {
+		return nil
+	}
 	return s.writer.Flush()
 }
 
 func (s *segment) sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.writer == nil {
+		return nil
+	}
 	if err := s.writer.Flush(); err != nil {
 		return err
 	}
@@ -271,8 +316,16 @@ func (s *segment) close() error {
 		return nil
 	}
 	s.closed = true
-	_ = s.writer.Flush()
-	return s.file.Close()
+	s.writeClosed = true
+	if s.writer != nil {
+		_ = s.writer.Flush()
+	}
+	if s.file != nil {
+		err := s.file.Close()
+		s.file = nil
+		return err
+	}
+	return nil
 }
 
 // readValue reads raw bytes from the segment at the given offset.
@@ -281,13 +334,28 @@ func (s *segment) readValue(offset uint64, size uint32) ([]byte, error) {
 		return nil, nil
 	}
 	s.mu.Lock()
-	if err := s.writer.Flush(); err != nil {
+	if s.closed {
 		s.mu.Unlock()
-		return nil, err
+		return nil, fmt.Errorf("vlog: segment %d is closed", s.fid)
 	}
+	if s.file == nil {
+		f, err := os.Open(s.path)
+		if err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		s.file = f
+	}
+	if !s.writeClosed {
+		if err := s.writer.Flush(); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	f := s.file
 	s.mu.Unlock()
 	buf := make([]byte, size)
-	if _, err := s.file.ReadAt(buf, int64(offset)); err != nil {
+	if _, err := f.ReadAt(buf, int64(offset)); err != nil {
 		return nil, err
 	}
 	if s.encrypted {
@@ -296,6 +364,27 @@ func (s *segment) readValue(offset uint64, size uint32) ([]byte, error) {
 		}
 	}
 	return buf, nil
+}
+
+func (s *segment) closeForWrite() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writeClosed {
+		return nil
+	}
+	s.writeClosed = true
+	if s.writer != nil {
+		if err := s.writer.Flush(); err != nil {
+			return err
+		}
+		s.writer = nil
+	}
+	if s.file != nil {
+		err := s.file.Close()
+		s.file = nil
+		return err
+	}
+	return nil
 }
 
 // ValueLog manages VLog segments and provides the main API.
@@ -367,6 +456,7 @@ func openWithMaxSize(dir string, maxSegmentSize int64, reg *crypto.KeyRegistry) 
 				continue
 			}
 			vl.segments[fid] = seg
+			_ = seg.closeForWrite()
 			if fid > maxFid {
 				maxFid = fid
 			}
@@ -389,18 +479,17 @@ func openWithMaxSize(dir string, maxSegmentSize int64, reg *crypto.KeyRegistry) 
 
 // Write appends a value entry to the active segment and returns the ValuePointer.
 func (vl *ValueLog) Write(e *ValueEntry) (ValuePointer, error) {
-	// The rotation decision and the segment swap happen under vl.mu so
-	// concurrent writers cannot each spawn their own empty segment.
+	// Held for the whole append so a concurrent rotation cannot release the
+	// handle out from under an in-flight write.
 	vl.mu.Lock()
+	defer vl.mu.Unlock()
+
 	if vl.active.offset.Load() >= vl.active.maxSize {
 		if err := vl.rotateLocked(); err != nil {
-			vl.mu.Unlock()
 			return ValuePointer{}, fmt.Errorf("vlog rotate: %w", err)
 		}
 	}
 	active := vl.active
-	fid := active.fid
-	vl.mu.Unlock()
 
 	offset, err := active.writeEntry(e)
 	if err != nil {
@@ -408,7 +497,7 @@ func (vl *ValueLog) Write(e *ValueEntry) (ValuePointer, error) {
 	}
 
 	return ValuePointer{
-		Fid:    fid,
+		Fid:    active.fid,
 		Offset: uint64(offset),
 		Size:   uint32(len(e.Value)),
 	}, nil
@@ -424,7 +513,8 @@ func (vl *ValueLog) Rotate() error {
 // rotateLocked closes out the active segment and opens the next one.
 // The caller must hold vl.mu.
 func (vl *ValueLog) rotateLocked() error {
-	if err := vl.active.sync(); err != nil {
+	old := vl.active
+	if err := old.sync(); err != nil {
 		return err
 	}
 
@@ -436,7 +526,7 @@ func (vl *ValueLog) rotateLocked() error {
 	}
 	vl.segments[vl.nextFid] = active
 	vl.active = active
-	return nil
+	return old.closeForWrite()
 }
 
 // Sync flushes and syncs the active segment to disk.
@@ -455,11 +545,15 @@ func (vl *ValueLog) ReadValue(vp ValuePointer) ([]byte, error) {
 
 	vl.mu.Lock()
 	seg, ok := vl.segments[vp.Fid]
+	if ok {
+		seg.IncrRef()
+	}
 	vl.mu.Unlock()
 
 	if !ok {
 		return nil, fmt.Errorf("%w: fid=%d", ErrSegmentNotFound, vp.Fid)
 	}
+	defer seg.DecrRef()
 
 	return seg.readValue(vp.Offset, vp.Size)
 }
@@ -562,15 +656,22 @@ func (vl *ValueLog) Recover(fid uint32, fn func(entry ValueEntry, valueOffset in
 
 	// Flush the writer so recovery sees all data.
 	seg.mu.Lock()
-	_ = seg.writer.Flush()
+	if seg.writer != nil && !seg.writeClosed {
+		_ = seg.writer.Flush()
+	}
 	seg.mu.Unlock()
 
 	// Read the file directly for recovery (bypass buffered writer).
-	file, err := os.Open(seg.file.Name())
+	file, err := os.Open(seg.path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+
+	var segSize int64
+	if st, serr := file.Stat(); serr == nil {
+		segSize = st.Size()
+	}
 
 	// Read the segment header (magic + version, plus keyID/baseIV when encrypted).
 	var segHdr [segmentHeaderSize]byte
@@ -607,6 +708,10 @@ func (vl *ValueLog) Recover(fid uint32, fn func(entry ValueEntry, valueOffset in
 		kLen := binary.BigEndian.Uint32(hdr[1:5])
 		vLen := binary.BigEndian.Uint32(hdr[5:9])
 		expAt := int64(binary.BigEndian.Uint64(hdr[9:17]))
+
+		if offset+int64(entryHeaderSize)+int64(kLen)+int64(vLen)+4 > segSize {
+			break
+		}
 
 		key := make([]byte, kLen)
 		if _, err := io.ReadFull(file, key); err != nil {
@@ -682,9 +787,16 @@ func (vl *ValueLog) Close() error {
 	return firstErr
 }
 
-// DeleteSegment removes a segment file from disk and from the map.
+// DeleteSegment removes a segment file from disk and from the map. When a
+// concurrent reader still holds a reference the physical removal is deferred
+// until the last reader drops it, which keeps Windows from rejecting the
+// delete with ERROR_ACCESS_DENIED.
 func (vl *ValueLog) DeleteSegment(fid uint32) error {
 	vl.mu.Lock()
+	if vl.active != nil && vl.active.fid == fid {
+		vl.mu.Unlock()
+		return fmt.Errorf("vlog: cannot delete active segment %d", fid)
+	}
 	seg, ok := vl.segments[fid]
 	if ok {
 		delete(vl.segments, fid)
@@ -695,10 +807,5 @@ func (vl *ValueLog) DeleteSegment(fid uint32) error {
 		return nil
 	}
 
-	if err := seg.close(); err != nil {
-		return err
-	}
-
-	path := filepath.Join(vl.dir, fmt.Sprintf("vlog_%06d.log", fid))
-	return os.Remove(path)
+	return seg.markRemove()
 }

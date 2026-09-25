@@ -148,3 +148,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Removed custom wire RPC protocols (`writeMessage`, `readMessage`, `peerConn`) and home-grown disk log compaction from the `cluster` package in favor of HashiCorp TCP transport and FileSnapshotStore.
 - Removed OS build tags and unsafe memory mappings in `uring/uring_linux.go` and `uring/uring_fallback.go`.
+
+## [0.2.0] - 2026-09-25
+
+### Added
+
+- **Binary Raft Snapshots**: Replaced JSON state machine snapshots in `cluster/fsm.go` with a length-prefixed binary format (`AKWS` magic, versioned header, size guards). Snapshots are streamed through a `bufio` writer, eliminating per-entry reflection and serialization overhead during catch-up replication.
+- **Chunked Bitmap Storage**: BITMAPS are now stored in 4KB pages under composite keys (`b\x00<key>\x00<page>`), so a single bitmap no longer rewrites one monolithic value on every `SETBIT`/`BITCOUNT`. Added `Engine.DeleteBitmap` and exposed it through the `server.DB` interface.
+- **Deferred ValueLog Segment Reclamation**: `vlog.Segment` now carries an atomic reference count. `DeleteSegment` defers the unlink until the last in-flight reader releases the segment and refuses to delete the active writer segment, preventing readers from observing a truncated file mid-lookup.
+- **Exact ValueLog GC Accounting**: VLog GC now counts precisely dropped bytes (`vlogDiscards` / `DiscardStats`) and only deletes a segment once compaction has purged all pointers referencing it, replacing the previous heuristic that could reclaim live data.
+- **GC Blacklist for Pending Segments**: Added `gcPending`, so segments awaiting compaction reclamation are skipped by both the GC ticker and `RunValueLogGC` until their discard counters catch up.
+- **Transactional `DEL` Accounting**: `DEL` inside `MULTI` now returns the real number of removed keys (`keyExistsInDB`), records them in `txDeletes`, and performs follow-up `DeleteBitmap`/`Delete` cleanup after a successful commit.
+- **`WAL.SyncOnWrite()`**: Exposed the group-commit durability mode so engine components can preserve the configured write policy across WAL rotations.
+- **`ErrWALClosed`**: Added a typed error returned by `WriteVersion` when the WAL has been closed, replacing an unrecoverable channel-send panic.
+
+### Changed
+
+- **Portable Concurrent Block Reader**: `uring.AsyncReader.ReadBlocks` now accepts an `io.ReaderAt` instead of raw file descriptors, eliminating the `os.NewFile` finalizer that could close still-in-use descriptors and removing the remaining Linux-specific assumptions from the read path.
+- **SSI/MVCC Correctness in Transactions**: `MGET`, `INCR`/`DECR` and `EXPIRE` inside `MULTI` now read through `GetByVersion(execReadTs)`, honor prior writes from `txWrites`, and record their reads in `txReadSet`, so transactional reads observe the transaction snapshot instead of latest committed state.
+- **Disconnect Rollback**: `handleConnection` now rolls back an unfinished transaction when a client disconnects mid-`MULTI`, so an abandoned transaction can no longer pin the Oracle read watermark.
+- **WAL Group Commit Preserved Across Flushes**: `triggerFlushLocked` carries `SyncOnWrite` over to the rotating WAL, so a rotation no longer silently downgrades a `SYNC` workload to buffered writes.
+- **Checkpoint and Compaction Synchronization**: Added `metaMu` (level append + MANIFEST write) and `manifestMu` (checkpoint manifest copy), and moved `CreateCheckpoint` to a strict wait-flush-lock-snapshot order, preventing checkpoints from capturing a half-applied level set or a partially written MANIFEST.
+- **WAL Rotation Serialization**: `triggerFlushLocked` and `clearInternal` now hold `walAppendMu` while rotating or closing the WAL, closing the window in which a concurrent appender could write to a closed file.
+- **Raft Leader-Change Version Safety**: `cluster/node.go` assigns write versions from `max(nextVersion, db.CurrentVersion()) + 1` under `verMu`, and followers reset `lastSeq` when a snapshot transfer starts, preventing version reuse and gap-induced stalls after elections.
+- **Raft Leader Redirects**: Applying a command on a non-leader now returns `MOVED 0 <leaderAddr>` (or `CLUSTERDOWN no leader elected`) via `leaderRedirect()` instead of a generic error.
+- **Replication Sequence Ownership**: `ReplBacklog.Push` now assigns and returns the entry sequence, so the replication appender no longer feeds an unassigned `seq` back into the backlog.
+- **ValueLog Rotation Handle Hygiene**: Rotated segments close their write handle immediately and are reopened lazily on read, and historical segments discovered during `Recover` are put into write-closed state, avoiding leaked descriptors and buffered writes to stale segments.
+- **Composite-Key Allocation Reduction**: Hash, set, list and bitmap key builders now use preallocated buffers (`hashPrefix`/`hashFieldKey`, `setPrefix`/`setMemberKey`, `listElemKey`/`listMetaKey`), removing most per-operation string anagrams in hot command paths.
+- **README I/O Alignment**: Documentation now describes the portable parallel `file.ReadAt` block reader instead of the removed `io_uring` and `runtime.Pinner` implementation.
+
+### Fixed
+
+- **`byteSlab` Chunk Leak**: `release()` now returns every allocated chunk to the pool instead of only the last one, so arena recycling no longer leaks the remainder of a slab.
+- **Raft Snapshot Restore Safety**: `Restore` validates the `AKWS` magic, format version and field sizes before calling `db.Clear()`, so a truncated or foreign stream can no longer wipe live state before failing.
+- **WAL Recovery Offset Desync**: `Recover` now bounds-checks every decoded record against the real file size, ignores trailing garbage instead of over-allocating from a corrupt length header, and realigns `currentOffset`/writer position to the last valid frame.
+- **Windows WAL Truncate `ERROR_ACCESS_DENIED`**: Recovery truncates via `os.Truncate(path, size)` instead of the `O_APPEND` file handle, which Windows rejects with access-denied.
+- **Windows ValueLog Delete Failure**: Segment deletion now retries/handles the Windows access-denied case that occurred when deleting a value log file while a handle was still open.
+- **Oracle Read Watermark Refcount**: `readSeqs` is now a `map[uint64]int` reference count, so overlapping readers of the same timestamp no longer release the watermark early and unblock compaction against live readers.
+- **`appliedTs` Wedge on Dropped Writes**: The writer calls `oracle.MarkApplied(req.seq)` on context-cancel paths, so an aborted request can no longer leave `appliedTs` permanently behind and stall every subsequent read.
+- **ValueLog GC Shutdown Hang**: The GC rewrite wait loop now selects on `e.ctx.Done()`, so shutdown is no longer blocked by a rewrite that cannot complete.
+- **ValueLog GC Deleting Live Data**: Segments are deleted only after compaction has dropped all pointers to them, fixing data loss when GC ran ahead of compaction.
+- **Bitmap Deletion**: `DEL` on a bitmap key now removes all of its chunk pages (and the server delegates to `DeleteBitmap`) instead of leaving orphaned pages readable.
+- **List Metadata Key Leak**: `LPOP`/`RPOP` delete `listMetaKey` once a list becomes empty, so the empty-list marker no longer resurrects as a phantom key.
+- **`MULTI`/`EXEC` Visibility Gaps**: Compound read commands that cannot honor a transaction snapshot are rejected inside `MULTI` (`txUnsupportedCommands`) rather than silently reading latest committed data.
+- **Replica Snapshot Sequence Gaps**: Resetting `lastSeq` on snapshot start and validating `ReplBacklog.Since` against `nextSeq` prevents replicas from requesting entries beyond the backlog after a snapshot transfer.
+- **NaN ZSet Scores**: `ZADD` now rejects `math.IsNaN(score)` on both the direct and replicated paths, preventing corrupt ordering in the score index.
+- **SSTable TTL Tombstone Version Zero**: Expired records returned from block scans now report their real `bestVer` instead of version `0`, so TTL tombstones mask older versions in lower levels.
+- **VLog Read-after-Rotate Failure**: `readValue` lazily reopens a rotated segment's read handle, and `Write` holds the segment lock end-to-end, fixing `nil`-handle panics and torn writes after rotation.
+- **VLog Recovery OOM on Corrupt Header**: `Recover` validates each entry header against the recorded segment size before allocating, preventing multi-gigabyte allocations from a corrupt length field.
+- **VLog Descriptor and Buffer Leak on Open**: Opening a value log no longer leaks a duplicated descriptor and its write buffer when an existing segment is reused.
+- **`ZSCORE` on Missing Key**: Returns a nil bulk reply (`$-1`) instead of a protocol error, matching Redis semantics for absent members.
+- **WAL Write-After-Close Hang**: The group-commit loop receives its queue as a parameter, so it cannot block forever on a nil channel after `Close` clears the field.
+
+## [0.2.1] - 2026-09-25
+
+### Added
+
+- **Streaming LSM Compaction**: Replaced the materialize-then-split compaction path with a streaming `sstLevelWriter`. `drainMergedIterator` now writes key-groups straight to disk and closes an SSTable as soon as the ~8 MB target is reached, so peak compaction RAM is bounded by one output table instead of the full merged range. Tables are only cut on a key boundary, so MVCC versions of a key never split across tables.
+- **Full-Space `SCAN`**: Added `Engine.ScanAllKeys(pattern)`, which walks the whole keyspace, reconstructs logical names from composite keys (`h\x00`, `s\x00`, `l\x00`, `z\x00`, `b\x00`, `t\x00`), deduplicates and matches the glob. RESP `SCAN` now also returns hashes, sets, lists, zsets and bitmaps, not just plain strings.
+- **Chunked Collection Deletion**: Added `Engine.DeleteCollection(key)` backed by `deletePrefixChunked`, which streams a prefix iterator and applies deletions in 1024-key batches. `DEL` of a multi-million-field hash/set/list/zset/bitmap no longer materializes every member in memory (`HGetAll`/`SMEMBERS` followed by N `HDel`).
+- **`GETDEL` Command**: Added `Engine.GetDel(key)` (read-and-delete under the key lock), exposed as RESP `GETDEL` including the Raft-replicated path, giving an atomic primitive for idempotent cart/checkout cleanup.
+- **`SINTER` Command**: Added `Engine.SInter(keys...)` and RESP `SINTER key [key ...]`, intersecting sets by member name to support secondary-index style queries.
+- **TLS Transport**: `Server.SetTLS(certFile, keyFile)` makes `Start()` listen through `tls.Listen` with minimum TLS 1.2; without a certificate the server keeps its previous plain TCP listener. Config keys `tls_cert_file` / `tls_key_file`.
+- **Raft Wired Into the Binary**: `cmd/akwadb` now creates `cluster.NewNode(...)` and injects it through `srv.SetClusterNode(...)` when `--raft-id` is set, with `--raft-addr` / `--raft-bootstrap` and matching `raft_id` / `raft_addr` / `raft_bootstrap` config keys. The shipped binary previously always started as a single node even though the `cluster` package existed.
+- **Segment Archiving (`Archiver`)**: Added the `Archiver` interface and `Engine.SetArchiver`, with a background worker drained on `Close()`. Rotated WAL segments and VLog segments are handed to the archiver before deletion. Two implementations ship: `FileArchiver` (gzip into a local directory via atomic `.tmp` + rename + directory sync) and `S3Archiver` — a dependency-free S3/MinIO/R2 uploader using hand-rolled AWS SigV4 (`s3_endpoint`, `s3_region`, `s3_bucket`, `s3_prefix`, `s3_access_key`, `s3_secret_key`, `s3_path_style`, `s3_use_tls`).
+- **Point-in-Time Recovery**: WAL records now carry a wall-clock `Timestamp`; `internal/pitr.Restore` replays a base checkpoint plus archived `wal_*.log.gz` / `vlog_*.log.gz` segments up to a cutoff, and the new `akwadb-tool` CLI exposes it (`-base`, `-archive`, `-out`, `-restore-until`).
+- **Scheduled Checkpoints**: `Options.CheckpointDir` / `CheckpointInterval` / `CheckpointKeep` add a worker that creates timestamped checkpoints on an interval and prunes old ones (config keys `checkpoint_dir`, `checkpoint_interval_seconds`, `checkpoint_keep`).
+- **Fuzz Targets**: Added `FuzzWALRecover` and `FuzzSSTableOpen` for the binary WAL and SSTable parsers.
+- **Hard-Kill Crash Test**: Added `test/integration/crash_test.go`, which re-execs the test binary, kills it with `Process.Kill` mid-write, then reopens the engine and verifies every acknowledged key survived recovery.
+
+### Changed
+
+- **C10k Connection Model**: Removed the per-connection writer goroutine and `sendCh`. The pub/sub pump now starts lazily on `SUBSCRIBE`, and per-connection buffers dropped from 32 KB / 16 KB to a shared 4 KB (`connBufferSize`), cutting idle connection cost from ~80 KB to a few KB, with one extra goroutine only for subscribed clients.
+- **Disk-Full is Read-Only Instead of Destructive**: Removed `evictIfNeeded`, which silently unlinked the oldest SSTables from the bottom levels when `MaxDiskBytes` was exceeded. The engine now flips an atomic `diskFull` flag and rejects data-growing writes with `ErrDiskFull` (`-OOM command not allowed when disk is full`) while still allowing deletes; the flag clears automatically once compaction/GC frees space.
+- **Write Queue Backpressure Timeout**: All enqueue points now go through `submitWrite`, a `select` on the request channel with `ctx.Done()` and a timeout, returning `ErrWriteTimeout` instead of blocking handler goroutines indefinitely when the disk stalls.
+- **WAL Durability**: `fsutil.SyncDir(dataDir)` is now called after renaming the active WAL on flush and after creating a fresh `wal.log`, so directory metadata survives a kernel panic.
+- **WAL Record Format**: The record header grew from 29 to 37 bytes to include the 8-byte `Timestamp` field, and the CRC covers the new layout. This is a breaking on-disk format change: WAL files written by older builds are not readable by this version.
+
+### Fixed
+
+- **Bitmap Existence Check**: `keyExistsInDB` now probes the raw bitmap key pages instead of the string prefix, so `DEL` / `EXISTS` correctly count and report bitmaps.

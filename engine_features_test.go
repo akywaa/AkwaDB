@@ -204,6 +204,86 @@ func TestEngine_TombstoneVictim(t *testing.T) {
 	}
 }
 
+func TestEngine_ZScoreMissingIsNil(t *testing.T) {
+	e := testEngine(t)
+	defer func() { e.Close(); os.RemoveAll(e.dataDir) }()
+
+	score, ok, err := e.ZScore("nosuch", "member")
+	if err != nil || ok || score != 0 {
+		t.Fatalf("ZScore missing = %v, %v, %v; want 0, false, nil", score, ok, err)
+	}
+}
+
+func TestEngine_WALGroupCommitAfterFlush(t *testing.T) {
+	e := testEngine(t)
+	defer func() { e.Close(); os.RemoveAll(e.dataDir) }()
+
+	if !e.wal.SyncOnWrite() {
+		t.Fatal("active WAL did not start in group-commit mode")
+	}
+	if err := e.Put("k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.submitFlush(); err != nil {
+		t.Fatal(err)
+	}
+	if !e.wal.SyncOnWrite() {
+		t.Fatal("group commit was disabled after the first memtable flush")
+	}
+}
+
+func TestEngine_ListMetaRemovedWhenEmpty(t *testing.T) {
+	e := testEngine(t)
+	defer func() { e.Close(); os.RemoveAll(e.dataDir) }()
+
+	if _, err := e.RPush("lst", []string{"a", "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RPop("lst"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.RPop("lst"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.getByKey(listMetaKey("lst")); err != ErrKeyNotFound {
+		t.Fatalf("list meta key survived an emptied list: %v", err)
+	}
+	if n, _ := e.LLen("lst"); n != 0 {
+		t.Fatalf("LLen = %d, want 0", n)
+	}
+}
+
+func TestEngine_BitmapChunked(t *testing.T) {
+	e := testEngine(t)
+	defer func() { e.Close(); os.RemoveAll(e.dataDir) }()
+
+	const far = int64(1_000_000_007)
+	if old, err := e.SetBit("bm", 3, 1); err != nil || old != 0 {
+		t.Fatalf("SetBit(3,1) = %d, %v; want 0", old, err)
+	}
+	if old, err := e.SetBit("bm", far, 1); err != nil || old != 0 {
+		t.Fatalf("SetBit(%d,1) = %d, %v; want 0", far, old, err)
+	}
+	if bit, err := e.GetBit("bm", 3); err != nil || bit != 1 {
+		t.Fatalf("GetBit(3) = %d, %v; want 1", bit, err)
+	}
+	if bit, err := e.GetBit("bm", far); err != nil || bit != 1 {
+		t.Fatalf("GetBit(%d) = %d, %v; want 1", far, bit, err)
+	}
+	if bit, err := e.GetBit("bm", far+1); err != nil || bit != 0 {
+		t.Fatalf("GetBit(%d) = %d, %v; want 0", far+1, bit, err)
+	}
+	if n, err := e.BitCount("bm"); err != nil || n != 2 {
+		t.Fatalf("BitCount = %d, %v; want 2", n, err)
+	}
+	if err := e.DeleteBitmap("bm"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := e.BitCount("bm"); n != 0 {
+		t.Fatalf("BitCount after delete = %d; want 0", n)
+	}
+}
+
 func TestEngine_PipelinedIncr(t *testing.T) {
 	e := testEngine(t)
 	defer func() { e.Close(); os.RemoveAll(e.dataDir) }()

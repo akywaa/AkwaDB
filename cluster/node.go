@@ -1,9 +1,12 @@
 package cluster
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +20,7 @@ type Node struct {
 	fsm         *EngineFSM
 	db          server.DB
 	nextVersion atomic.Uint64
+	verMu       sync.Mutex
 	transport   *raft.NetworkTransport
 	logStore    *boltdb.BoltStore
 	stableStore *boltdb.BoltStore
@@ -91,12 +95,40 @@ func (n *Node) LeaderAddr() string {
 	return string(n.raftNode.Leader())
 }
 
+// leaderRedirect returns a Redis MOVED error so clients on a follower can
+// reconnect to the current leader instead of seeing a bare raft error.
+func (n *Node) leaderRedirect() error {
+	addr := n.LeaderAddr()
+	if addr == "" {
+		return errors.New("CLUSTERDOWN no leader elected")
+	}
+	return fmt.Errorf("MOVED 0 %s", addr)
+}
+
+// nextWriteVersion returns a commit version strictly greater than anything
+// already applied to the local database, so a former follower promoted to
+// leader cannot reissue already-committed versions.
+func (n *Node) nextWriteVersion() uint64 {
+	n.verMu.Lock()
+	defer n.verMu.Unlock()
+	cur := n.nextVersion.Load()
+	if applied := n.db.CurrentVersion(); applied > cur {
+		cur = applied
+	}
+	v := cur + 1
+	n.nextVersion.Store(v)
+	return v
+}
+
 func (n *Node) ApplyWrite(entries []server.BatchWriteEntry) error {
-	cmd := raftCommand{Op: "batch_apply", Entries: entries, Version: n.nextVersion.Add(1)}
+	cmd := raftCommand{Op: "batch_apply", Entries: entries, Version: n.nextWriteVersion()}
 	data := encodeRaftCommand(cmd)
 
 	future := n.raftNode.Apply(data, 5*time.Second)
 	if err := future.Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return n.leaderRedirect()
+		}
 		return err
 	}
 	res := future.Response()
@@ -112,6 +144,9 @@ func (n *Node) ApplyCommand(op string, args []string) (interface{}, error) {
 
 	future := n.raftNode.Apply(data, 5*time.Second)
 	if err := future.Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return nil, n.leaderRedirect()
+		}
 		return nil, err
 	}
 	res := future.Response()

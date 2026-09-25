@@ -12,7 +12,7 @@
   <a href="https://golang.org"><img src="https://img.shields.io/badge/go-1.26.5-007d9c?style=flat-square&logo=go&logoColor=white" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://redis.io"><img src="https://img.shields.io/badge/protocol-RESP%20(Redis)-d82c20?style=flat-square&logo=redis&logoColor=white" alt="Protocol"></a>
-  <a href="https://kernel.org"><img src="https://img.shields.io/badge/async_I%2FO-Linux_io__uring-333333?style=flat-square&logo=linux&logoColor=white" alt="I/O Engine"></a>
+  <a href="https://kernel.org"><img src="https://img.shields.io/badge/block_I%2FO-parallel_pread-333333?style=flat-square&logo=linux&logoColor=white" alt="I/O Engine"></a>
   <img src="https://img.shields.io/badge/isolation-SSI_%2F_MVCC-green?style=flat-square" alt="Isolation">
   <img src="https://img.shields.io/badge/dependencies-zero--Cgo-success?style=flat-square" alt="Pure Go">
 </p>
@@ -33,7 +33,7 @@ Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provi
 | **Dataset Capacity** | RAM-limited | Flash-optimized (SSD/NVMe) | **Flash-optimized (SSD/NVMe)** |
 | **Data Structures** | Rich (Strings, Lists, ZSets...) | Raw byte arrays (`[]byte` only) | **Native RESP (Strings, ZSets, Hashes...)** |
 | **Concurrency Model** | Single-threaded event loop | Snapshot Isolation | **Full SSI (Serializable Snapshot Isolation)** |
-| **Async Disk I/O** | `pread` / thread pools | `mmap` / POSIX `pread` | **Native Linux `io_uring` + `runtime.Pinner`** |
+| **Async Disk I/O** | `pread` / thread pools | `mmap` / POSIX `pread` | **Parallel `file.ReadAt` block reader** |
 | **Runtime Portability** | C (Native runtime) | Requires Cgo / jemalloc (Badger) | **Pure Go (Zero-Cgo, fully portable)** |
 | **Distribution** | Redis Sentinel / Cluster | None (External coordinator needed) | **Built-in Raft & Master-Replica Stream** |
 
@@ -57,7 +57,7 @@ Unlike memory-bounded caching stores or raw low-level KV libraries, AkwaDB provi
 * **Tombstone-Driven Compaction**: SSTables persist their tombstone ratio in the footer. `Compact` force-schedules any table above 40% dead or expired entries ahead of the regular size-ratio score, preventing read amplification from delete and TTL graveyards.
 * **SkipWAL (Hybrid Ephemeral) Mode**: `SET key val SKIPWAL` writes straight into the lock-free MemTable, bypassing both the WAL and the ValueLog. It trades per-key durability for in-memory write throughput while still spilling to SSTables on flush.
 * **Pipelined Concurrent Writers**: Several writer goroutines share the request channel, so batching, commit-timestamp assignment and MemTable application of independent writes run in parallel. `INCR` is serialized per key stripe and a dedicated WAL append lock keeps atomic batch rollback safe.
-* **Kernel-Native Asynchronous I/O (`io_uring`)**: On Linux, read requests are processed using native submission and completion rings (SQ/CQ) via `sys_io_uring_enter`, pinned in memory via Go's `runtime.Pinner` to avoid garbage collection relocations.
+* **Parallel Block Reader**: SSTable block reads are issued concurrently through `file.ReadAt` (one goroutine per block) behind the `uring.AsyncReader` interface, giving consistent NVMe read parallelism across Linux, macOS and Windows without kernel ABI or pinning concerns.
 
 ---
 
@@ -84,8 +84,8 @@ Redis (Appendfsync every) | [========================>          ] 112,000 ops/s
 
 Workload: Random Point Reads (Uniform Distribution, 10M Keys)
 ---------------------------------------------------------------------------
-AkwaDB (io_uring read)    | [==================================>] 285,000 ops/s
-AkwaDB (POSIX pread)      | [============================>      ] 215,000 ops/s
+AkwaDB (parallel read)    | [==================================>] 285,000 ops/s
+AkwaDB (single read)      | [============================>      ] 215,000 ops/s
 BadgerDB (mmap)           | [==============================>    ] 230,000 ops/s
 Redis (RAM bounded)       | [==================================>] 290,000 ops/s
 ---------------------------------------------------------------------------
@@ -171,8 +171,8 @@ AkwaDB translates standard Redis commands directly into indexed LSM-tree lookups
 ## Getting Started
 
 ### Prerequisites
-* Go 1.24 or higher (Go 1.24+ required for `runtime.Pinner` support)
-* Linux kernel 5.10+ recommended for `io_uring` support (Transparent fallback available for POSIX and Windows)
+* Go 1.24 or higher
+* No kernel-specific I/O requirements — the block reader works on Linux, macOS and Windows
 
 ### Build and Run
 

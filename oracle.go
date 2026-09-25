@@ -72,7 +72,7 @@ type Oracle struct {
 	history   []committedTxn
 	watermark *WaterMark
 	readMu    sync.Mutex
-	readSeqs  map[uint64]struct{}
+	readSeqs  map[uint64]int
 }
 
 func newOracle() *Oracle {
@@ -81,7 +81,7 @@ func newOracle() *Oracle {
 		appliedTs: 1,
 		awaiting:  make(map[uint64]struct{}),
 		watermark: newWaterMark(),
-		readSeqs:  make(map[uint64]struct{}),
+		readSeqs:  make(map[uint64]int),
 	}
 }
 
@@ -175,13 +175,17 @@ func (o *Oracle) BeginRead() uint64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	ts := o.nextTs
-	o.readSeqs[ts] = struct{}{}
+	o.readSeqs[ts]++
 	return ts
 }
 
 func (o *Oracle) DoneRead(ts uint64) {
 	o.mu.Lock()
-	delete(o.readSeqs, ts)
+	if n := o.readSeqs[ts] - 1; n > 0 {
+		o.readSeqs[ts] = n
+	} else {
+		delete(o.readSeqs, ts)
+	}
 	o.advanceAppliedLocked()
 	o.mu.Unlock()
 }

@@ -10,24 +10,27 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/akywaa/akwadb/internal/crypto"
 )
 
 var ErrCorruptedRecord = errors.New("wal: record checksum mismatch or truncated entry")
 
+var ErrWALClosed = errors.New("wal: closed")
+
 const (
 	OpPut byte = iota + 1
 	OpDelete
 )
 
-// WAL Record format (29 bytes total overhead):
-// +-----------+-------------+---------------+----------------+----------------+----------------+
-// | Op (1B)   | KeyLen (4B) | ValLen (4B)   | ExpiresAt (8B) | Version (8B)   | CRC32 (4B)     |
-// +-----------+-------------+---------------+----------------+----------------+----------------+
-// | Data: Key (KeyLen) ...                  | Data: Value (ValLen) ...                        |
-// +-----------------------------------------+--------------------------------------------------+
-const walHeaderSize = 29
+// WAL Record format (37 bytes total overhead):
+// +-----------+-------------+---------------+----------------+----------------+----------------+----------------+
+// | Op (1B)   | KeyLen (4B) | ValLen (4B)   | ExpiresAt (8B) | Version (8B)   | Timestamp (8B) | CRC32 (4B)     |
+// +-----------+-------------+---------------+----------------+----------------+----------------+----------------+
+// | Data: Key (KeyLen) ...                  | Data: Value (ValLen) ...                                          |
+// +-----------------------------------------+-------------------------------------------------------------------+
+const walHeaderSize = 37
 
 // Encrypted WAL files start with a plaintext header:
 // magic(4) + version(4) + keyID(8) + baseIV(16) = 32 bytes.
@@ -44,6 +47,7 @@ type Record struct {
 	ValueOffset int64
 	ExpiresAt   int64
 	Version     uint64
+	Timestamp   int64
 }
 
 // writeTask is submitted to the group commit batcher.
@@ -53,6 +57,7 @@ type writeTask struct {
 	val       []byte
 	expiresAt int64
 	version   uint64
+	timestamp int64
 	offsetCh  chan int64
 	errCh     chan error
 }
@@ -156,9 +161,10 @@ func OpenWithOptionsAndRegistry(path string, syncOnWrite bool, reg *crypto.KeyRe
 	}
 
 	if syncOnWrite {
-		w.writeQueue = make(chan writeTask, 1024)
+		queue := make(chan writeTask, 1024)
+		w.writeQueue = queue
 		w.wg.Add(1)
-		go w.groupCommitLoop()
+		go w.groupCommitLoop(queue)
 	}
 	return w, nil
 }
@@ -170,6 +176,7 @@ func (w *WAL) Write(op byte, key, val []byte, expiresAt int64) (int64, error) {
 
 // WriteVersion appends a record with an explicit version (commitTs) to the WAL.
 func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version uint64) (int64, error) {
+	timestamp := time.Now().UnixNano()
 	if w.syncOnWrite {
 		task := writeTask{
 			op:        op,
@@ -177,10 +184,17 @@ func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version ui
 			val:       val,
 			expiresAt: expiresAt,
 			version:   version,
+			timestamp: timestamp,
 			offsetCh:  make(chan int64, 1),
 			errCh:     make(chan error, 1),
 		}
+		w.mu.Lock()
+		if w.writeQueue == nil {
+			w.mu.Unlock()
+			return 0, ErrWALClosed
+		}
 		w.writeQueue <- task
+		w.mu.Unlock()
 		err := <-task.errCh
 		return <-task.offsetCh, err
 	}
@@ -191,7 +205,7 @@ func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version ui
 	startOffset := w.currentOffset.Load()
 	valueOffset := startOffset + int64(walHeaderSize) + int64(len(key))
 
-	if err := w.writeDirect(op, key, val, expiresAt, version, startOffset); err != nil {
+	if err := w.writeDirect(op, key, val, expiresAt, version, timestamp, startOffset); err != nil {
 		return 0, err
 	}
 	w.currentOffset.Add(int64(walHeaderSize + len(key) + len(val)))
@@ -201,7 +215,7 @@ func (w *WAL) WriteVersion(op byte, key, val []byte, expiresAt int64, version ui
 
 // writeDirect writes a single record into the buffered writer. When encryption
 // is enabled, the key and value are encrypted at their on-disk offsets.
-func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uint64, startOffset int64) error {
+func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uint64, timestamp int64, startOffset int64) error {
 	encKey := key
 	encVal := val
 	if w.encrypted {
@@ -237,6 +251,10 @@ func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uin
 	binary.BigEndian.PutUint64(verBuf[:], version)
 	crc.Write(verBuf[:])
 
+	var tsBuf [8]byte
+	binary.BigEndian.PutUint64(tsBuf[:], uint64(timestamp))
+	crc.Write(tsBuf[:])
+
 	crc.Write(encKey)
 	crc.Write(encVal)
 
@@ -245,7 +263,8 @@ func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uin
 	binary.BigEndian.PutUint32(w.headerBuf[5:9], uint32(len(encVal)))
 	binary.BigEndian.PutUint64(w.headerBuf[9:17], uint64(expiresAt))
 	binary.BigEndian.PutUint64(w.headerBuf[17:25], version)
-	binary.BigEndian.PutUint32(w.headerBuf[25:29], crc.Sum32())
+	binary.BigEndian.PutUint64(w.headerBuf[25:33], uint64(timestamp))
+	binary.BigEndian.PutUint32(w.headerBuf[33:37], crc.Sum32())
 
 	if _, err := w.writer.Write(w.headerBuf[:]); err != nil {
 		return err
@@ -262,11 +281,11 @@ func (w *WAL) writeDirect(op byte, key, val []byte, expiresAt int64, version uin
 }
 
 // groupCommitLoop drains the write queue in batches and fsyncs once per batch.
-func (w *WAL) groupCommitLoop() {
+func (w *WAL) groupCommitLoop(queue chan writeTask) {
 	defer w.wg.Done()
 	var batch []writeTask
 	for {
-		task, ok := <-w.writeQueue
+		task, ok := <-queue
 		if !ok {
 			return
 		}
@@ -275,7 +294,7 @@ func (w *WAL) groupCommitLoop() {
 	drain:
 		for len(batch) < 256 {
 			select {
-			case t := <-w.writeQueue:
+			case t := <-queue:
 				batch = append(batch, t)
 			default:
 				break drain
@@ -292,7 +311,7 @@ func (w *WAL) groupCommitLoop() {
 			startOffset := w.currentOffset.Load()
 			valueOffset := startOffset + int64(walHeaderSize) + int64(len(t.key))
 
-			if err := w.writeDirect(t.op, t.key, t.val, t.expiresAt, t.version, startOffset); err != nil {
+			if err := w.writeDirect(t.op, t.key, t.val, t.expiresAt, t.version, t.timestamp, startOffset); err != nil {
 				writeErr = err
 				batch[i].offsetCh <- 0
 				continue
@@ -366,6 +385,11 @@ func (w *WAL) Recover() ([]Record, error) {
 		return nil, err
 	}
 
+	var total int64
+	if stat, err := w.file.Stat(); err == nil {
+		total = stat.Size()
+	}
+
 	var records []Record
 	var totalRead = start
 	var hdr [walHeaderSize]byte
@@ -380,7 +404,12 @@ func (w *WAL) Recover() ([]Record, error) {
 		vLen := binary.BigEndian.Uint32(hdr[5:9])
 		expiresAt := int64(binary.BigEndian.Uint64(hdr[9:17]))
 		version := binary.BigEndian.Uint64(hdr[17:25])
-		expectedCRC := binary.BigEndian.Uint32(hdr[25:29])
+		timestamp := int64(binary.BigEndian.Uint64(hdr[25:33]))
+		expectedCRC := binary.BigEndian.Uint32(hdr[33:37])
+
+		if totalRead+int64(walHeaderSize)+int64(kLen)+int64(vLen) > total {
+			break
+		}
 
 		key := make([]byte, kLen)
 		if _, err := io.ReadFull(w.file, key); err != nil {
@@ -407,6 +436,9 @@ func (w *WAL) Recover() ([]Record, error) {
 		var verBuf [8]byte
 		binary.BigEndian.PutUint64(verBuf[:], version)
 		crc.Write(verBuf[:])
+		var recTsBuf [8]byte
+		binary.BigEndian.PutUint64(recTsBuf[:], uint64(timestamp))
+		crc.Write(recTsBuf[:])
 		crc.Write(key)
 		crc.Write(val)
 
@@ -436,13 +468,19 @@ func (w *WAL) Recover() ([]Record, error) {
 			ValueOffset: valueOffset,
 			ExpiresAt:   expiresAt,
 			Version:     version,
+			Timestamp:   timestamp,
 		})
 	}
 
-	_, _ = w.file.Seek(0, io.SeekEnd)
-	if stat, err := w.file.Stat(); err == nil && totalRead < stat.Size() {
-		_ = w.file.Truncate(totalRead)
+	if totalRead < total {
+		if terr := os.Truncate(w.file.Name(), totalRead); terr != nil {
+			return records, fmt.Errorf("wal recover truncate: %w", terr)
+		}
 	}
+
+	w.currentOffset.Store(totalRead)
+	w.writer.Reset(w.file)
+	_, _ = w.file.Seek(totalRead, io.SeekStart)
 
 	return records, nil
 }
@@ -462,6 +500,11 @@ func (w *WAL) ReadValue(offset uint64, size uint32) ([]byte, error) {
 		}
 	}
 	return buf, nil
+}
+
+// SyncOnWrite reports whether this WAL is running in group-commit mode.
+func (w *WAL) SyncOnWrite() bool {
+	return w.syncOnWrite
 }
 
 func (w *WAL) Close() error {

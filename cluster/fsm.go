@@ -1,9 +1,10 @@
 package cluster
 
 import (
+	"bufio"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/akywaa/akwadb/server"
@@ -19,6 +20,20 @@ type raftCommand struct {
 
 const raftCmdDeletedFlag byte = 1 << 0
 var errTruncatedRaftCommand = errors.New("cluster: truncated raft command")
+
+var snapshotMagic = [4]byte{'A', 'K', 'W', 'S'}
+
+const (
+	snapshotVersion       byte   = 1
+	snapshotEntryHdrSize         = 17 // op(1) + kLen(4) + vLen(4) + expiresAt(8)
+	maxSnapshotFieldSize  uint32 = 1 << 30
+)
+
+var (
+	errInvalidSnapshotMagic   = errors.New("cluster: invalid snapshot magic")
+	errUnsupportedSnapshotVer = errors.New("cluster: unsupported snapshot version")
+	errOversizedSnapshotField = errors.New("cluster: oversized snapshot field")
+)
 
 func encodeRaftCommand(cmd raftCommand) []byte {
 	buf := make([]byte, 0, 64)
@@ -174,28 +189,65 @@ func (f *EngineFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 func (f *EngineFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	if err := f.db.Clear(); err != nil {
-		return err
+
+	r := bufio.NewReaderSize(rc, 64*1024)
+	var magic [4]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		return fmt.Errorf("cluster: snapshot header: %w", err)
+	}
+	if magic != snapshotMagic {
+		return errInvalidSnapshotMagic
+	}
+	version, err := r.ReadByte()
+	if err != nil {
+		return fmt.Errorf("cluster: snapshot version: %w", err)
+	}
+	if version != snapshotVersion {
+		return errUnsupportedSnapshotVer
 	}
 
-	decoder := json.NewDecoder(rc)
-	if _, err := decoder.Token(); err != nil {
+	if err := f.db.Clear(); err != nil {
 		return err
 	}
 
 	var batch []server.BatchWriteEntry
 	const batchSize = 1000
+	var hdr [snapshotEntryHdrSize]byte
 
-	for decoder.More() {
-		var entry server.SnapshotEntry
-		if err := decoder.Decode(&entry); err != nil {
-			return err
+	for {
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("cluster: snapshot entry header: %w", err)
 		}
+
+		op := hdr[0]
+		kLen := binary.BigEndian.Uint32(hdr[1:5])
+		vLen := binary.BigEndian.Uint32(hdr[5:9])
+		expiresAt := int64(binary.BigEndian.Uint64(hdr[9:17]))
+		if kLen > maxSnapshotFieldSize || vLen > maxSnapshotFieldSize {
+			return errOversizedSnapshotField
+		}
+
+		key := make([]byte, kLen)
+		if _, err := io.ReadFull(r, key); err != nil {
+			return fmt.Errorf("cluster: snapshot key: %w", err)
+		}
+
+		var val []byte
+		if vLen > 0 {
+			val = make([]byte, vLen)
+			if _, err := io.ReadFull(r, val); err != nil {
+				return fmt.Errorf("cluster: snapshot value: %w", err)
+			}
+		}
+
 		batch = append(batch, server.BatchWriteEntry{
-			Key:       string(entry.Key),
-			Value:     string(entry.Value),
-			ExpiresAt: entry.ExpiresAt,
-			Deleted:   entry.Deleted,
+			Key:       string(key),
+			Value:     string(val),
+			ExpiresAt: expiresAt,
+			Deleted:   op == 2,
 		})
 		if len(batch) >= batchSize {
 			if err := f.db.BatchApply(batch); err != nil {
@@ -204,6 +256,7 @@ func (f *EngineFSM) Restore(rc io.ReadCloser) error {
 			batch = batch[:0]
 		}
 	}
+
 	if len(batch) > 0 {
 		return f.db.BatchApply(batch)
 	}
@@ -215,38 +268,46 @@ type engineSnapshot struct {
 }
 
 func (s *engineSnapshot) Persist(sink raft.SnapshotSink) error {
-	encoder := json.NewEncoder(sink)
-	if _, err := sink.Write([]byte("[")); err != nil {
+	w := bufio.NewWriterSize(sink, 64*1024)
+
+	if _, err := w.Write(snapshotMagic[:]); err != nil {
+		sink.Cancel()
+		return err
+	}
+	if err := w.WriteByte(snapshotVersion); err != nil {
 		sink.Cancel()
 		return err
 	}
 
-	first := true
 	_, err := s.db.StreamSnapshot(func(op byte, key, val []byte, expiresAt int64) error {
-		if !first {
-			if _, err := sink.Write([]byte(",")); err != nil {
+		var hdr [snapshotEntryHdrSize]byte
+		hdr[0] = op
+		binary.BigEndian.PutUint32(hdr[1:5], uint32(len(key)))
+		binary.BigEndian.PutUint32(hdr[5:9], uint32(len(val)))
+		binary.BigEndian.PutUint64(hdr[9:17], uint64(expiresAt))
+
+		if _, err := w.Write(hdr[:]); err != nil {
+			return err
+		}
+		if _, err := w.Write(key); err != nil {
+			return err
+		}
+		if len(val) > 0 {
+			if _, err := w.Write(val); err != nil {
 				return err
 			}
 		}
-		first = false
-		return encoder.Encode(server.SnapshotEntry{
-			Key:       key,
-			Value:     val,
-			Deleted:   op == 2,
-			ExpiresAt: expiresAt,
-		})
+		return nil
 	})
-
 	if err != nil {
 		sink.Cancel()
 		return err
 	}
 
-	if _, err := sink.Write([]byte("]")); err != nil {
+	if err := w.Flush(); err != nil {
 		sink.Cancel()
 		return err
 	}
-
 	return sink.Close()
 }
 

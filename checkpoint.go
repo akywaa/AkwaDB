@@ -3,13 +3,64 @@ package akwadb
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/akywaa/akwadb/sstable"
 )
+
+func (e *Engine) checkpointWorker() {
+	defer e.checkpointWG.Done()
+	ticker := time.NewTicker(e.opts.CheckpointInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.checkpointStop:
+			return
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.runScheduledCheckpoint()
+		}
+	}
+}
+
+func (e *Engine) runScheduledCheckpoint() {
+	dir := filepath.Join(e.opts.CheckpointDir, "checkpoint_"+time.Now().UTC().Format("20060102T150405"))
+	if err := e.CreateCheckpoint(dir); err != nil {
+		slog.Error("scheduled checkpoint failed", "dir", dir, "err", err)
+		return
+	}
+	slog.Info("scheduled checkpoint created", "dir", dir)
+	e.pruneCheckpoints()
+}
+
+func (e *Engine) pruneCheckpoints() {
+	keep := e.opts.CheckpointKeep
+	if keep <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(e.opts.CheckpointDir)
+	if err != nil {
+		return
+	}
+	var dirs []string
+	for _, ent := range entries {
+		if ent.IsDir() && strings.HasPrefix(ent.Name(), "checkpoint_") {
+			dirs = append(dirs, ent.Name())
+		}
+	}
+	sort.Strings(dirs)
+	for len(dirs) > keep {
+		_ = os.RemoveAll(filepath.Join(e.opts.CheckpointDir, dirs[0]))
+		dirs = dirs[1:]
+	}
+}
 
 func (e *Engine) allSSTables() []*sstable.SSTable {
 	var out []*sstable.SSTable
@@ -29,7 +80,9 @@ func (e *Engine) submitFlush() error {
 		op:    opFlush,
 		errCh: make(chan incrResult, 1),
 	}
-	e.writeReq <- req
+	if err := e.submitWrite(req); err != nil {
+		return err
+	}
 	res := <-req.errCh
 	return res.err
 }
@@ -82,6 +135,18 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 		return err
 	}
 
+	for {
+		e.metaMu.Lock()
+		if e.immutableMemTable() == nil {
+			break
+		}
+		e.metaMu.Unlock()
+		if err := e.ctx.Err(); err != nil {
+			return err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	tables := e.allSSTables()
 	for _, sst := range tables {
 		sst.IncrRef()
@@ -92,27 +157,6 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 		}
 	}()
 
-	for _, sst := range tables {
-		if err := linkOrCopy(sst.Filename(), filepath.Join(backupDir, filepath.Base(sst.Filename()))); err != nil {
-			return err
-		}
-	}
-
-	for _, name := range []string{"MANIFEST", "DISCARD", "KEYREGISTRY"} {
-		src := filepath.Join(e.dataDir, name)
-		if _, err := os.Stat(src); err != nil {
-			continue
-		}
-		if err := copyFile(src, filepath.Join(backupDir, name)); err != nil {
-			return err
-		}
-	}
-
-	// Freeze the append path: walAppendMu serializes every WAL and VLog append
-	// in the writer pipeline, so holding it after a flush/sync yields a
-	// consistent on-disk image instead of a torn record mid-copy. The WAL is
-	// copied before the active VLog segment because value bytes are always
-	// written to the VLog before the WAL record that points at them.
 	e.walMu.RLock()
 	e.walAppendMu.Lock()
 
@@ -121,9 +165,13 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 		copyErr = err
 	} else if err := e.vl.Sync(); err != nil {
 		copyErr = err
-	} else if err := copyFile(filepath.Join(e.dataDir, "wal.log"), filepath.Join(backupDir, "wal.log")); err != nil {
-		copyErr = err
 	} else {
+		copyErr = e.copyCheckpointManifest(backupDir)
+	}
+	if copyErr == nil {
+		copyErr = copyFile(filepath.Join(e.dataDir, "wal.log"), filepath.Join(backupDir, "wal.log"))
+	}
+	if copyErr == nil {
 		activeFid := e.vl.ActiveFid()
 		srcVlogDir := filepath.Join(e.dataDir, "vlog")
 		vlogFiles, rerr := os.ReadDir(srcVlogDir)
@@ -147,13 +195,34 @@ func (e *Engine) CreateCheckpoint(backupDir string) error {
 			copyErr = linkOrCopy(src, dst)
 		}
 	}
+	if copyErr == nil {
+		for _, sst := range tables {
+			if err := linkOrCopy(sst.Filename(), filepath.Join(backupDir, filepath.Base(sst.Filename()))); err != nil {
+				copyErr = err
+				break
+			}
+		}
+	}
 
 	e.walAppendMu.Unlock()
 	e.walMu.RUnlock()
-	if copyErr != nil {
-		return copyErr
-	}
+	e.metaMu.Unlock()
 
+	return copyErr
+}
+
+func (e *Engine) copyCheckpointManifest(backupDir string) error {
+	e.manifestMu.Lock()
+	defer e.manifestMu.Unlock()
+	for _, name := range []string{"MANIFEST", "DISCARD", "KEYREGISTRY"} {
+		src := filepath.Join(e.dataDir, name)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if err := copyFile(src, filepath.Join(backupDir, name)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
