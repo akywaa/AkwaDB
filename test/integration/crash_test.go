@@ -1,43 +1,35 @@
 package integration_test
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/akywaa/akwadb"
-	"github.com/akywaa/akwadb/server"
 )
 
 func TestCrashRecovery(t *testing.T) {
-	if os.Getenv("AKWADB_CRASH_CHILD") == "1" {
-		crashChild(os.Getenv("AKWADB_CRASH_DIR"), os.Getenv("AKWADB_CRASH_PROGRESS"))
-		return
-	}
-
 	dataDir := t.TempDir()
 	progressPath := filepath.Join(t.TempDir(), "progress.log")
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestCrashRecovery")
-	cmd.Env = append(os.Environ(),
-		"AKWADB_CRASH_CHILD=1",
-		"AKWADB_CRASH_DIR="+dataDir,
-		"AKWADB_CRASH_PROGRESS="+progressPath,
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
+	binary := filepath.Join(t.TempDir(), "crashwriter")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
 	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	}()
+	build := exec.Command("go", "build", "-o", binary, "./test/crashwriter")
+	build.Dir = moduleRoot(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build crash writer: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(binary, "-dir", dataDir, "-progress", progressPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to spawn crash writer: %v", err)
+	}
 
 	var lines []string
 	deadline := time.Now().Add(15 * time.Second)
@@ -48,6 +40,7 @@ func TestCrashRecovery(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
@@ -64,31 +57,25 @@ func TestCrashRecovery(t *testing.T) {
 	defer db.Close()
 
 	for _, key := range lines {
-		if _, err := db.Get(key); err != nil {
+		val, err := db.Get(key)
+		if err != nil {
 			t.Fatalf("acknowledged key %q lost after crash: %v", key, err)
+		}
+		if val != key+"_payload" {
+			t.Fatalf("key %q has corrupted value: %q", key, val)
 		}
 	}
 }
 
-func crashChild(dataDir, progressPath string) {
-	db, err := akwadb.OpenEngineWithOpts(akwadb.DefaultOptions(dataDir))
-	if err != nil {
-		os.Exit(3)
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("unable to determine the module root")
 	}
-	f, err := os.OpenFile(progressPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		os.Exit(3)
-	}
-	for i := 0; ; i++ {
-		key := fmt.Sprintf("k%06d", i)
-		if err := db.PutWithOptions(key, key, server.WriteOptions{Sync: true}); err != nil {
-			os.Exit(4)
-		}
-		if _, err := fmt.Fprintf(f, "%s\n", key); err != nil {
-			os.Exit(4)
-		}
-		_ = f.Sync()
-	}
+	// We are at <moduleRoot>/test/integration/crash_test.go; walking up three
+	// directories from this file reaches the module root.
+	return filepath.Dir(filepath.Dir(filepath.Dir(file)))
 }
 
 func readProgress(path string) []string {

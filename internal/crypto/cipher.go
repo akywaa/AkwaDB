@@ -19,10 +19,7 @@ func NewBaseIV() ([]byte, error) {
 	return iv, nil
 }
 
-// CryptAtOffset encrypts or decrypts data in place with AES-CTR at a byte offset.
-// The counter block is derived from baseIV plus offset/16, so an arbitrary range
-// can be processed without touching surrounding data. Encryption and decryption
-// are the same XOR operation.
+// CryptAtOffset encrypts/decrypts data in-place at the given byte offset using AES-CTR.
 func CryptAtOffset(key, baseIV []byte, offset int64, data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -35,9 +32,7 @@ func CryptAtOffset(key, baseIV []byte, offset int64, data []byte) error {
 	iv := make([]byte, aes.BlockSize)
 	copy(iv, baseIV)
 	blockNum := uint64(offset / aes.BlockSize)
-	// Advance the counter as a full 128-bit big-endian integer, exactly like
-	// cipher.NewCTR does per block. Adding only to the low 64 bits would drop
-	// the carry and desynchronize the keystream near 2^64.
+	// advance counter with 128-bit carry
 	low := binary.BigEndian.Uint64(iv[8:16])
 	sum := low + blockNum
 	binary.BigEndian.PutUint64(iv[8:16], sum)

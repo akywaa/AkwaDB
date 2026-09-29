@@ -77,7 +77,6 @@ func (f *Filter) Add(key []byte) {
 
 	for i := uint32(0); i < uint32(f.k); i++ {
 		idx := (h1 + i*h2) % f.bits
-		// idx >> 3 is idx / 8, idx & 7 is idx % 8
 		f.data[idx>>3] |= 1 << (idx & 7)
 		// log.Printf("[bloom-debug] key=%s probe=%d bit=%d", string(key), i, idx)
 	}

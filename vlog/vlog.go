@@ -791,10 +791,7 @@ func (vl *ValueLog) Close() error {
 	return firstErr
 }
 
-// DeleteSegment removes a segment file from disk and from the map. When a
-// concurrent reader still holds a reference the physical removal is deferred
-// until the last reader drops it, which keeps Windows from rejecting the
-// delete with ERROR_ACCESS_DENIED.
+// DeleteSegment closes and unlinks a segment (deferred if readers are active).
 func (vl *ValueLog) DeleteSegment(fid uint32) error {
 	vl.mu.Lock()
 	if vl.active != nil && vl.active.fid == fid {

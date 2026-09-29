@@ -123,8 +123,7 @@ func (e *Engine) forceFlush() error {
 	return e.ctx.Err()
 }
 
-// CreateCheckpoint takes a near-instant point-in-time backup by hardlinking the
-// immutable on-disk files and copying only the actively appended ones.
+// CreateCheckpoint hardlinks SSTables and copies active logs into backupDir.
 func (e *Engine) CreateCheckpoint(backupDir string) error {
 	if err := e.submitFlush(); err != nil {
 		return err

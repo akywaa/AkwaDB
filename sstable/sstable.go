@@ -895,8 +895,7 @@ func verifyBlockCRC(data []byte) ([]byte, bool) {
 	return blockContent, true
 }
 
-// decodeBlock verifies the on-disk checksum, decrypts (when needed) and
-// decompresses a raw block read from disk.
+// verify, decrypt and decompress a raw block
 func (s *SSTable) decodeBlock(bp *[]byte) ([]byte, error) {
 	raw := *bp
 	defer func() {

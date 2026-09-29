@@ -14,8 +14,7 @@ import (
 	"time"
 )
 
-// S3Archiver ships gzip-compressed segments to any S3-compatible object store
-// (AWS S3, MinIO, Cloudflare R2, ...) using AWS Signature Version 4.
+// S3Archiver uploads gzipped segments to S3/MinIO using SigV4.
 type S3Archiver struct {
 	Endpoint  string
 	Region    string

@@ -288,9 +288,7 @@ func (o *Oracle) removeWriteVersionLocked(fp, commitTs uint64) {
 	o.historyIndex[fp] = list
 }
 
-// trimHistoryLocked drops committed transactions every active reader has moved
-// past. The removed slots are zeroed so their write maps are not kept alive by
-// the backing array of the history slice.
+// trims old transactions past minActiveTs and clears references for GC
 func (o *Oracle) trimHistoryLocked(minActiveTs uint64) {
 	i := 0
 	for ; i < len(o.history); i++ {

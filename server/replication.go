@@ -349,11 +349,7 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 	s.replicasMu.RUnlock()
 
 	for _, rc := range targets {
-		// While the initial snapshot streams, entries are buffered for replay
-		// once it finishes instead of force-disconnecting a slow replica —
-		// otherwise it could never finish syncing. After the snapshot, a full
-		// send channel means the replica cannot keep up: drop it so it
-		// reconnects with a fresh SYNC rather than silently missing entries.
+		// Buffer writes during snapshot; drop replica if queue fills up to force resync.
 		rc.pendingMu.Lock()
 		if rc.snapshotActive.Load() {
 			if len(rc.pending) < replPendingLimit {
@@ -361,9 +357,6 @@ func (s *Server) ReplicateEntry(op byte, key, val []byte, expiresAt int64) {
 				rc.pendingMu.Unlock()
 				continue
 			}
-			// The replica cannot keep up even with the snapshot backlog:
-			// drop it so it reconnects and requests a fresh sync instead of
-			// silently missing writes.
 			rc.pendingMu.Unlock()
 			rc.mu.Lock()
 			rc.running = false

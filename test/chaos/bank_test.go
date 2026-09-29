@@ -210,7 +210,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 				if err == nil {
 					readChecks.Add(1)
 				} else {
-					fmt.Printf("[READER ERR] reader %d failed: %v\n", readerID, err)
+					t.Logf("[READER ERR] reader %d failed: %v", readerID, err)
 				}
 				time.Sleep(2 * time.Millisecond)
 			}
@@ -231,7 +231,7 @@ func TestBank_HeavyChaos(t *testing.T) {
 			case <-ticker.C:
 				stats := eng.Stats()
 				elapsed := time.Since(start).Round(time.Second)
-				fmt.Printf("[%s] Committed: %d | Conflicts: %d | Scans: %d | Violations: %d | Flushes: %d | Compactions: %d\n",
+				t.Logf("[%s] Committed: %d | Conflicts: %d | Scans: %d | Violations: %d | Flushes: %d | Compactions: %d",
 					elapsed,
 					txCommitted.Load(),
 					txConflicts.Load(),
@@ -259,20 +259,18 @@ func TestBank_HeavyChaos(t *testing.T) {
 
 	engineStats := eng.Stats()
 
-	fmt.Println("BANK TEST SUMMARY")
-	fmt.Printf("Total Duration:            %s\n", *testDuration)
-	fmt.Printf("Accounts:                  %d (Expected total: %d)\n", heavyBankAccounts, expectedTotal)
-	fmt.Printf("Writers / Readers:         %d / %d\n", heavyBankWriters, heavyBankReaders)
-	fmt.Println("---------------------------------------------------------------")
-	fmt.Printf("Successful Transfers:      %d\n", txCommitted.Load())
-	fmt.Printf("Detected SSI Conflicts:    %d\n", txConflicts.Load())
-	fmt.Printf("Write Errors:              %d\n", txOtherErrors.Load())
-	fmt.Printf("Full Isolation Scans:      %d\n", readChecks.Load())
-	fmt.Printf("Isolation Violations:      %d\n", readViolations.Load())
-	fmt.Println("---------------------------------------------------------------")
-	fmt.Printf("LSM Flushes:               %d\n", engineStats.FlushesTotal)
-	fmt.Printf("LSM Compactions Done:      %d\n", engineStats.CompactionsDone)
-	fmt.Printf("Final Database Total:      %d\n", finalTotal)
+	t.Logf("BANK TEST SUMMARY")
+	t.Logf("Total Duration: %s", *testDuration)
+	t.Logf("Accounts: %d (expected total: %d)", heavyBankAccounts, expectedTotal)
+	t.Logf("Writers / Readers: %d / %d", heavyBankWriters, heavyBankReaders)
+	t.Logf("Successful Transfers: %d", txCommitted.Load())
+	t.Logf("Detected SSI Conflicts: %d", txConflicts.Load())
+	t.Logf("Write Errors: %d", txOtherErrors.Load())
+	t.Logf("Full Isolation Scans: %d", readChecks.Load())
+	t.Logf("Isolation Violations: %d", readViolations.Load())
+	t.Logf("LSM Flushes: %d", engineStats.FlushesTotal)
+	t.Logf("LSM Compactions Done: %d", engineStats.CompactionsDone)
+	t.Logf("Final Database Total: %d", finalTotal)
 
 	if readViolations.Load() > 0 {
 		t.Fatalf("FAILED: Detected %d isolation violations during test execution!", readViolations.Load())

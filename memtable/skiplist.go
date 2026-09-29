@@ -54,9 +54,7 @@ func returnUpdatePool(pUpd *[]*Node) {
 	updatePool.Put(pUpd)
 }
 
-// fastrand returns a pseudorandom uint64 using a lock-free xorshift64.
-// Each goroutine naturally gets different timing, providing sufficient
-// randomness for skip-level selection without any locking.
+// lock-free xorshift64 for level selection
 func (s *SkipList) fastrand() uint64 {
 	for {
 		x := atomic.LoadUint64(&s.randSeed)

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,74 +35,74 @@ const (
 	valueChurnKeys   = 4
 )
 
-type NemesisFault int
+type Fault int
 
 const (
-	FaultMemTableFlush NemesisFault = iota
-	FaultForcedCompaction
-	FaultValueLogGC
-	FaultCheckpointFlood
-	FaultDiskThrottle
-	FaultValueSizeChurn
-	FaultColdCacheScan
-	FaultMax
+	MemTableFlushFault Fault = iota
+	ForcedCompactionFault
+	ValueLogGCFault
+	CheckpointFloodFault
+	DiskThrottleFault
+	ValueSizeChurnFault
+	ColdCacheScanFault
+	faultMax
 )
 
-func (f NemesisFault) String() string {
+func (f Fault) String() string {
 	switch f {
-	case FaultMemTableFlush:
+	case MemTableFlushFault:
 		return "memtable_flush"
-	case FaultForcedCompaction:
+	case ForcedCompactionFault:
 		return "forced_compaction"
-	case FaultValueLogGC:
+	case ValueLogGCFault:
 		return "value_log_gc"
-	case FaultCheckpointFlood:
+	case CheckpointFloodFault:
 		return "checkpoint_flood"
-	case FaultDiskThrottle:
+	case DiskThrottleFault:
 		return "disk_throttle"
-	case FaultValueSizeChurn:
+	case ValueSizeChurnFault:
 		return "value_size_churn"
-	case FaultColdCacheScan:
+	case ColdCacheScanFault:
 		return "cold_cache_scan"
 	default:
 		return "unknown"
 	}
 }
 
-type NemesisController struct {
+type FaultController struct {
 	db         *akwadb.Engine
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
-	faultStats [FaultMax]atomic.Int64
+	faultStats [faultMax]atomic.Int64
 }
 
-func NewNemesisController(db *akwadb.Engine) *NemesisController {
-	return &NemesisController{
+func NewFaultController(db *akwadb.Engine) *FaultController {
+	return &FaultController{
 		db:     db,
 		stopCh: make(chan struct{}),
 	}
 }
 
-func (n *NemesisController) Start() {
+func (n *FaultController) Start() {
 	for i := 0; i < 3; i++ {
 		n.wg.Add(1)
-		go n.nemesisWorker(i)
+		go n.faultWorker(i)
 	}
 }
 
-func (n *NemesisController) Stop() {
+func (n *FaultController) Stop() {
 	close(n.stopCh)
 	n.wg.Wait()
 }
 
-func (n *NemesisController) PrintSummary() {
-	fmt.Println("nemesis faults:")
-	for f := NemesisFault(0); f < FaultMax; f++ {
+func (n *FaultController) PrintSummary() {
+	fmt.Println("fault injection summary:")
+	for f := Fault(0); f < faultMax; f++ {
 		fmt.Printf("  %s: %d\n", f.String(), n.faultStats[f].Load())
 	}
 }
 
-func (n *NemesisController) nemesisWorker(workerID int) {
+func (n *FaultController) faultWorker(workerID int) {
 	defer n.wg.Done()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)*777))
 
@@ -112,34 +113,34 @@ func (n *NemesisController) nemesisWorker(workerID int) {
 		case <-time.After(time.Duration(rng.Intn(40)+10) * time.Millisecond):
 		}
 
-		fault := NemesisFault(rng.Intn(int(FaultMax)))
+		fault := Fault(rng.Intn(int(faultMax)))
 		n.faultStats[fault].Add(1)
 
 		switch fault {
-		case FaultMemTableFlush:
+		case MemTableFlushFault:
 			for i := 0; i < memtableFillKeys; i++ {
-				key := fmt.Sprintf("__nemesis_flush_%d_%04d_%s", workerID, i, nemesisFlushPad)
+				key := fmt.Sprintf("__fault_flush_%d_%04d_%s", workerID, i, nemesisFlushPad)
 				_ = n.db.PutWithOptions(key, "x", server.WriteOptions{})
 			}
 
-		case FaultForcedCompaction:
+		case ForcedCompactionFault:
 			_ = n.db.Compact()
 
-		case FaultValueLogGC:
+		case ValueLogGCFault:
 			_ = n.db.RunValueLogGC(0.0)
 
-		case FaultCheckpointFlood:
-			chkDir := filepath.Join(os.TempDir(), fmt.Sprintf("nemesis_chk_%d_%d", workerID, rng.Int63()))
+		case CheckpointFloodFault:
+			chkDir := filepath.Join(os.TempDir(), fmt.Sprintf("fault_chk_%d_%d", workerID, rng.Int63()))
 			if err := n.db.CreateCheckpoint(chkDir); err == nil {
 				_ = os.RemoveAll(chkDir)
 			}
 
-		case FaultDiskThrottle:
+		case DiskThrottleFault:
 			time.Sleep(time.Duration(rng.Intn(5)) * time.Millisecond)
 
-		case FaultValueSizeChurn:
+		case ValueSizeChurnFault:
 			for i := 0; i < valueChurnKeys; i++ {
-				key := fmt.Sprintf("__nemesis_vsize_%d_%d", workerID, i)
+				key := fmt.Sprintf("__fault_vsize_%d_%d", workerID, i)
 				if i%2 == 0 {
 					_ = n.db.Put(key, nemesisSmallValue)
 					continue
@@ -147,7 +148,7 @@ func (n *NemesisController) nemesisWorker(workerID int) {
 				_ = n.db.Put(key, nemesisLargeValue)
 			}
 
-		case FaultColdCacheScan:
+		case ColdCacheScanFault:
 			keys, err := n.db.ScanKeys("*")
 			if err == nil && len(keys) > 0 {
 				for i := 0; i < 32; i++ {
@@ -218,7 +219,7 @@ func runBankConservation(t *testing.T, opts akwadb.Options) {
 	}
 	expectedTotal := int64(numAccounts * initialAmount)
 
-	nemesis := NewNemesisController(db)
+	nemesis := NewFaultController(db)
 	nemesis.Start()
 	defer nemesis.PrintSummary()
 	defer nemesis.Stop()
@@ -351,7 +352,7 @@ func TestChaos_BatchAllOrNothingUnderChaos(t *testing.T) {
 	}
 	defer db.Close()
 
-	nemesis := NewNemesisController(db)
+	nemesis := NewFaultController(db)
 	nemesis.Start()
 	defer nemesis.Stop()
 
@@ -451,7 +452,7 @@ func TestChaos_TombstoneResurrectionNemesis(t *testing.T) {
 	}
 	defer db.Close()
 
-	nemesis := NewNemesisController(db)
+	nemesis := NewFaultController(db)
 	nemesis.Start()
 
 	const churnKeys = 300
@@ -658,7 +659,7 @@ func TestChaos_LongRunningViewVsCompaction(t *testing.T) {
 		}
 	}
 
-	nemesis := NewNemesisController(db)
+	nemesis := NewFaultController(db)
 	nemesis.Start()
 	defer nemesis.Stop()
 
@@ -758,7 +759,7 @@ func TestChaos_CollectionsConsistencyUnderChaos(t *testing.T) {
 	}
 	defer db.Close()
 
-	nemesis := NewNemesisController(db)
+	nemesis := NewFaultController(db)
 	nemesis.Start()
 	defer nemesis.Stop()
 
@@ -953,9 +954,14 @@ func TestChaos_BitmapPageBoundaryUnderChaos(t *testing.T) {
 }
 
 func TestChaos_HardPowerLossKill(t *testing.T) {
-	if os.Getenv("AKWADB_NEMESIS_CHILD") == "1" {
-		runChildProcessWriter(os.Getenv("AKWADB_CHILD_DIR"), os.Getenv("AKWADB_CHILD_LOG"))
-		return
+	binary := filepath.Join(t.TempDir(), "crashwriter")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+	build := exec.Command("go", "build", "-o", binary, "./test/crashwriter")
+	build.Dir = moduleRoot(t)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build crash writer: %v\n%s", err, out)
 	}
 
 	for round := 1; round <= 3; round++ {
@@ -963,15 +969,9 @@ func TestChaos_HardPowerLossKill(t *testing.T) {
 			childDir := t.TempDir()
 			progressLog := filepath.Join(t.TempDir(), "acknowledged.log")
 
-			cmd := exec.Command(os.Args[0], "-test.run=TestChaos_HardPowerLossKill")
-			cmd.Env = append(os.Environ(),
-				"AKWADB_NEMESIS_CHILD=1",
-				"AKWADB_CHILD_DIR="+childDir,
-				"AKWADB_CHILD_LOG="+progressLog,
-			)
-
+			cmd := exec.Command(binary, "-dir", childDir, "-progress", progressLog)
 			if err := cmd.Start(); err != nil {
-				t.Fatalf("failed to spawn child process: %v", err)
+				t.Fatalf("failed to spawn crash writer: %v", err)
 			}
 
 			sleepDuration := time.Duration(100+rand.Intn(700)) * time.Millisecond
@@ -980,7 +980,7 @@ func TestChaos_HardPowerLossKill(t *testing.T) {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 
-			syncedKeys := readSyncedKeys(progressLog)
+			syncedKeys := readProgressLog(progressLog)
 			if len(syncedKeys) == 0 {
 				t.Skip("child process didn't sync enough keys before kill")
 			}
@@ -1004,44 +1004,25 @@ func TestChaos_HardPowerLossKill(t *testing.T) {
 	}
 }
 
-func runChildProcessWriter(dir, logPath string) {
-	opts := akwadb.DefaultOptions(dir)
-	opts.MemTableSize = 16 * 1024
-	opts.CompactionThreshold = 2
-	db, err := akwadb.OpenEngineWithOpts(opts)
-	if err != nil {
-		os.Exit(10)
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("unable to determine the module root")
 	}
-
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		os.Exit(11)
-	}
-
-	for i := 0; ; i++ {
-		key := fmt.Sprintf("crash_key_%06d", i)
-		val := key + "_payload"
-
-		err := db.PutWithOptions(key, val, server.WriteOptions{Sync: true})
-		if err != nil {
-			os.Exit(12)
-		}
-
-		_, _ = fmt.Fprintf(logFile, "%s\n", key)
-		_ = logFile.Sync()
-	}
+	// We are at <moduleRoot>/test/chaos/nemesis_test.go; walking up three
+	// directories from this file reaches the module root.
+	return filepath.Dir(filepath.Dir(filepath.Dir(file)))
 }
 
-func readSyncedKeys(path string) []string {
+func readProgressLog(path string) []string {
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) == 0 {
 		return nil
 	}
-
-	lines := strings.Split(string(data), "\n")
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	var result []string
 	for _, l := range lines {
-		l = strings.TrimSpace(l)
 		if l != "" {
 			result = append(result, l)
 		}
@@ -1061,7 +1042,7 @@ func TestChaos_IncrLinearizability(t *testing.T) {
 	}
 	defer db.Close()
 
-	nemesis := NewNemesisController(db)
+	nemesis := NewFaultController(db)
 	nemesis.Start()
 	defer nemesis.Stop()
 

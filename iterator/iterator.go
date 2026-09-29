@@ -109,7 +109,7 @@ func (m *MergedIterator) Next() bool {
 
 	// pop the highest priority item for the current key
 	top := heap.Pop(&m.heap).(*heapItem)
-	
+
 	// save state so its stable even if underlying iter moves
 	m.currKey = top.key
 	m.currVal = top.value
@@ -118,7 +118,6 @@ func (m *MergedIterator) Next() bool {
 	m.currExp = top.expAt
 	m.currValid = true
 
-	// advance the winner
 	if top.iter.Next() {
 		top.key = top.iter.Key()
 		top.value = top.iter.Value()

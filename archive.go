@@ -17,8 +17,7 @@ type Archiver interface {
 	ArchiveSegment(path string) error
 }
 
-// FileArchiver gzip-compresses archived segments into a local directory. It is
-// the reference implementation and a drop-in foundation for object storage.
+// FileArchiver writes gzipped segments to a local directory.
 type FileArchiver struct {
 	Dir string
 }
