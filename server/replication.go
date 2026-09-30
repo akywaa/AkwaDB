@@ -20,6 +20,10 @@ const (
 	opSnapshotEnd   byte = 4
 	opResume        byte = 5
 	opSeqSync       byte = 6
+
+	// maxReplFieldSize bounds a single key/value payload read from a replica
+	// stream, rejecting corrupt frames before any allocation.
+	maxReplFieldSize uint32 = 64 * 1024 * 1024
 )
 
 type replEntry struct {
@@ -609,6 +613,11 @@ func (s *Server) startReplication(ctx context.Context, addr string) {
 				}
 				keyLen := binary.BigEndian.Uint32(hdr[1:5])
 				valLen := binary.BigEndian.Uint32(hdr[5:9])
+
+				if keyLen > maxReplFieldSize || valLen > maxReplFieldSize {
+					slog.Error("repl stream corrupted: oversized payload", "keyLen", keyLen, "valLen", valLen)
+					return
+				}
 
 				var expBuf [8]byte
 				if _, err := io.ReadFull(reader, expBuf[:]); err != nil {
