@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
+
 	"github.com/akywaa/akwadb/memtable"
 	"github.com/akywaa/akwadb/server"
 	"github.com/akywaa/akwadb/vlog"
@@ -347,7 +349,7 @@ func (e *Engine) dispatchIncr(r *writeReq) incrResult {
 		}
 		return incrResult{err: ErrDiskFull}
 	}
-	stripe := e.keyStripe(r.key)
+	stripe := stripe(r.key)
 	e.incrMu[stripe].Lock()
 	if r.seq == 0 {
 		r.seq = e.oracle.NewCommitTs()
@@ -523,12 +525,8 @@ func (e *Engine) notifyWrites(batch []*writeReq) {
 	}
 }
 
-func (e *Engine) keyStripe(key []byte) int {
-	var h uint32 = 2166136261
-	for i := 0; i < len(key); i++ {
-		h = (h ^ uint32(key[i])) * 16777619
-	}
-	return int(h % keyLockStripes)
+func stripe(key []byte) int {
+	return int(xxhash.Sum64(key) % keyLockStripes)
 }
 
 func bumpUint64(addr *uint64, v uint64) {
@@ -658,11 +656,7 @@ func (e *Engine) applyEntry(op byte, key, val []byte, expiresAt int64, seq uint6
 }
 
 func (e *Engine) lockKey(key string) *sync.Mutex {
-	var h uint32 = 2166136261
-	for i := 0; i < len(key); i++ {
-		h = (h ^ uint32(key[i])) * 16777619
-	}
-	mu := &e.keyLocks[h%keyLockStripes]
+	mu := &e.keyLocks[stripe([]byte(key))]
 	mu.Lock()
 	return mu
 }

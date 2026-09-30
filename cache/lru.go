@@ -30,7 +30,6 @@ func NewLRUCache(capacity int) *LRUCache {
 		capacity = 128
 	}
 
-	// 16 shards gives good lock dispersion without wasting map overhead on small caps
 	nShards := 16
 	if capacity < nShards {
 		nShards = capacity
@@ -58,7 +57,7 @@ func NewLRUCache(capacity int) *LRUCache {
 		}
 		s.tbl = make(map[string]*node, perShard)
 
-		// dummy sentinels avoid edge-case nil checks on head/tail insertions
+		// sentinels simplify head/tail splices
 		s.head = &node{}
 		s.tail = &node{}
 		s.head.next = s.tail

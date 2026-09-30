@@ -4,6 +4,10 @@ import "sync"
 
 const byteSlabSize = 64 * 1024
 
+var slabPool = sync.Pool{
+	New: func() any { return make([]byte, byteSlabSize) },
+}
+
 type byteSlab struct {
 	mu        sync.Mutex
 	slabs     [][]byte
@@ -13,7 +17,7 @@ type byteSlab struct {
 }
 
 func newByteSlab() *byteSlab {
-	buf := make([]byte, byteSlabSize)
+	buf := slabPool.Get().([]byte)
 	return &byteSlab{slabs: [][]byte{buf}, buf: buf}
 }
 
@@ -22,6 +26,11 @@ func (s *byteSlab) release() {
 		return
 	}
 	s.mu.Lock()
+	for _, b := range s.slabs {
+		if cap(b) == byteSlabSize {
+			slabPool.Put(b)
+		}
+	}
 	s.slabs = nil
 	s.buf = nil
 	s.off = 0
@@ -43,7 +52,11 @@ func (s *byteSlab) alloc(data []byte) []byte {
 		if n > sz {
 			sz = n
 		}
-		s.buf = make([]byte, sz)
+		if sz == byteSlabSize {
+			s.buf = slabPool.Get().([]byte)
+		} else {
+			s.buf = make([]byte, sz)
+		}
 		s.slabs = append(s.slabs, s.buf)
 		s.off = 0
 	}

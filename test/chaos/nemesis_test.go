@@ -106,11 +106,14 @@ func (n *FaultController) faultWorker(workerID int) {
 	defer n.wg.Done()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)*777))
 
+	timer := time.NewTimer(time.Duration(rng.Intn(40)+10) * time.Millisecond)
+	defer timer.Stop()
 	for {
+		timer.Reset(time.Duration(rng.Intn(40)+10) * time.Millisecond)
 		select {
 		case <-n.stopCh:
 			return
-		case <-time.After(time.Duration(rng.Intn(40)+10) * time.Millisecond):
+		case <-timer.C:
 		}
 
 		fault := Fault(rng.Intn(int(faultMax)))

@@ -1,11 +1,10 @@
 package bloom
 
 import (
+	"math"
+
 	"github.com/cespare/xxhash/v2"
 )
-
-// ln(2) constant for optimal k bit-probes calculation
-const ln2 = 0.6931471805599453
 
 type Filter struct {
 	data []byte
@@ -40,7 +39,7 @@ func NewFilterSized(n int, bitsPerKey int) *Filter {
 	numBits := byteLen * 8
 
 	// k = (m/n) * ln(2) = bitsPerKey * ln(2)
-	k := uint8(float64(bitsPerKey) * ln2)
+	k := uint8(float64(bitsPerKey) * math.Ln2)
 	if k < 1 {
 		k = 1
 	} else if k > 30 {
@@ -67,9 +66,6 @@ func (f *Filter) Add(key []byte) {
 		return
 	}
 
-	// Kirsch-Mitzenmacher optimization: two 32-bit hashes simulate k independent hash functions
-	// gi(x) = h1(x) + i * h2(x)
-	// (xxhash gives 64 bits in one pass, split into low/high words)
 	h := xxhash.Sum64(key)
 	h1 := uint32(h)
 	h2 := uint32(h >> 32)

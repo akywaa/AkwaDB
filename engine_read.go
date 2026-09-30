@@ -163,7 +163,7 @@ func (it *memVersionIter) Valid() bool  { return it.inner.Valid() }
 func (it *memVersionIter) Close() error { return it.inner.Close() }
 func (it *memVersionIter) Entry() iterator.VersionEntry {
 	e := it.inner.Entry()
-	return iterator.VersionEntry{Key: e.Key, Value: e.Value, Version: e.Version}
+	return iterator.VersionEntry{Key: e.Key, Value: e.Value, Version: e.Version, Deleted: e.Deleted, ExpiresAt: e.ExpiresAt}
 }
 
 // NewVersionIterator returns an iterator over all key-version pairs.

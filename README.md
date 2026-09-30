@@ -1,23 +1,38 @@
 # akwadb
 
-`akwadb` is an LSM-tree based persistent key-value store written in Go. It implements WiscKey-style key-value separation, Serializable Snapshot Isolation (SSI / MVCC) for transactions, and a Redis-compatible network interface (RESP).
+`akwadb` is an LSM-tree based key-value store written in Go. It was built as a
+hands-on project to understand how LSM engines and databases really work
+instead of just reading about them - and, along the way, to explore what happens
+if you mash a Badger-style storage engine together with a Redis wire protocol.
 
-It can be run as a standalone server compatible with standard Redis clients, or embedded directly into Go applications as a library.
+It can be run as a standalone server (any standard Redis client works) or
+embedded directly into Go applications as a library.
 
 ## Overview
 
-The engine is optimized for NVMe and SSD storage. By decoupling large values from the primary LSM tree (storing keys and small values inline in SSTables while streaming larger payloads into append-only Value Logs), write amplification during compaction is significantly reduced.
+Values are separated from the LSM tree: keys and small values live inline in
+SSTables, while larger payloads stream into append-only value logs. This keeps
+compaction write-amplification low on NVMe/SSD drives, which is where the design
+shines.
 
 ### Key Features
 
-* **Storage Engine**: Multi-level LSM-tree with two-level indexing, block restarts, prefix Bloom filters, and level-aware compression (Snappy for L0–L1, Zstandard for L2+).
-* **Key-Value Separation**: WiscKey architecture with adaptive size thresholding. Values larger than the threshold are stored in append-only `vlog` segments.
-* **Concurrency & Isolation**: Fully serializable snapshot isolation (SSI) using an in-memory Oracle for read/commit timestamps and read-conflict tracking.
-* **Redis Protocol (RESP)**: Drop-in compatibility for Strings, Hashes, Lists, Sets, Sorted Sets, and Bitmaps. Supports `MULTI`/`EXEC` transactions and Pub/Sub.
-* **Durability & Recovery**: Write-Ahead Log (WAL) with batched group commits. Crash recovery with checksum validation. Optional `SKIPWAL` mode for ephemeral workloads.
-* **Replication & Consensus**: Master-replica streaming with partial sync (`PSYNC`) ring buffer, or distributed clustering powered by HashiCorp Raft.
-* **Security**: Transparent encryption at rest (TDE) using AES-256-GCM for SSTable blocks and AES-CTR for log segments via a local key registry.
-* **Backups & PITR**: Point-in-time hardlink checkpoints, background segment archiving to local disk or S3/MinIO, and a dedicated restore utility (`akwadb-tool`).
+* **Storage Engine**: multi-level LSM-tree with two-level indexing, block
+  restarts, prefix Bloom filters, and level-aware compression (Snappy L0–L1,
+  Zstandard L2+).
+* **Key-Value Separation**: WiscKey architecture with adaptive size thresholding.
+* **Concurrency & Isolation**: serializable snapshot isolation (SSI) with an
+  in-memory Oracle for read/commit timestamps and read-conflict tracking.
+* **Redis Protocol (RESP)**: Strings, Hashes, Lists, Sets, Sorted Sets, Bitmaps,
+  `MULTI`/`EXEC` transactions, and Pub/Sub.
+* **Durability & Recovery**: WAL with batched group commits, crash recovery with
+  checksum validation, optional `SKIPWAL` mode for ephemeral workloads.
+* **Replication & Consensus**: master-replica streaming with `PSYNC` ring buffer
+  partial sync, or distributed clustering via HashiCorp Raft.
+* **Security**: encryption at rest (AES-256-GCM for SSTable blocks, AES-CTR for
+  log segments) via a local key registry.
+* **Backups & PITR**: point-in-time hardlink checkpoints, background segment
+  archiving to local disk or S3/MinIO, and a `akwadb-tool` restore utility.
 
 ---
 
@@ -187,25 +202,13 @@ If segment archiving is enabled (local directory or S3), you can replay archived
 
 ## Benchmarks
 
-Benchmarked using `redis-benchmark` over localhost (TCP loopback) against an NVMe SSD:
-* **CPU**: AMD Ryzen 9 7950X (16 cores)
-* **RAM**: 64 GB DDR5
-* **Storage**: Samsung 990 Pro 2TB (PCIe 4.0 NVMe)
-* **Go**: 1.24 linux/amd64
-
-```text
-$ redis-benchmark -p 6379 -t set,get -n 500000 -c 50 -q -d 128
-SET: 138888.89 requests per second, p50=0.312 msec, p99=1.420 msec
-GET: 245098.03 requests per second, p50=0.184 msec, p99=0.780 msec
-
-$ redis-benchmark -p 6379 -t set -n 500000 -c 50 -P 16 -q
-SET (pipeline 16): 485436.88 requests per second
-```
-
-To run embedded benchmarks:
+Throughput depends heavily on your hardware, `MemTableSize`, and whether SSDs
+are involved. Don't trust third-hand numbers - measure on your own box:
 
 ```bash
 go test -bench=BenchmarkEngine -benchmem ./...
+
+redis-benchmark -p 6379 -t set,get -n 500000 -c 50 -q -d 128
 ```
 
 ---

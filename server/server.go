@@ -46,7 +46,8 @@ type WriteOptions struct {
 	SkipWAL bool
 }
 
-type DB interface {
+// KVStore covers plain string keys: SET/GET/DEL/TTL/INCR and scans.
+type KVStore interface {
 	Put(key, val string) error
 	PutEx(key, val string, ttlSeconds int64) error
 	PutWithOptions(key, val string, opts WriteOptions) error
@@ -59,8 +60,21 @@ type DB interface {
 	ScanKeys(pattern string) ([]string, error)
 	ScanAllKeys(pattern string) ([]string, error)
 	ScanPage(pattern string, cursor string, count int) ([]string, string, error)
+	Incr(key string) (int64, error)
+	Decr(key string) (int64, error)
+	IncrBy(key string, delta int64) (int64, error)
+	MGet(keys []string) ([]string, []bool, error)
+	MSet(kvs map[string]string) error
+}
+
+// CollectionStore manages the collection keyspace (hash/set/list key prefixes).
+type CollectionStore interface {
 	DeleteCollection(key string) (int64, error)
 	CollectionKeys(key string) ([]string, error)
+}
+
+// HashStore covers Hash commands.
+type HashStore interface {
 	HSet(hash, field, val string) (bool, error)
 	HSetMulti(hash string, fields []string) (int64, error)
 	HGet(hash, field string) (string, error)
@@ -68,53 +82,89 @@ type DB interface {
 	HGetAll(hash string) (map[string]string, error)
 	HLen(hash string) (int64, error)
 	HKeys(hash string) ([]string, error)
-	Incr(key string) (int64, error)
-	Decr(key string) (int64, error)
-	IncrBy(key string, delta int64) (int64, error)
-	MGet(keys []string) ([]string, []bool, error)
-	MSet(kvs map[string]string) error
-	Stats() StatsResult
-	SnapshotEntries() []SnapshotEntry
-	StreamSnapshot(fn func(op byte, key, val []byte, expiresAt int64) error) (int, error)
-	GetByVersion(key string, maxVersion uint64) (string, error)
-	GetVersion(key string) (string, uint64, error)
-	CurrentVersion() uint64
-	BatchApply(entries []BatchWriteEntry) error
-	BatchApplyWithVersion(entries []BatchWriteEntry, version uint64) error
-	BeginTx() uint64
-	CommitTx(readTs uint64, readSet map[string]struct{}, writeKeys map[string]struct{}) (uint64, error)
-	RollbackTx(readTs uint64)
-	Clear() error
+}
 
-	// Lists
+// ListStore covers List commands.
+type ListStore interface {
 	LPush(key string, values []string) (int64, error)
 	RPush(key string, values []string) (int64, error)
 	LPop(key string) (string, error)
 	RPop(key string) (string, error)
 	LLen(key string) (int64, error)
 	LRange(key string, start, stop int64) ([]string, error)
+}
 
-	// Sets
+// SetStore covers Set commands.
+type SetStore interface {
 	SAdd(key string, members []string) (int64, error)
 	SMembers(key string) ([]string, error)
 	SIsMember(key, member string) (bool, error)
 	SRem(key string, members []string) (int64, error)
 	SCard(key string) (int64, error)
 	SInter(keys []string) ([]string, error)
+}
 
-	// Sorted Sets
+// ZSetStore covers Sorted Set commands.
+type ZSetStore interface {
 	ZAdd(key string, score float64, member string) (bool, error)
 	ZAddMulti(key string, members []ZSetMember) (int64, error)
 	ZScore(key, member string) (float64, bool, error)
 	ZRangeByScore(key string, min, max float64) ([]string, error)
 	ZRem(key string, members ...string) (int64, error)
+}
 
-	// Bitmaps
+// BitmapStore covers Bitmap commands.
+type BitmapStore interface {
 	SetBit(key string, offset int64, val int) (int, error)
 	GetBit(key string, offset int64) (int, error)
 	BitCount(key string) (int64, error)
 	BitCountRange(key string, start, end int64, bitMode bool) (int64, error)
 	DeleteBitmap(key string) error
+}
+
+// VersionStore reads values at a specific commit version.
+type VersionStore interface {
+	GetByVersion(key string, maxVersion uint64) (string, error)
+	GetVersion(key string) (string, uint64, error)
+	CurrentVersion() uint64
+}
+
+// TxStore drives SSI transactions.
+type TxStore interface {
+	BatchApply(entries []BatchWriteEntry) error
+	BatchApplyWithVersion(entries []BatchWriteEntry, version uint64) error
+	BeginTx() uint64
+	CommitTx(readTs uint64, readSet map[string]struct{}, writeKeys map[string]struct{}) (uint64, error)
+	RollbackTx(readTs uint64)
+}
+
+// SnapshotStore streams engine contents for replication and checkpoints.
+type SnapshotStore interface {
+	SnapshotEntries() []SnapshotEntry
+	StreamSnapshot(fn func(op byte, key, val []byte, expiresAt int64) error) (int, error)
+}
+
+// AdminStore exposes engine-wide operations.
+type AdminStore interface {
+	Stats() StatsResult
+	Clear() error
+}
+
+// DB is the full engine surface exposed to the RESP server and the Raft FSM.
+// It is split into narrow, functional interfaces above; keep the composed view
+// for callers that need everything (e.g. the replicated cluster path).
+type DB interface {
+	KVStore
+	CollectionStore
+	HashStore
+	ListStore
+	SetStore
+	ZSetStore
+	BitmapStore
+	VersionStore
+	TxStore
+	SnapshotStore
+	AdminStore
 }
 
 type Server struct {

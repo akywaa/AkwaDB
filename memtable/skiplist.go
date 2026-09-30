@@ -25,7 +25,7 @@ type Node struct {
 	deleted   atomic.Bool
 	expiresAt int64
 	version   uint64
-	fwd       [inlineTowerSize]unsafe.Pointer // inline tower — zero GC pressure
+	fwd       [inlineTowerSize]unsafe.Pointer // inline tower
 }
 
 type SkipList struct {

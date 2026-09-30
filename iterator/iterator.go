@@ -173,9 +173,11 @@ func (m *MergedIterator) Close() error {
 
 // VersionEntry is a single key-version pair returned by VersionIterator.
 type VersionEntry struct {
-	Key     []byte
-	Value   []byte
-	Version uint64
+	Key       []byte
+	Value     []byte
+	Version   uint64
+	Deleted   bool
+	ExpiresAt int64
 }
 
 // VersionIterator iterates over all versions of all keys.
@@ -277,9 +279,11 @@ func (m *MergedVersionIterator) Next() bool {
 	top := heap.Pop(&m.heap).(*versionedHeapItem)
 
 	m.currEntry = VersionEntry{
-		Key:     top.key,
-		Value:   top.value,
-		Version: top.version,
+		Key:       top.key,
+		Value:     top.value,
+		Version:   top.version,
+		Deleted:   top.deleted,
+		ExpiresAt: top.expAt,
 	}
 	m.currDel = top.deleted
 	m.currExp = top.expAt
