@@ -6,6 +6,24 @@ import (
 	"strings"
 )
 
+// replCount normalizes an integer returned by a cluster ApplyCommand. MsgPack
+// deserialization may yield int64, uint64 or int depending on sign/size.
+func replCount(res interface{}) int64 {
+	switch v := res.(type) {
+	case int64:
+		return v
+	case uint64:
+		return int64(v)
+	case int:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case uint32:
+		return int64(v)
+	}
+	return 0
+}
+
 func (s *Server) cmdHSet(srv *Server, cl *client, args []string) error {
 	if len(args) < 3 || (len(args)-1)%2 != 0 {
 		srv.writeError(cl, "ERR wrong number of arguments for 'hset' command")
@@ -17,8 +35,7 @@ func (s *Server) cmdHSet(srv *Server, cl *client, args []string) error {
 			srv.writeError(cl, err.Error())
 			return nil
 		}
-		n, _ := res.(int64)
-		srv.writeInt(cl, n)
+		srv.writeInt(cl, replCount(res))
 		return nil
 	}
 
@@ -130,7 +147,7 @@ func (s *Server) cmdLPush(srv *Server, cl *client, args []string) error {
 		if err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
-			n, _ := res.(int64)
+			n := replCount(res)
 			srv.writeInt(cl, n)
 		}
 		return nil
@@ -153,7 +170,7 @@ func (s *Server) cmdRPush(srv *Server, cl *client, args []string) error {
 		if err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
-			n, _ := res.(int64)
+			n := replCount(res)
 			srv.writeInt(cl, n)
 		}
 		return nil
@@ -263,7 +280,7 @@ func (s *Server) cmdSAdd(srv *Server, cl *client, args []string) error {
 		if err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
-			n, _ := res.(int64)
+			n := replCount(res)
 			srv.writeInt(cl, n)
 		}
 		return nil
@@ -336,7 +353,7 @@ func (s *Server) cmdSRem(srv *Server, cl *client, args []string) error {
 		if err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
-			n, _ := res.(int64)
+			n := replCount(res)
 			srv.writeInt(cl, n)
 		}
 		return nil
@@ -375,7 +392,7 @@ func (s *Server) cmdZAdd(srv *Server, cl *client, args []string) error {
 		if err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
-			added, _ := res.(int64)
+			added := replCount(res)
 			srv.writeInt(cl, added)
 		}
 		return nil
@@ -450,7 +467,7 @@ func (s *Server) cmdZRem(srv *Server, cl *client, args []string) error {
 		if err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
-			n, _ := res.(int64)
+			n := replCount(res)
 			srv.writeInt(cl, n)
 		}
 		return nil
@@ -485,8 +502,7 @@ func (s *Server) cmdSetBit(srv *Server, cl *client, args []string) error {
 		if err != nil {
 			srv.writeError(cl, err.Error())
 		} else {
-			old, _ := res.(int)
-			srv.writeInt(cl, int64(old))
+			srv.writeInt(cl, replCount(res))
 		}
 		return nil
 	}
