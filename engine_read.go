@@ -615,6 +615,13 @@ func (e *Engine) ScanPage(pattern string, cursor string, count int) ([]string, s
 					if globMatch(pattern, name) {
 						names = append(names, name)
 					}
+					// Skip the rest of this collection's composite keys so the
+					// logical key is not returned again on the next page.
+					if len(k) > 2 && k[1] == 0 {
+						merged, iters = e.reseekAfterCollectionPrefix(merged, iters, k)
+						last = append(last[:0], collectionResumeKey(k)...)
+						continue
+					}
 				}
 			}
 		}
@@ -632,6 +639,31 @@ func (e *Engine) ScanPage(pattern string, cursor string, count int) ([]string, s
 	}
 	sort.Strings(names)
 	return names, next, nil
+}
+
+// collectionResumeKey returns the seek key that lands just past every composite
+// key of the collection whose member key k belongs to, so a later SCAN page does
+// not re-return the same logical key. Composite layout: type \x00 name \x00 rest.
+func collectionResumeKey(k []byte) []byte {
+	rest := k[2:]
+	i := bytes.IndexByte(rest, 0)
+	if i < 0 {
+		return k
+	}
+	prefixEnd := k[:i+3] // type(1) + \x00(1) + name + \x00(1)
+	out := make([]byte, 0, len(prefixEnd)+1)
+	out = append(out, prefixEnd...)
+	return append(out, 0xFF)
+}
+
+// reseekAfterCollectionPrefix rebuilds the merged iterator just past the
+// collection owning k, discarding the current one (its underlying iterators are
+// closed here to avoid leaking file handles).
+func (e *Engine) reseekAfterCollectionPrefix(merged *iterator.MergedIterator, iters []iterator.Iterator, k []byte) (*iterator.MergedIterator, []iterator.Iterator) {
+	for _, it := range iters {
+		_ = it.Close()
+	}
+	return e.buildMergedIterator(collectionResumeKey(k))
 }
 
 func globMatch(pattern, s string) bool {
