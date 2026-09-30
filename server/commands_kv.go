@@ -13,19 +13,41 @@ func (s *Server) cmdSet(srv *Server, cl *client, args []string) error {
 		return nil
 	}
 	var opts WriteOptions
-	for _, arg := range args[2:] {
-		switch strings.ToUpper(arg) {
+	var expiresAt int64
+	for i := 2; i < len(args); i++ {
+		switch strings.ToUpper(args[i]) {
 		case "SKIPWAL":
 			opts.SkipWAL = true
 		case "SYNC":
 			opts.Sync = true
+		case "EX", "PX", "EXAT", "PXAT":
+			if i+1 >= len(args) {
+				srv.writeError(cl, "ERR syntax error")
+				return nil
+			}
+			n, err := strconv.ParseInt(args[i+1], 10, 64)
+			if err != nil {
+				srv.writeError(cl, "ERR value is not an integer or out of range")
+				return nil
+			}
+			switch strings.ToUpper(args[i]) {
+			case "EX":
+				expiresAt = time.Now().Unix() + n
+			case "PX":
+				expiresAt = time.Now().Unix() + n/1000
+			case "EXAT":
+				expiresAt = n
+			case "PXAT":
+				expiresAt = n / 1000
+			}
+			i++
 		default:
 			srv.writeError(cl, "ERR syntax error")
 			return nil
 		}
 	}
 	if cl.txWrites != nil {
-		cl.txWrites[strKey(args[0])] = txWriteEntry{value: args[1]}
+		cl.txWrites[strKey(args[0])] = txWriteEntry{value: args[1], expiresAt: expiresAt}
 		srv.writeSimpleString(cl, "OK")
 	} else if _, handled, err := srv.applyReplicated("SET", args); handled {
 		if err != nil {
@@ -33,7 +55,7 @@ func (s *Server) cmdSet(srv *Server, cl *client, args []string) error {
 		} else {
 			srv.writeSimpleString(cl, "OK")
 		}
-	} else if err := srv.db.PutWithOptions(strKey(args[0]), args[1], opts); err != nil {
+	} else if err := srv.db.PutExAt(strKey(args[0]), args[1], expiresAt, opts); err != nil {
 		srv.writeError(cl, err.Error())
 	} else {
 		srv.writeSimpleString(cl, "OK")

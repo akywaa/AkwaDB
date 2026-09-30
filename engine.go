@@ -451,7 +451,10 @@ func (e *Engine) PutExWithOptions(key, val string, ttlSeconds int64, opts server
 	if ttlSeconds > 0 {
 		expiresAt = time.Now().Unix() + ttlSeconds
 	}
+	return e.PutExAt(key, val, expiresAt, opts)
+}
 
+func (e *Engine) PutExAt(key, val string, expiresAt int64, opts server.WriteOptions) error {
 	kBytes := []byte(key)
 	vBytes := []byte(val)
 

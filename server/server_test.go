@@ -504,6 +504,16 @@ func (m *memoryBackend) PutWithOptions(key, val string, opts WriteOptions) error
 	return m.Put(key, val)
 }
 
+func (m *memoryBackend) PutExAt(key, val string, expiresAt int64, opts WriteOptions) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.kv[key] = val
+	if expiresAt > 0 {
+		m.ttls[key] = expiresAt
+	}
+	return nil
+}
+
 func (m *memoryBackend) BatchApply(entries []BatchWriteEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

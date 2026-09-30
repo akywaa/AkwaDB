@@ -50,6 +50,7 @@ type WriteOptions struct {
 type KVStore interface {
 	Put(key, val string) error
 	PutEx(key, val string, ttlSeconds int64) error
+	PutExAt(key, val string, expiresAt int64, opts WriteOptions) error
 	PutWithOptions(key, val string, opts WriteOptions) error
 	Get(key string) (string, error)
 	Delete(key string) (bool, error)
@@ -150,9 +151,7 @@ type AdminStore interface {
 	Clear() error
 }
 
-// DB is the full engine surface exposed to the RESP server and the Raft FSM.
-// It is split into narrow, functional interfaces above; keep the composed view
-// for callers that need everything (e.g. the replicated cluster path).
+// DB is the full engine surface used by the RESP server and the Raft FSM.
 type DB interface {
 	KVStore
 	CollectionStore

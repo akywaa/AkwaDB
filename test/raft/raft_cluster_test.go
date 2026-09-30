@@ -25,6 +25,9 @@ func (m *memoryDB) Put(key, val string) error { return m.PutWithOptions(key, val
 func (m *memoryDB) PutEx(key, val string, _ int64) error {
 	return m.PutWithOptions(key, val, server.WriteOptions{})
 }
+func (m *memoryDB) PutExAt(key, val string, _ int64, _ server.WriteOptions) error {
+	return m.PutWithOptions(key, val, server.WriteOptions{})
+}
 func (m *memoryDB) PutWithOptions(key, val string, _ server.WriteOptions) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
