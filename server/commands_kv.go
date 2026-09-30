@@ -241,7 +241,20 @@ func (s *Server) cmdExpire(srv *Server, cl *client, args []string) error {
 				val, gerr = srv.db.Get(key)
 			}
 			if gerr != nil {
-				srv.writeInt(cl, 0)
+				// Key is not a plain string; fall back to collection members.
+				collKeys, _ := srv.db.CollectionKeys(args[0])
+				if len(collKeys) == 0 {
+					srv.writeInt(cl, 0)
+					return nil
+				}
+				exp := time.Now().Unix() + sec
+				for _, ck := range collKeys {
+					cl.txWrites[ck] = txWriteEntry{expiresAt: exp}
+					if cl.txReadSet != nil {
+						cl.txReadSet[ck] = struct{}{}
+					}
+				}
+				srv.writeInt(cl, 1)
 				return nil
 			}
 			tw = txWriteEntry{value: val}
