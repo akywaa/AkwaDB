@@ -16,6 +16,9 @@ import (
 const deleteBatchSize = 1024
 
 func (e *Engine) DeleteCollection(key string) (int64, error) {
+	mu := e.lockKey(key)
+	defer mu.Unlock()
+
 	var total int64
 	for _, prefix := range collectionPrefixes(key) {
 		n, err := e.deletePrefixChunked(prefix)
