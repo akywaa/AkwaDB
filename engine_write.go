@@ -55,6 +55,11 @@ type incrResult struct {
 }
 
 func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList) incrResult {
+	currentTTL, _ := e.TTL(string(r.key))
+	var expiresAt int64
+	if currentTTL > 0 {
+		expiresAt = time.Now().Unix() + currentTTL
+	}
 	current, err := e.getForReadAt(r.key, r.seq)
 	if err != nil && err != ErrKeyNotFound {
 		return incrResult{err: err}
@@ -71,23 +76,25 @@ func (e *Engine) processIncr(r *writeReq, mt *memtable.SkipList) incrResult {
 	threshold := e.valueThreshold()
 	e.recordValueSize(len(newBytes))
 	if len(newBytes) < threshold {
-		_, werr := e.wal.WriteVersion(wal.OpPut, r.key, newBytes, 0, r.seq)
+		_, werr := e.wal.WriteVersion(wal.OpPut, r.key, newBytes, expiresAt, r.seq)
 		if werr != nil {
 			return incrResult{err: werr}
 		}
-		mt.PutVersion(r.key, encodeInlineValue(newBytes), 0, r.seq)
+		mt.PutVersion(r.key, encodeInlineValue(newBytes), expiresAt, r.seq)
 	} else {
 		vvp, verr := e.vl.Write(&vlog.ValueEntry{
-			Op:    vlog.OpPut,
-			Key:   r.key,
-			Value: newBytes,
+			Op:        vlog.OpPut,
+			Key:       r.key,
+			Value:     newBytes,
+			ExpiresAt: expiresAt,
 		})
 		if verr != nil {
 			return incrResult{err: verr}
 		}
-		_, _ = e.wal.WriteVersion(wal.OpPut, r.key, encodeWalValuePointer(vpFromVlog(vvp)), 0, r.seq)
-		mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), 0, r.seq)
+		_, _ = e.wal.WriteVersion(wal.OpPut, r.key, encodeWalValuePointer(vpFromVlog(vvp)), expiresAt, r.seq)
+		mt.PutVersion(r.key, encodeValuePointer(vpFromVlog(vvp)), expiresAt, r.seq)
 	}
+	e.trackExpiry(r.key, expiresAt)
 	return incrResult{val: newVal}
 }
 
