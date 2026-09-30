@@ -143,9 +143,6 @@ func (o *Oracle) advanceAppliedLocked() {
 		if _, pending := o.awaiting[next]; pending {
 			break
 		}
-		if _, activeRead := o.readSeqs[next]; activeRead {
-			break
-		}
 		o.appliedTs = next
 	}
 }
