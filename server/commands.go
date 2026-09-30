@@ -429,9 +429,12 @@ func (s *Server) cmdExec(srv *Server, cl *client, args []string) error {
 		return nil
 	}
 
-	writeKeys := make(map[string]struct{}, len(txWrites))
+	writeKeys := make(map[string]struct{}, len(txWrites)+len(txDeletes))
 	for k := range txWrites {
 		writeKeys[k] = struct{}{}
+	}
+	for _, ck := range txDeletes {
+		writeKeys[ck] = struct{}{}
 	}
 	commitTs, err := srv.db.CommitTx(savedReadTs, txReadSet, writeKeys)
 	if err != nil {
