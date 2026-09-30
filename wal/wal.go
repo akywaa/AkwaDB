@@ -509,7 +509,7 @@ func (w *WAL) Recover() ([]Record, error) {
 	}
 
 	if totalRead < total {
-		if terr := os.Truncate(w.file.Name(), totalRead); terr != nil {
+		if terr := w.file.Truncate(totalRead); terr != nil {
 			return records, fmt.Errorf("wal recover truncate: %w", terr)
 		}
 	}
