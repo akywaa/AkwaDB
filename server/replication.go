@@ -30,8 +30,8 @@ type replEntry struct {
 	seq       uint64
 }
 
-// ReplBacklog is a fixed-size ring buffer that stores recent replication entries
-// so reconnecting replicas can resume from a partial sync instead of a full snapshot.
+// ReplBacklog is a ring buffer of recent replication entries used for partial
+// resync of reconnecting replicas.
 type ReplBacklog struct {
 	mu       sync.Mutex
 	entries  []replEntry
@@ -134,7 +134,7 @@ func (rc *replicaConn) stopReplica() {
 
 // --- Master side: accepting replica connections ---
 
-// handleReplicaSync handles a replica sending SYNC <lastSeq>.
+// handleReplicaSync serves a SYNC <lastSeq> request from a replica.
 func (s *Server) handleReplicaSync(cl *client, r *bufio.Reader, args []string) {
 	addr := cl.conn.RemoteAddr().String()
 	slog.Info("replica connected", "addr", addr)
@@ -442,7 +442,7 @@ func writeSeqMarker(w replWriter, seq uint64) error {
 
 // --- Replica side ---
 
-// cmdReplicaOf handles REPLICAOF host port.
+// cmdReplicaOf implements REPLICAOF host port.
 func (s *Server) cmdReplicaOf(srv *Server, cl *client, args []string) error {
 	if len(args) < 2 {
 		srv.writeError(cl, "ERR wrong number of arguments for 'replicaof' command")
@@ -497,9 +497,10 @@ func (s *Server) startReplication(ctx context.Context, addr string) {
 
 		var conn net.Conn
 		var err error
-		for i := 0; i < 10; i++ {
+		for {
 			select {
 			case <-ctx.Done():
+				slog.Info("replication stopped by REPLICAOF NO ONE")
 				return
 			default:
 			}
@@ -507,18 +508,19 @@ func (s *Server) startReplication(ctx context.Context, addr string) {
 			if err == nil {
 				break
 			}
-			slog.Warn("repl connect attempt failed, retrying", "attempt", i+1, "err", err)
-			time.Sleep(backoff)
+			slog.Warn("repl connect attempt failed, retrying", "err", err)
+			select {
+			case <-ctx.Done():
+				slog.Info("replication stopped by REPLICAOF NO ONE")
+				return
+			case <-time.After(backoff):
+			}
 			if backoff < maxBackoff {
 				backoff *= 2
 				if backoff > maxBackoff {
 					backoff = maxBackoff
 				}
 			}
-		}
-		if err != nil {
-			slog.Error("gave up connecting to master", "addr", addr)
-			return
 		}
 
 		func() {
