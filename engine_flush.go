@@ -142,6 +142,11 @@ func (e *Engine) triggerFlushLocked() (*flushTask, error) {
 	if err := e.vl.Rotate(); err != nil {
 		slog.Warn("vlog rotate failed", "err", err)
 	}
+	if oldVlogFid > 0 {
+		// Archive the closed segment for PITR even if GC never accumulates
+		// enough garbage to reclaim it. Keep the file locally until GC drops it.
+		e.enqueueArchive(filepath.Join(e.dataDir, "vlog", fmt.Sprintf("vlog_%06d.log", oldVlogFid)), false)
+	}
 
 	task := &flushTask{
 		seq:        seq,
